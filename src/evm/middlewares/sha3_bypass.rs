@@ -19,6 +19,28 @@ use crate::evm::{
 
 const MAX_CALL_DEPTH: u64 = 3;
 
+/// Hard cap on dirty_memory growth and on input_data lengths returned by
+/// {read,write}_input. The taint analysis tracks one bool per byte of EVM
+/// memory. The real EVM's memory expansion is quadratic in gas, so reaching
+/// even 1 MB costs ~2M gas; 16 MB is unreachable under any block gas limit.
+/// Stack inputs that resolve to offsets or lengths beyond this cap therefore
+/// imply the executing frame will run out of gas before any tainted byte
+/// could be observed by a subsequent opcode — making the taint update moot.
+///
+/// Bounding here turns adversarial fuzzer-generated u256 values into safe
+/// no-ops instead of capacity-overflow panics from Vec::resize.
+const MEMORY_LIMIT_BYTES: usize = 1 << 24; // 16 MB
+
+/// Returns `Some(offset + len)` if the range fits within MEMORY_LIMIT_BYTES
+/// without integer overflow; `None` otherwise. Callers must skip the memory
+/// access when this returns None.
+#[inline]
+fn safe_mem_end(offset: usize, len: usize) -> Option<usize> {
+    offset
+        .checked_add(len)
+        .filter(|&end| end <= MEMORY_LIMIT_BYTES)
+}
+
 #[derive(Clone, Debug)]
 pub struct Sha3TaintAnalysisCtx {
     pub dirty_memory: Vec<bool>,
@@ -29,11 +51,18 @@ pub struct Sha3TaintAnalysisCtx {
 
 impl Sha3TaintAnalysisCtx {
     pub fn read_input(&self, start: usize, length: usize) -> Vec<bool> {
+        // Cap length to keep adversarial fuzzer inputs from triggering an
+        // exabyte-scale allocation. The returned vec may be shorter than
+        // requested; downstream lookups go through this function so they
+        // see the clamped slice, not the original length.
+        let length = length.min(MEMORY_LIMIT_BYTES);
         let mut res = vec![false; length];
         let available = self.input_data.len();
-        if start < available {
-            let end = (start + length).min(available);
-            res[..end - start].copy_from_slice(&self.input_data[start..end]);
+        if start < available && length > 0 {
+            let end = start.saturating_add(length).min(available);
+            if end > start {
+                res[..end - start].copy_from_slice(&self.input_data[start..end]);
+            }
         }
         res
     }
@@ -81,11 +110,15 @@ impl Sha3TaintAnalysis {
     }
 
     pub fn write_input(&self, start: usize, length: usize) -> Vec<bool> {
+        // See read_input — same adversarial-length protection.
+        let length = length.min(MEMORY_LIMIT_BYTES);
         let mut res = vec![false; length];
         let available = self.dirty_memory.len();
-        if start < available {
-            let end = (start + length).min(available);
-            res[..end - start].copy_from_slice(&self.dirty_memory[start..end]);
+        if start < available && length > 0 {
+            let end = start.saturating_add(length).min(available);
+            if end > start {
+                res[..end - start].copy_from_slice(&self.dirty_memory[start..end]);
+            }
         }
         res
     }
@@ -198,8 +231,13 @@ where
                 stack_pop_n!(3);
                 let len = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
                 let mem_offset = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
-                ensure_size!(self.dirty_memory, mem_offset + len);
-                self.dirty_memory[mem_offset..mem_offset + len].copy_from_slice(vec![false; len as usize].as_slice());
+                if let Some(end) = safe_mem_end(mem_offset, len) {
+                    ensure_size!(self.dirty_memory, end);
+                    self.dirty_memory[mem_offset..end]
+                        .copy_from_slice(vec![false; len].as_slice());
+                }
+                // else: adversarial offset/len, EVM will OOG. Stack pop above
+                // matches real EVM behavior; skip memory tracking only.
             }};
         }
 
@@ -294,8 +332,11 @@ where
                 stack_pop_n!(4);
                 let len = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
                 let mem_offset = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
-                ensure_size!(self.dirty_memory, mem_offset + len);
-                self.dirty_memory[mem_offset..mem_offset + len].copy_from_slice(vec![false; len as usize].as_slice());
+                if let Some(end) = safe_mem_end(mem_offset, len) {
+                    ensure_size!(self.dirty_memory, end);
+                    self.dirty_memory[mem_offset..end]
+                        .copy_from_slice(vec![false; len].as_slice());
+                }
             }
             // RETURNDATASIZE
             0x3d => push_false!(),
@@ -311,8 +352,13 @@ where
             0x51 => {
                 self.dirty_stack.pop();
                 let mem_offset = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
-                ensure_size!(self.dirty_memory, mem_offset + 32);
-                let is_dirty = self.dirty_memory[mem_offset..mem_offset + 32].iter().any(|x| *x);
+                let is_dirty = if let Some(end) = safe_mem_end(mem_offset, 32) {
+                    ensure_size!(self.dirty_memory, end);
+                    self.dirty_memory[mem_offset..end].iter().any(|x| *x)
+                } else {
+                    // Adversarial offset — EVM will OOG. Push clean.
+                    false
+                };
                 self.dirty_stack.push(is_dirty);
             }
             // MSTORE
@@ -320,16 +366,21 @@ where
                 stack_pop_n!(1);
                 let mem_offset = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
                 let is_dirty = self.dirty_stack.pop().expect("stack is empty");
-                ensure_size!(self.dirty_memory, mem_offset + 32);
-                self.dirty_memory[mem_offset..mem_offset + 32].copy_from_slice(vec![is_dirty; 32].as_slice());
+                if let Some(end) = safe_mem_end(mem_offset, 32) {
+                    ensure_size!(self.dirty_memory, end);
+                    self.dirty_memory[mem_offset..end]
+                        .copy_from_slice(vec![is_dirty; 32].as_slice());
+                }
             }
             // MSTORE8
             0x53 => {
                 stack_pop_n!(1);
                 let mem_offset = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
                 let is_dirty = self.dirty_stack.pop().expect("stack is empty");
-                ensure_size!(self.dirty_memory, mem_offset + 1);
-                self.dirty_memory[mem_offset] = is_dirty;
+                if let Some(end) = safe_mem_end(mem_offset, 1) {
+                    ensure_size!(self.dirty_memory, end);
+                    self.dirty_memory[mem_offset] = is_dirty;
+                }
             }
             // SLOAD
             0x54 | 0x5c => {
@@ -690,5 +741,72 @@ mod tests {
         );
         debug!("{:?}", taints);
         assert_eq!(taints.len(), 2);
+    }
+
+    // --- Memory-bound regression tests ------------------------------------
+    // These exercise the adversarial-input guards added to defend against
+    // fuzzer-generated u256 values that would otherwise resize dirty_memory
+    // beyond `isize::MAX`, triggering `capacity overflow` in raw_vec.
+
+    #[test]
+    fn safe_mem_end_accepts_within_limit() {
+        assert_eq!(safe_mem_end(0, 32), Some(32));
+        assert_eq!(safe_mem_end(1024, 4096), Some(5120));
+        assert_eq!(safe_mem_end(0, MEMORY_LIMIT_BYTES), Some(MEMORY_LIMIT_BYTES));
+    }
+
+    #[test]
+    fn safe_mem_end_rejects_overflow() {
+        assert_eq!(safe_mem_end(usize::MAX, 1), None);
+        assert_eq!(safe_mem_end(usize::MAX - 100, 200), None);
+    }
+
+    #[test]
+    fn safe_mem_end_rejects_over_limit() {
+        assert_eq!(safe_mem_end(0, MEMORY_LIMIT_BYTES + 1), None);
+        assert_eq!(safe_mem_end(MEMORY_LIMIT_BYTES, 1), None);
+        // Large but non-overflowing values should still be rejected.
+        assert_eq!(safe_mem_end(1 << 40, 32), None);
+    }
+
+    #[test]
+    fn write_input_clamps_adversarial_length() {
+        // write_input is on Sha3TaintAnalysis (reads from dirty_memory).
+        // Build one with a small dirty_memory but ask for a u64::MAX-scale
+        // write. Must not panic and must cap allocation at MEMORY_LIMIT_BYTES.
+        let mut analysis = Sha3TaintAnalysis::new();
+        analysis.dirty_memory = vec![true; 64];
+        let out = analysis.write_input(0, usize::MAX);
+        assert_eq!(out.len(), MEMORY_LIMIT_BYTES);
+        assert!(out[..64].iter().all(|&b| b));
+        assert!(out[64..].iter().all(|&b| !b));
+    }
+
+    #[test]
+    fn read_input_clamps_adversarial_length() {
+        let ctx = Sha3TaintAnalysisCtx {
+            input_data: vec![true; 16],
+            dirty_memory: vec![],
+            dirty_storage: HashMap::new(),
+            dirty_stack: vec![],
+        };
+        let out = ctx.read_input(0, usize::MAX);
+        assert_eq!(out.len(), MEMORY_LIMIT_BYTES);
+        assert!(out[..16].iter().all(|&b| b));
+        assert!(out[16..].iter().all(|&b| !b));
+    }
+
+    #[test]
+    fn read_input_handles_offset_past_input() {
+        let ctx = Sha3TaintAnalysisCtx {
+            input_data: vec![true; 10],
+            dirty_memory: vec![],
+            dirty_storage: HashMap::new(),
+            dirty_stack: vec![],
+        };
+        // start beyond input_data => all-false result, no panic
+        let out = ctx.read_input(100, 32);
+        assert_eq!(out.len(), 32);
+        assert!(out.iter().all(|&b| !b));
     }
 }
