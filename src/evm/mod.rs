@@ -177,8 +177,17 @@ pub struct EvmArgs {
     #[arg(long, default_value = "0")]
     concolic_num_threads: usize,
 
-    /// Enable flashloan
-    #[arg(short, long, default_value = "false")]
+    /// Enable the economic outcome detection subsystem.
+    ///
+    /// Despite the legacy `--flashloan` name, this flag controls the entire
+    /// fund-loss detection layer: synthetic-capital injection so the fuzzer's
+    /// attacker can attempt drains, owed/earned accounting per call frame, and
+    /// portfolio valuation via registered Uniswap pairs. The `Fund Loss`
+    /// finding in oracles/erc20.rs ONLY fires when this is enabled — without it
+    /// the entire balance-based outcome detection is dormant regardless of any
+    /// `-d` selection. Default-on in this fork; pass `--flashloan=false` to
+    /// disable. Long-form alias `--economic-oracle` is preferred for new scripts.
+    #[arg(short, long, alias = "economic-oracle", default_value = "true")]
     flashloan: bool,
 
     /// Panic when a typed_bug() is called (Default: false)
