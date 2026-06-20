@@ -250,8 +250,12 @@ fn add_reserve_info(chain: &mut Box<dyn ChainConfig>, pair_data: &mut PairData) 
     if pair_data.interface == "uniswapv2" {
         let reserves = chain.fetch_reserve(&pair_data.pair);
         if let Some((r0, r1)) = reserves {
-            pair_data.initial_reserves_0 = EVMU256::try_from_be_slice(&hex::decode(r0).unwrap()).unwrap();
-            pair_data.initial_reserves_1 = EVMU256::try_from_be_slice(&hex::decode(r1).unwrap()).unwrap();
+            let r0 = r0.strip_prefix("0x").unwrap_or(&r0);
+            let r1 = r1.strip_prefix("0x").unwrap_or(&r1);
+            if let (Ok(r0_bytes), Ok(r1_bytes)) = (hex::decode(r0), hex::decode(r1)) {
+                pair_data.initial_reserves_0 = EVMU256::try_from_be_slice(&r0_bytes).unwrap_or_default();
+                pair_data.initial_reserves_1 = EVMU256::try_from_be_slice(&r1_bytes).unwrap_or_default();
+            }
         }
     }
     if pair_data.interface == "uniswapv3" {

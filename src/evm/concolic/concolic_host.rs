@@ -571,6 +571,7 @@ pub struct ConcolicCallCtx {
     pub symbolic_stack: Vec<Option<Box<Expr>>>,
     pub symbolic_memory: SymbolicMemory,
     pub symbolic_state: HashMap<EVMU256, Option<Box<Expr>>>,
+    pub symbolic_transient: HashMap<EVMU256, Option<Box<Expr>>>,
 
     // seperated by 32 bytes
     pub input_bytes: Vec<Box<Expr>>,
@@ -581,6 +582,7 @@ pub struct ConcolicHost {
     pub symbolic_stack: Vec<Option<Box<Expr>>>,
     pub symbolic_memory: SymbolicMemory,
     pub symbolic_state: HashMap<EVMU256, Option<Box<Expr>>>,
+    pub symbolic_transient: HashMap<EVMU256, Option<Box<Expr>>>,
     pub input_bytes: Vec<Box<Expr>>,
     pub constraints: Vec<Box<Expr>>,
     pub testcase_ref: Rc<EVMInput>,
@@ -598,6 +600,7 @@ impl ConcolicHost {
             symbolic_stack: Vec::new(),
             symbolic_memory: SymbolicMemory::new(),
             symbolic_state: Default::default(),
+            symbolic_transient: Default::default(),
             input_bytes: Self::construct_input_from_abi(testcase_ref.get_data_abi().expect("data abi not found")),
             constraints: vec![],
             testcase_ref,
@@ -613,6 +616,7 @@ impl ConcolicHost {
             self.symbolic_stack = ctx.symbolic_stack;
             self.symbolic_memory = ctx.symbolic_memory;
             self.symbolic_state = ctx.symbolic_state;
+            self.symbolic_transient = ctx.symbolic_transient;
         } else {
             panic!("pop_ctx: ctx is empty");
         }
@@ -632,6 +636,7 @@ impl ConcolicHost {
             symbolic_stack: self.symbolic_stack.clone(),
             symbolic_memory: self.symbolic_memory.clone(),
             symbolic_state: self.symbolic_state.clone(),
+            symbolic_transient: self.symbolic_transient.clone(),
             input_bytes: {
                 let by = self.symbolic_memory.get_slice(arg_offset, arg_len);
                 #[cfg(feature = "z3_debug")]
@@ -1137,6 +1142,14 @@ where
             0x48 => {
                 vec![None]
             }
+            // BLOBBASEFEE
+            0x49 => {
+                vec![None]
+            }
+            // BLOBHASH
+            0x4a => {
+                concrete_eval!(1, 1)
+            }
             // POP
             0x50 => {
                 self.symbolic_stack.pop();
@@ -1284,6 +1297,24 @@ where
             }
             // JUMPDEST
             0x5b => {
+                vec![]
+            }
+            // TLOAD
+            0x5c => {
+                self.symbolic_stack.pop();
+                let key = fast_peek!(0);
+                vec![match self.symbolic_transient.get(&key) {
+                    Some(v) => v.clone(),
+                    None => None,
+                }]
+            }
+            // TSTORE
+            0x5d => {
+                let key = fast_peek!(1);
+                let value = stack_bv!(0);
+                self.symbolic_transient.insert(key, Some(value));
+                self.symbolic_stack.pop();
+                self.symbolic_stack.pop();
                 vec![]
             }
             // MCOPY

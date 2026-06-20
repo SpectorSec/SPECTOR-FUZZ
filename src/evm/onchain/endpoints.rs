@@ -404,7 +404,7 @@ impl ChainConfig for OnChainConfig {
         let pegged_token = self.get_pegged_token();
 
         match self.chain_name.as_str() {
-            "eth" | "arbitrum" | "scroll" => return pegged_token.get("WETH").unwrap().to_string(),
+            "eth" | "arbitrum" | "scroll" | "base" => return pegged_token.get("WETH").unwrap().to_string(),
             "bsc" => return pegged_token.get("WBNB").unwrap().to_string(),
             "polygon" => return pegged_token.get("WMATIC").unwrap().to_string(),
             "vana" => return pegged_token.get("WVANA").unwrap().to_string(),
@@ -503,6 +503,16 @@ impl ChainConfig for OnChainConfig {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
 
+            "base" => [
+                ("WETH", "0x4200000000000000000000000000000000000006"),
+                ("USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                ("USDT", "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"),
+                ("DAI", "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"),
+                ("CBETH", "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
             "local" => [("ZERO", "0x0000000000000000000000000000000000000000")]
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1086,6 +1096,9 @@ impl OnChainConfig {
     pub fn get_v3_fee(&mut self, address: EVMAddress) -> u32 {
         let data = "ddca3f43".to_string();
         let fee = self.eth_call(address, Bytes::from(hex::decode(data).unwrap()));
+        if fee.len() < 32 {
+            return 3000;
+        }
         u32::from_be_bytes([fee[28], fee[29], fee[30], fee[31]])
     }
 
@@ -1245,13 +1258,27 @@ impl OnChainConfig {
         if self.pair_cache.contains_key(&EVMAddress::from_str(&token).unwrap()) {
             return self.pair_cache[&EVMAddress::from_str(&token).unwrap()].clone();
         }
+        let base_url = env::var("ITYFUZZ_PAIRS_URL")
+            .unwrap_or_else(|_| "https://pairs-all.infra.fuzz.land".to_string());
         let url = if is_pegged {
-            format!("https://pairs-all.infra.fuzz.land/single_pair/{network}/{token}/{weth}")
+            format!("{base_url}/single_pair/{network}/{token}/{weth}")
         } else {
-            format!("https://pairs-all.infra.fuzz.land/pairs/{network}/{token}")
+            format!("{base_url}/pairs/{network}/{token}")
         };
         debug!(">> {url}");
-        let resp: Value = reqwest::blocking::get(url).unwrap().json().unwrap();
+        let resp: Value = match reqwest::blocking::get(&url) {
+            Ok(r) => match r.json() {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!("flashloan: no pair data for {network}");
+                    return vec![];
+                }
+            },
+            Err(_) => {
+                warn!("flashloan: pair server unreachable at {base_url}");
+                return vec![];
+            }
+        };
         debug!("<< {}", resp.to_string());
         let mut pairs: Vec<PairData> = Vec::new();
         if let Some(resp_pairs) = resp.as_array() {
@@ -1279,8 +1306,14 @@ impl OnChainConfig {
                     in_token: token.clone(),
                     interface: item["interface"].as_str().unwrap().to_string(),
                     src_exact: item["src_exact"].as_str().unwrap().to_string(),
-                    initial_reserves_0: EVMU256::ZERO,
-                    initial_reserves_1: EVMU256::ZERO,
+                    initial_reserves_0: item["initial_reserves_0"]
+                        .as_str()
+                        .and_then(|s| EVMU256::from_str(s).ok())
+                        .unwrap_or(EVMU256::ZERO),
+                    initial_reserves_1: item["initial_reserves_1"]
+                        .as_str()
+                        .and_then(|s| EVMU256::from_str(s).ok())
+                        .unwrap_or(EVMU256::ZERO),
                     decimals_0: if token0_decimals >= 0 {
                         token0_decimals as u32
                     } else {

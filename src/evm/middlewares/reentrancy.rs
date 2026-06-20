@@ -86,7 +86,7 @@ where
 {
     unsafe fn on_step(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>, _state: &mut EVMFuzzState) {
         match *interp.instruction_pointer {
-            0x54 => {
+            0x54 | 0x5c => {
                 let depth = host.evmstate.post_execution.len() as u32;
                 let slot_idx = interp.stack.peek(0).unwrap();
 
@@ -131,7 +131,7 @@ where
                 merge_sorted_vec_dedup(write_entry, &found_smaller);
             }
 
-            0x55 => {
+            0x55 | 0x5d => {
                 let depth = host.evmstate.post_execution.len() as u32;
                 let slot_idx = interp.stack.peek(0).unwrap();
                 let write_entry = host

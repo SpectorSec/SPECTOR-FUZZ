@@ -216,7 +216,7 @@ pub struct EvmArgs {
 
     /// Whether bypass all SHA3 comparisons, this may break original logic of
     /// contracts  (Experimental)
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     sha3_bypass: bool,
 
     /// Only fuzz contracts with the addresses provided, separated by comma

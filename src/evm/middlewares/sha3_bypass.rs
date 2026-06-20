@@ -30,7 +30,11 @@ pub struct Sha3TaintAnalysisCtx {
 impl Sha3TaintAnalysisCtx {
     pub fn read_input(&self, start: usize, length: usize) -> Vec<bool> {
         let mut res = vec![false; length];
-        res[..length].copy_from_slice(&self.input_data[start..(length + start)]);
+        let available = self.input_data.len();
+        if start < available {
+            let end = (start + length).min(available);
+            res[..end - start].copy_from_slice(&self.input_data[start..end]);
+        }
         res
     }
 }
@@ -41,6 +45,7 @@ pub struct Sha3TaintAnalysis {
     pub dirty_storage: HashMap<EVMU256, bool>,
     pub dirty_stack: Vec<bool>,
     pub tainted_jumpi: HashSet<(EVMAddress, usize)>,
+    pub prev_opcode: u8,
 
     pub ctxs: Vec<Sha3TaintAnalysisCtx>,
 }
@@ -58,6 +63,7 @@ impl Sha3TaintAnalysis {
             dirty_storage: HashMap::new(),
             dirty_stack: vec![],
             tainted_jumpi: HashSet::new(),
+            prev_opcode: 0x00,
             ctxs: vec![],
         }
     }
@@ -70,14 +76,23 @@ impl Sha3TaintAnalysis {
 
     pub fn write_input(&self, start: usize, length: usize) -> Vec<bool> {
         let mut res = vec![false; length];
-        res[..length].copy_from_slice(&self.dirty_memory[start..(length + start)]);
+        let available = self.dirty_memory.len();
+        if start < available {
+            let end = (start + length).min(available);
+            res[..end - start].copy_from_slice(&self.dirty_memory[start..end]);
+        }
         res
     }
 
     pub fn push_ctx(&mut self, interp: &mut Interpreter) {
+        // EVM stack layout for CALL-family opcodes:
+        //   CALL/CALLCODE (0xf1/0xf2): gas, recipient, value, arg_offset, arg_size, ret_offset, ret_size
+        //   DELEGATECALL/STATICCALL (0xf4/0xfa): gas, recipient, arg_offset, arg_size, ret_offset, ret_size
+        // In both cases arg_offset is at peek(3) and arg_size is at peek(2).
         let (arg_offset, arg_len) = match unsafe { *interp.instruction_pointer } {
-            0xf1 | 0xf2 => (interp.stack.peek(3).unwrap(), interp.stack.peek(4).unwrap()),
-            0xf4 | 0xfa => (interp.stack.peek(2).unwrap(), interp.stack.peek(3).unwrap()),
+            0xf1 | 0xf2 | 0xf4 | 0xfa => {
+                (interp.stack.peek(3).unwrap(), interp.stack.peek(2).unwrap())
+            }
             _ => {
                 panic!("not supported opcode");
             }
@@ -118,6 +133,8 @@ where
         if host.call_depth > MAX_CALL_DEPTH {
             return;
         }
+
+        self.prev_opcode = *interp.instruction_pointer;
 
         //
         // debug!("on_step: {:?} with {:x}", interp.program_counter(),
@@ -161,13 +178,25 @@ where
         macro_rules! setup_mem {
             () => {{
                 stack_pop_n!(3);
-                let mem_offset = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
-                let len = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
+                let len = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
+                let mem_offset = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
                 ensure_size!(self.dirty_memory, mem_offset + len);
                 self.dirty_memory[mem_offset..mem_offset + len].copy_from_slice(vec![false; len as usize].as_slice());
             }};
         }
 
+        if interp.stack.len() != self.dirty_stack.len() {
+            eprintln!(
+                "STACK MISMATCH: real={} dirty={} pc={:#x} addr={:#x} depth={:?} prev_opcode={:#x} instr_pointer={:#x}",
+                interp.stack.len(),
+                self.dirty_stack.len(),
+                interp.program_counter(),
+                interp.contract.address,
+                host.call_depth,
+                self.prev_opcode,
+                *interp.instruction_pointer,
+            );
+        }
         assert_eq!(interp.stack.len(), self.dirty_stack.len());
 
         match *interp.instruction_pointer {
@@ -239,8 +268,14 @@ where
                 stack_pop_n!(1);
                 self.dirty_stack.push(false);
             }
-            // EXTCODECOPY
-            0x3c => setup_mem!(),
+            // EXTCODECOPY (pops 4: address, mem_offset, code_offset, size)
+            0x3c => {
+                stack_pop_n!(4);
+                let len = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
+                let mem_offset = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
+                ensure_size!(self.dirty_memory, mem_offset + len);
+                self.dirty_memory[mem_offset..mem_offset + len].copy_from_slice(vec![false; len as usize].as_slice());
+            }
             // RETURNDATASIZE
             0x3d => push_false!(),
             // RETURNDATACOPY
@@ -276,14 +311,14 @@ where
                 self.dirty_memory[mem_offset] = is_dirty;
             }
             // SLOAD
-            0x54 => {
+            0x54 | 0x5c => {
                 self.dirty_stack.pop();
                 let key = interp.stack.peek(0).expect("stack is empty");
                 let is_dirty = self.dirty_storage.get(&key).unwrap_or(&false);
                 self.dirty_stack.push(*is_dirty);
             }
             // SSTORE
-            0x55 => {
+            0x55 | 0x5d => {
                 self.dirty_stack.pop();
                 let is_dirty = self.dirty_stack.pop().expect("stack is empty");
                 let key = interp.stack.peek(0).expect("stack is empty");

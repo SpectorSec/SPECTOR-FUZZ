@@ -198,10 +198,8 @@ pub fn evm_fuzzer(
     }
     let sha3_taint = Rc::new(RefCell::new(Sha3TaintAnalysis::new()));
 
-    if config.sha3_bypass {
-        debug!("sha3 bypass enabled");
-        fuzz_host.add_middlewares(Rc::new(RefCell::new(Sha3Bypass::new(sha3_taint.clone()))));
-    }
+    debug!("sha3 bypass enabled (unconditional)");
+    fuzz_host.add_middlewares(Rc::new(RefCell::new(Sha3Bypass::new(sha3_taint.clone()))));
 
     if config.reentrancy_oracle {
         debug!("reentrancy oracle enabled");

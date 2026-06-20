@@ -189,8 +189,8 @@ where
         }
 
         match *interp.instruction_pointer {
-            // SLOAD
-            0x54 => {
+            // SLOAD / TLOAD
+            0x54 | 0x5c => {
                 let address = interp.contract.address;
                 let slot_idx: alloy_primitives::Uint<256, 4> = interp.stack.peek(0).unwrap();
 

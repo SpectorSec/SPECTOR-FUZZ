@@ -260,7 +260,7 @@ where
         match *interp.instruction_pointer {
             // detect whether it mutates token balance
             0xf1 | 0xfa => {}
-            0x55 => {
+            0x55 | 0x5d => {
                 if self.pair_address.contains(&interp.contract.address) {
                     let key = interp.stack.peek(0).unwrap();
                     if key == EVMU256::from(8) {

@@ -1086,8 +1086,11 @@ where
                 }
 
                 #[cfg(any(feature = "dataflow", feature = "cmp"))]
-                0x55 => {
-                    // SSTORE
+                0x55 | 0x5d => {
+                    // SSTORE | TSTORE — same [key, value] stack layout.
+                    // Transient writes do not persist, so JMP_MAP / STATE_CHANGE
+                    // are gated to SSTORE only.
+                    let is_sstore = *interp.instruction_pointer == 0x55;
                     let pc = interp.program_counter();
                     if !self.mapping_sstore_pcs.contains(&(interp.contract.address, pc)) {
                         let mut key = fast_peek!(0);
@@ -1104,20 +1107,25 @@ where
                         let compressed_value = u256_to_u8!(value) + 1;
                         WRITE_MAP[process_rw_key!(key)] = compressed_value;
 
-                        let res =
-                            <FuzzHost<SC> as Host<EVMFuzzState>>::sload(self, interp.contract.address, fast_peek!(0));
-                        let value_changed = res.expect("sload failed").0 != value;
+                        if is_sstore {
+                            let res = <FuzzHost<SC> as Host<EVMFuzzState>>::sload(
+                                self,
+                                interp.contract.address,
+                                fast_peek!(0),
+                            );
+                            let value_changed = res.expect("sload failed").0 != value;
 
-                        let idx = interp.program_counter() % MAP_SIZE;
-                        JMP_MAP[idx] = if value_changed { 1 } else { 0 };
+                            let idx = interp.program_counter() % MAP_SIZE;
+                            JMP_MAP[idx] = if value_changed { 1 } else { 0 };
 
-                        STATE_CHANGE |= value_changed;
+                            STATE_CHANGE |= value_changed;
+                        }
                     }
                 }
 
                 #[cfg(feature = "dataflow")]
-                0x54 => {
-                    // SLOAD
+                0x54 | 0x5c => {
+                    // SLOAD | TLOAD
                     let mut key = fast_peek!(0);
                     READ_MAP[process_rw_key!(key)] = true;
                 }
