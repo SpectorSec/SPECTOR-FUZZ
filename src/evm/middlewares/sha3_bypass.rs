@@ -45,7 +45,12 @@ pub struct Sha3TaintAnalysis {
     pub dirty_storage: HashMap<EVMU256, bool>,
     pub dirty_stack: Vec<bool>,
     pub tainted_jumpi: HashSet<(EVMAddress, usize)>,
+    // Diagnostics: prev_opcode/prev_dirty_len are set at the END of on_step,
+    // so on the NEXT on_step call they reflect what truly ran before the
+    // current opcode. Without this, prev_opcode == current opcode at the
+    // mismatch point and the field is useless.
     pub prev_opcode: u8,
+    pub prev_dirty_len: usize,
 
     pub ctxs: Vec<Sha3TaintAnalysisCtx>,
 }
@@ -64,6 +69,7 @@ impl Sha3TaintAnalysis {
             dirty_stack: vec![],
             tainted_jumpi: HashSet::new(),
             prev_opcode: 0x00,
+            prev_dirty_len: 0,
             ctxs: vec![],
         }
     }
@@ -101,22 +107,36 @@ impl Sha3TaintAnalysis {
         let arg_offset = as_u64(arg_offset) as usize;
         let arg_len = as_u64(arg_len) as usize;
 
+        let saved_dirty_len = self.dirty_stack.len();
         self.ctxs.push(Sha3TaintAnalysisCtx {
             input_data: self.write_input(arg_offset, arg_len),
             dirty_memory: self.dirty_memory.clone(),
             dirty_storage: self.dirty_storage.clone(),
             dirty_stack: self.dirty_stack.clone(),
         });
+        eprintln!(
+            "push_ctx op={:#x} saved_dirty_len={} ctxs_after={}",
+            unsafe { *interp.instruction_pointer },
+            saved_dirty_len,
+            self.ctxs.len(),
+        );
 
         self.cleanup();
     }
 
     pub fn pop_ctx(&mut self) {
-        // debug!("pop_ctx");
+        let before_ctxs = self.ctxs.len();
+        let before_dirty = self.dirty_stack.len();
         let ctx = self.ctxs.pop().expect("ctxs is empty");
         self.dirty_memory = ctx.dirty_memory;
         self.dirty_storage = ctx.dirty_storage;
         self.dirty_stack = ctx.dirty_stack;
+        eprintln!(
+            "pop_ctx ctxs_before={} dirty_before={} restored_dirty_len={}",
+            before_ctxs,
+            before_dirty,
+            self.dirty_stack.len(),
+        );
     }
 
     fn as_any(&self) -> &dyn any::Any {
@@ -133,8 +153,6 @@ where
         if host.call_depth > MAX_CALL_DEPTH {
             return;
         }
-
-        self.prev_opcode = *interp.instruction_pointer;
 
         //
         // debug!("on_step: {:?} with {:x}", interp.program_counter(),
@@ -187,14 +205,17 @@ where
 
         if interp.stack.len() != self.dirty_stack.len() {
             eprintln!(
-                "STACK MISMATCH: real={} dirty={} pc={:#x} addr={:#x} depth={:?} prev_opcode={:#x} instr_pointer={:#x}",
+                "STACK MISMATCH real={} dirty={} pc={:#x} addr={:#x} depth={} \
+                 prev_opcode={:#x} prev_dirty_len={} current_op={:#x} ctxs_len={}",
                 interp.stack.len(),
                 self.dirty_stack.len(),
                 interp.program_counter(),
                 interp.contract.address,
                 host.call_depth,
                 self.prev_opcode,
+                self.prev_dirty_len,
                 *interp.instruction_pointer,
+                self.ctxs.len(),
             );
         }
         assert_eq!(interp.stack.len(), self.dirty_stack.len());
@@ -411,6 +432,11 @@ where
             }
             _ => panic!("unknown opcode: {:x}", *interp.instruction_pointer),
         }
+
+        // Record AFTER handler runs so the next on_step sees the actual
+        // previous opcode and the dirty_stack length it produced.
+        self.prev_opcode = *interp.instruction_pointer;
+        self.prev_dirty_len = self.dirty_stack.len();
     }
 
     unsafe fn on_return(
@@ -426,7 +452,18 @@ where
         // when the callee's depth is <= MAX_CALL_DEPTH + 1. Without this gate,
         // sub-calls made by frames that on_step skipped pop ctxs that were
         // saved by outer frames, corrupting dirty_stack.
-        if host.call_depth > MAX_CALL_DEPTH + 1 {
+        eprintln!(
+            "on_return entry call_depth={} ctxs_len={} dirty_len={}",
+            host.call_depth,
+            self.ctxs.len(),
+            self.dirty_stack.len(),
+        );
+        // host.call_depth at this point is the PARENT's depth (call_depth -= 1
+        // already ran in FuzzHost::call before on_return is invoked). So if
+        // call_depth > MAX_CALL_DEPTH, the parent's on_step was skipped and
+        // never called push_ctx — we must skip the pop too.
+        if host.call_depth > MAX_CALL_DEPTH {
+            eprintln!("on_return SKIP (depth > MAX_CALL_DEPTH)");
             return;
         }
         self.pop_ctx();
