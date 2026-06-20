@@ -416,10 +416,19 @@ where
     unsafe fn on_return(
         &mut self,
         _interp: &mut Interpreter,
-        _host: &mut FuzzHost<SC>,
+        host: &mut FuzzHost<SC>,
         _state: &mut EVMFuzzState,
         _by: &Bytes,
     ) {
+        // Mirror the depth gate in on_step: push_ctx only ran when the calling
+        // instruction fired at depth <= MAX_CALL_DEPTH. The callee that triggered
+        // this on_return is at depth = (caller_depth + 1), so we must only pop
+        // when the callee's depth is <= MAX_CALL_DEPTH + 1. Without this gate,
+        // sub-calls made by frames that on_step skipped pop ctxs that were
+        // saved by outer frames, corrupting dirty_stack.
+        if host.call_depth > MAX_CALL_DEPTH + 1 {
+            return;
+        }
         self.pop_ctx();
     }
 
