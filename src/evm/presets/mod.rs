@@ -42,11 +42,29 @@ pub struct ExploitTemplate {
     pub calls: Vec<FunctionSig>,
 }
 
+/// Historical DeFi exploit corpus baked into the binary at compile time.
+/// Upstream ships this file in `tests/presets/` and requires both a compile
+/// feature (`use_presets`) and a runtime `--preset-file-path` flag to load
+/// it — the README's "80% of previous hacks" claim depends on opting into
+/// both. In this fork the corpus is `include_str!`-ed so it's always
+/// available; the `--preset-file-path` flag remains supported but is purely
+/// ADDITIVE on top of the baked-in set.
+const BAKED_DEFI_HACKS: &str = include_str!("../../../tests/presets/DefiHacksPresets.json");
+
 impl ExploitTemplate {
     pub fn from_filename(filename: String) -> Vec<Self> {
         let file = File::open(filename).unwrap();
         let exploit_templates: Vec<Self> = serde_json::from_reader(file).unwrap();
         exploit_templates
+    }
+
+    /// Parse the baked-in DefiHacksPresets corpus. Always available — no
+    /// flag, no file path, no I/O at runtime. Panics on parse failure
+    /// because the JSON is shipped with the binary and should be valid by
+    /// construction.
+    pub fn baked_in() -> Vec<Self> {
+        serde_json::from_str(BAKED_DEFI_HACKS)
+            .expect("baked-in DefiHacksPresets.json must parse — ship-blocker if not")
     }
 }
 

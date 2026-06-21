@@ -207,6 +207,8 @@ where
     pub current_self_destructs: Vec<(EVMAddress, usize)>,
     // arbitrary calls
     pub current_arbitrary_calls: Vec<(EVMAddress, EVMAddress, usize)>,
+    // arbitrary ERC20 transfers
+    pub current_arbitrary_transfers: Vec<(EVMAddress, usize)>,
     // integer_overflow
     pub current_integer_overflow: HashSet<(EVMAddress, usize, &'static str)>,
     // relations file handle
@@ -299,6 +301,7 @@ where
             setcode_data: self.setcode_data.clone(),
             current_self_destructs: self.current_self_destructs.clone(),
             current_arbitrary_calls: self.current_arbitrary_calls.clone(),
+            current_arbitrary_transfers: self.current_arbitrary_transfers.clone(),
             current_integer_overflow: self.current_integer_overflow.clone(),
             relations_file: self.relations_file.try_clone().unwrap(),
             relations_hash: self.relations_hash.clone(),
@@ -361,6 +364,7 @@ where
             setcode_data: HashMap::new(),
             current_self_destructs: Default::default(),
             current_arbitrary_calls: Default::default(),
+            current_arbitrary_transfers: Default::default(),
             current_integer_overflow: Default::default(),
             relations_file: std::fs::File::create(format!("{}/relations.log", workdir)).unwrap(),
             relations_hash: HashSet::new(),
@@ -682,13 +686,19 @@ where
                     input.context.address,
                     interp.program_counter(),
                 ));
-                // println!(
-                //     "ub leak {:?} -> {:?} with {:?} {}",
-                //     input.context.caller,
-                //     input.contract,
-                //     hex::encode(input.input.clone()),
-                //     self.jumpi_trace
-                // );
+                // ERC20 transfer detection for arbitrary_transfers oracle
+                let calldata = &input.input;
+                if calldata.len() >= 4 {
+                    let selector = &calldata[..4];
+                    // transfer(address,uint256) = a9059cbb
+                    // transferFrom(address,address,uint256) = 23b872dd
+                    if selector == b"\xa9\x05\x9c\xbb" || selector == b"\x23\xb8\x72\xdd" {
+                        self.current_arbitrary_transfers.push((
+                            input.context.caller,
+                            interp.program_counter(),
+                        ));
+                    }
+                }
                 push_interp!();
                 return (
                     InstructionResult::ArbitraryExternalCallAddressBounded(

@@ -4,22 +4,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use itertools::Itertools;
-use libafl::prelude::HasMetadata;
-use libafl_bolts::impl_serdeany;
 use revm_primitives::{Bytecode, HashSet};
-use serde::{Deserialize, Serialize};
 
 use crate::{
     evm::{
-        blaz::builder::{ArtifactInfoMetadata, BuildJobResult},
         input::{ConciseEVMInput, EVMInput},
         oracle::EVMBugResult,
-        oracles::{ARB_CALL_BUG_IDX, ARB_TRANSFER_BUG_IDX},
-        types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMU256},
+        oracles::ARB_TRANSFER_BUG_IDX,
+        srcmap::SOURCE_MAP_PROVIDER,
+        types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
-    fuzzer::ORACLE_OUTPUT,
     oracle::{Oracle, OracleCtx},
     state::HasExecutionResult,
 };
@@ -35,8 +30,19 @@ impl ArbitraryERC20TransferOracle {
 }
 
 impl
-    Oracle<EVMState, EVMAddress, Bytecode, Bytes, EVMAddress, EVMU256, Vec<u8>, EVMInput, EVMFuzzState, ConciseEVMInput>
-    for ArbitraryERC20TransferOracle
+    Oracle<
+        EVMState,
+        EVMAddress,
+        Bytecode,
+        Bytes,
+        EVMAddress,
+        EVMU256,
+        Vec<u8>,
+        EVMInput,
+        EVMFuzzState,
+        ConciseEVMInput,
+        EVMQueueExecutor,
+    > for ArbitraryERC20TransferOracle
 {
     fn transition(&self, ctx: &mut EVMOracleCtx<'_>, stage: u64) -> u64 {
         0

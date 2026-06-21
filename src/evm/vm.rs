@@ -259,6 +259,8 @@ pub struct EVMState {
     pub typed_bug: HashSet<(String, (EVMAddress, usize))>,
     #[serde(skip)]
     pub arbitrary_calls: HashSet<(EVMAddress, EVMAddress, usize)>,
+    #[serde(skip)]
+    pub arbitrary_transfers: HashSet<(EVMAddress, usize)>,
     // integer overflow in sol
     #[serde(skip)]
     pub integer_overflow: HashSet<(EVMAddress, usize, &'static str)>,
@@ -451,6 +453,7 @@ macro_rules! init_host {
     ($host:expr) => {
         $host.current_self_destructs = vec![];
         $host.current_arbitrary_calls = vec![];
+        $host.current_arbitrary_transfers = vec![];
         $host.call_count = 0;
         $host.jumpi_trace = 37;
         $host.current_typed_bug = vec![];
@@ -557,6 +560,7 @@ where
             self.host.jumpi_trace = 37;
             self.host.current_self_destructs = vec![];
             self.host.current_arbitrary_calls = vec![];
+            self.host.current_arbitrary_transfers = vec![];
             self.host.transient_storage = HashMap::new();
             // Initially, there is no state change
             unsafe {
@@ -828,6 +832,13 @@ where
                 .cloned()
                 .chain(self.host.current_arbitrary_calls.iter().cloned()),
         );
+        r.new_state.arbitrary_transfers = HashSet::from_iter(
+            vm_state
+                .arbitrary_transfers
+                .iter()
+                .cloned()
+                .chain(self.host.current_arbitrary_transfers.iter().cloned()),
+        );
 
         r.new_state.integer_overflow = HashSet::from_iter(
             vm_state
@@ -1066,6 +1077,7 @@ where
             self.host.transient_storage = HashMap::new();
             self.host.current_self_destructs = vec![];
             self.host.current_arbitrary_calls = vec![];
+            self.host.current_arbitrary_transfers = vec![];
             self.host.call_count = 0;
             self.host.jumpi_trace = 37;
             self.host.current_typed_bug = vec![];

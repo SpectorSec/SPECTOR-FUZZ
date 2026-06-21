@@ -51,6 +51,7 @@ use crate::{
         onchain::{flashloan::Flashloan, offchain::OffChainConfig, ChainConfig, OnChain, WHITELIST_ADDR},
         oracles::{
             arb_call::ArbitraryCallOracle,
+            arb_transfer::ArbitraryERC20TransferOracle,
             echidna::EchidnaOracle,
             invariant::InvariantOracle,
             reentrancy::ReentrancyOracle,
@@ -237,44 +238,48 @@ pub fn evm_fuzzer(
 
     #[cfg(feature = "use_presets")]
     {
-        let (has_preset_match, matched_templates, sig_to_addr_abi_map): (
-            bool,
-            Vec<ExploitTemplate>,
-            HashMap<[u8; 4], (EVMAddress, BoxedABI)>,
-        ) = if !config.preset_file_path.is_empty() {
-            let mut sig_to_addr_abi_map = HashMap::new();
-            let exploit_templates = ExploitTemplate::from_filename(config.preset_file_path.clone());
-            let mut matched_templates = vec![];
-            for template in exploit_templates {
-                // to match, all function_sigs in the template
-                // must exists in all abi.function
-                let mut function_sigs = template.function_sigs.clone();
-                for (addr, abis) in &artifacts.address_to_abi_object {
-                    for abi in abis {
-                        for (idx, function_sig) in function_sigs.iter().enumerate() {
-                            if abi.function == function_sig.value {
-                                debug!("matched: {:?} @ {:?}", abi.function, addr);
-                                sig_to_addr_abi_map.insert(function_sig.value, (*addr, abi.clone()));
-                                function_sigs.remove(idx);
-                                break;
-                            }
+        // Start with the baked-in DefiHacksPresets corpus — always loaded,
+        // no flag required. This is the third capability gate flipped to
+        // default-on in this fork (after Sha3Bypass and flashloan accounting).
+        // The README's "80% of previous hacks" claim depends on these
+        // templates being matched against the target's deployed contracts.
+        let mut exploit_templates = ExploitTemplate::baked_in();
+        debug!("loaded {} baked-in exploit templates", exploit_templates.len());
+
+        // If the user passed --preset-file-path, layer those templates ON TOP
+        // of the baked-in set (additive, never replacing). Keeps power-user
+        // workflows working — they can ship their own curated corpus and
+        // still benefit from the baked-in historical set.
+        if !config.preset_file_path.is_empty() {
+            let extra = ExploitTemplate::from_filename(config.preset_file_path.clone());
+            debug!("loaded {} additional templates from {}", extra.len(), config.preset_file_path);
+            exploit_templates.extend(extra);
+        }
+
+        let mut sig_to_addr_abi_map = HashMap::new();
+        let mut matched_templates = vec![];
+        for template in exploit_templates {
+            // to match, all function_sigs in the template
+            // must exists in all abi.function
+            let mut function_sigs = template.function_sigs.clone();
+            for (addr, abis) in &artifacts.address_to_abi_object {
+                for abi in abis {
+                    for (idx, function_sig) in function_sigs.iter().enumerate() {
+                        if abi.function == function_sig.value {
+                            debug!("matched: {:?} @ {:?}", abi.function, addr);
+                            sig_to_addr_abi_map.insert(function_sig.value, (*addr, abi.clone()));
+                            function_sigs.remove(idx);
+                            break;
                         }
                     }
-                    if function_sigs.is_empty() {
-                        matched_templates.push(template);
-                        break;
-                    }
+                }
+                if function_sigs.is_empty() {
+                    matched_templates.push(template);
+                    break;
                 }
             }
-
-            if !matched_templates.is_empty() {
-                (true, matched_templates, sig_to_addr_abi_map)
-            } else {
-                (false, vec![], HashMap::new())
-            }
-        } else {
-            (false, vec![], HashMap::new())
-        };
+        }
+        let has_preset_match = !matched_templates.is_empty();
         debug!("has_preset_match: {} {}", has_preset_match, matched_templates.len());
 
         state.init_presets(has_preset_match, matched_templates.clone(), sig_to_addr_abi_map);
@@ -422,6 +427,9 @@ pub fn evm_fuzzer(
         oracles.push(Rc::new(RefCell::new(ArbitraryCallOracle::new(
             artifacts.address_to_name.clone(),
         ))));
+        oracles.push(Rc::new(RefCell::new(
+            ArbitraryERC20TransferOracle::new(artifacts.address_to_name.clone()),
+        )));
     }
 
     if config.typed_bug {
