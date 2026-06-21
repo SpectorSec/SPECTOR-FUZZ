@@ -65,7 +65,14 @@ where
                 Ok(true) => {
                     if !input.is_step() {
                         // reexecute with sha3 taint analysis
-                        self.sha3_taints.deref().borrow_mut().cleanup();
+                        // Use full_reset (not cleanup) so ctxs / prev_opcode /
+                        // prev_dirty_len from the previous re-execution don't
+                        // leak into this one. Plain cleanup() only resets
+                        // dirty_memory/storage/stack — the call/return ctx
+                        // stack and prev-opcode telemetry both need to be
+                        // reset too or the assertion trips at pc=0 of the
+                        // first opcode in the new execution.
+                        self.sha3_taints.deref().borrow_mut().full_reset();
 
                         (self.evm_executor.deref().borrow_mut()).reexecute_with_middleware(
                             input,

@@ -103,10 +103,24 @@ impl Sha3TaintAnalysis {
         }
     }
 
+    /// Per-frame cleanup. Used INSIDE push_ctx after the current ctx has
+    /// been saved — must NOT clear `ctxs` or it would discard the save.
     pub fn cleanup(&mut self) {
         self.dirty_memory.clear();
         self.dirty_storage.clear();
         self.dirty_stack.clear();
+    }
+
+    /// Full per-execution reset. Call this BETWEEN test cases (not inside
+    /// push_ctx). Without this, dirty state from one re-execution leaks
+    /// into the next — the first opcode of the new run sees a real_stack
+    /// of 0 but a dirty_stack carrying the previous run's leftover, and
+    /// the assertion in on_step trips immediately.
+    pub fn full_reset(&mut self) {
+        self.cleanup();
+        self.ctxs.clear();
+        self.prev_opcode = 0;
+        self.prev_dirty_len = 0;
     }
 
     pub fn write_input(&self, start: usize, length: usize) -> Vec<bool> {
@@ -185,6 +199,28 @@ where
         // skip taint analysis if call depth is too deep
         if host.call_depth > MAX_CALL_DEPTH {
             return;
+        }
+
+        // Self-correcting reset on fresh top-level call entry.
+        //
+        // Within one reexecute_with_middleware invocation, execute_call_single!
+        // (vm.rs:468) creates a NEW Interpreter for EACH top-level call in the
+        // input sequence. The real stack is fresh (empty) on each, but our
+        // shadow state persists across them — feedbacks.rs only calls
+        // full_reset() ONCE at the start of the re-execution, not per call.
+        //
+        // When we observe depth=0 + real_stack=0 + dirty_stack non-empty,
+        // we KNOW there's stale shadow state from a previous top-level
+        // call's RETURN that didn't get cleared. Reset what should reset
+        // at a new top-level boundary: per-frame state (stack, memory, ctxs)
+        // and telemetry. KEEP dirty_storage — storage state legitimately
+        // persists across calls within a single re-execution session.
+        if host.call_depth == 0 && interp.stack.is_empty() && !self.dirty_stack.is_empty() {
+            self.dirty_stack.clear();
+            self.dirty_memory.clear();
+            self.ctxs.clear();
+            self.prev_opcode = 0;
+            self.prev_dirty_len = 0;
         }
 
         //
@@ -523,6 +559,7 @@ where
     fn get_type(&self) -> MiddlewareType {
         MiddlewareType::Sha3TaintAnalysis
     }
+
     fn as_any(&self) -> &dyn any::Any {
         self
     }
