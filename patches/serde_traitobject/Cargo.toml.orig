@@ -1,0 +1,41 @@
+[package]
+name = "serde_traitobject"
+version = "0.2.9"
+license = "MIT OR Apache-2.0"
+authors = ["Alec Mocatta <alec@mocatta.net>"]
+categories = ["development-tools","encoding","rust-patterns","network-programming"]
+keywords = ["trait-object","serialization","serde","distributed"]
+description = """
+Serializable and deserializable trait objects.
+
+This library enables the serialization and deserialization of trait objects such that they can be sent between other processes running the same binary.
+"""
+repository = "https://github.com/alecmocatta/serde_traitobject"
+homepage = "https://github.com/alecmocatta/serde_traitobject"
+documentation = "https://docs.rs/serde_traitobject"
+readme = "README.md"
+edition = "2018"
+
+[badges]
+azure-devops = { project = "alecmocatta/serde_traitobject", pipeline = "tests", build = "9" }
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+serde = "1.0"
+erased-serde = "0.3"
+metatype = "0.2.2"
+
+relative = "0.2"
+serde_closure = { version = "0.3", optional = true }
+
+[dev-dependencies]
+bincode = "1.0"
+serde_closure = "0.3"
+serde_derive = "1.0"
+serde_json = "1.0"
+wasm-bindgen-test = "0.3"
+
+[[test]]
+name = "test"
+path = "tests/test.rs"
+harness = false

@@ -35,16 +35,20 @@ force_cache = []
 use_presets = []
 print_logs = []
 z3_debug = []
-sui_support = [
-    "dep:move-binary-format",
-    "dep:move-core-types",
-    "dep:move-stdlib",
-    "dep:move-vm-runtime",
-    "dep:move-vm-types",
-    "dep:sui-move-natives-latest",
-    "dep:sui-protocol-config",
-    "dep:sui-types",
-]
+# sui_support is disabled during EVM modernization — the ityfuzz-sui-fork
+# workspace-hack references several stale/yanked crates (core2 0.4.0,
+# wasm-bindgen-backend "spans" feature) that block fresh Cargo resolution.
+# Re-enable once the Sui fork is updated to a current workspace-hack.
+# sui_support = [
+#     "dep:move-binary-format",
+#     "dep:move-core-types",
+#     "dep:move-stdlib",
+#     "dep:move-vm-runtime",
+#     "dep:move-vm-types",
+#     "dep:sui-move-natives-latest",
+#     "dep:sui-protocol-config",
+#     "dep:sui-types",
+# ]
 debug = []
 flashloan_debug = []
 no_etherscan = []
@@ -82,45 +86,33 @@ typetag = "0.2.13"
 lazy_static = "1.4.0"
 num_cpus = "1.0"
 
-revm = { git = "https://github.com/fuzzland/revm", rev = "1dead51", features = [
-    "no_gas_measuring",
-    "serde",
-    "memory_limit",
-] }
-revm-primitives = { git = "https://github.com/fuzzland/revm", rev = "1dead51", features = [
-    "no_gas_measuring",
-    "serde",
-    "memory_limit",
-] }
-revm-interpreter = { git = "https://github.com/fuzzland/revm", rev = "1dead51", features = [
-    "no_gas_measuring",
-    "serde",
-    "memory_limit",
-] }
+revm = { version = "41.0.0", features = ["serde", "memory_limit"] }
+revm-primitives = { version = "41.0.0", features = ["serde"] }
+revm-interpreter = { version = "41.0.0", features = ["serde", "memory_limit"] }
 
-move-binary-format = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-move-core-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
-    "address32",
-], optional = true }
-move-stdlib = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-move-vm-runtime = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
-    "lazy_natives",
-], optional = true }
-move-vm-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-sui-move-natives-latest = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-sui-protocol-config = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-sui-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# Sui optional deps disabled — see sui_support feature comment above.
+# move-binary-format = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# move-core-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
+#     "address32",
+# ], optional = true }
+# move-stdlib = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# move-vm-runtime = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
+#     "lazy_natives",
+# ], optional = true }
+# move-vm-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# sui-move-natives-latest = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# sui-protocol-config = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
+# sui-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
 
 # template engine
 handlebars = "4.4"
 
 # for cheatcode middleware
-# TODO: enable cheatcode when https://github.com/matter-labs/zksync-era/issues/4581 is resolved
-# foundry-cheatcodes = { git = "https://github.com/foundry-rs/foundry.git", rev = "617dfc28" }
-alloy-sol-types = "0.6"
-alloy-dyn-abi = { version = "0.6", features = ["arbitrary", "eip712"] }
-alloy-primitives = "0.6"
-alloy-json-abi = "0.6"
+foundry-cheatcodes = { git = "https://github.com/foundry-rs/foundry.git", rev = "e98c9385f170410c9e6f58de9d306734ff6e547a" }
+alloy-sol-types = "1.6.0"
+alloy-dyn-abi = { version = "1.6.0", features = ["arbitrary", "eip712"] }
+alloy-primitives = "1.6.0"
+alloy-json-abi = "1.6.0"
 # error handling
 anyhow = "1.0"
 thiserror = "1.0"
@@ -130,3 +122,74 @@ tracing-subscriber = "0.3"
 colored = "2.0"
 evmole = "0.3.8"
 semver = "1.0.22"
+
+# foundry at rev e98c938 uses many custom git sources rather than crates.io releases.
+# These patches replicate foundry's own Cargo.lock pinning so our dep resolution
+# agrees with what foundry's workspace compiled against.
+[patch.crates-io]
+# foundry-rs/foundry-core — three different revs, one per package group
+foundry-compilers = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
+foundry-compilers-artifacts = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
+foundry-compilers-artifacts-solc = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
+foundry-compilers-artifacts-vyper = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
+foundry-compilers-core = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
+foundry-fork-db = { git = "https://github.com/foundry-rs/foundry-core", rev = "ba6246789fc12cf8fe78aa74aadf31d663f08c1f" }
+foundry-wallets = { git = "https://github.com/foundry-rs/foundry-core", rev = "6bea29247c2fa37344337d7434cd8aaf2f479182" }
+# foundry-rs/optimism — custom branch with Karst hardfork + alloy-op-evm
+alloy-op-evm = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+alloy-op-hardforks = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy-consensus = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy-network = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy-provider = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy-rpc-types = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+op-alloy-rpc-types-engine = { git = "https://github.com/foundry-rs/optimism", branch = "bump-alloy-evm-0-36-tempo" }
+# foundry-rs/op-revm
+op-revm = { git = "https://github.com/foundry-rs/op-revm", rev = "c10fd76e66fd46cebc08ba370aa58bde72b94140" }
+# paradigmxyz/reth — git packages that crates.io can't satisfy
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-db-models = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-prune-types = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "f955d2907c9b51f101ec93848bce36101a1ee7e3" }
+# paradigmxyz/solar
+solar-ast = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-config = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-data-structures = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-interface = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-macros = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-parse = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+solar-sema = { git = "https://github.com/paradigmxyz/solar", rev = "da6b0c3a8c0edd23f8b1414c61418ba78d6c4670" }
+# tempoxyz/tempo
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-chainspec = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-dkg-onchain-artifacts = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-evm = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-precompiles = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-precompiles-macros = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+tempo-revm = { git = "https://github.com/tempoxyz/tempo", rev = "2cf84002140367ff6de3268e5bf39972b8a0dc6c" }
+# tempoxyz/mpp-rs
+mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "9de5344a961c13dd4b20186e665bdcf61ed0e2df" }
+# serde_traitobject 0.2.9 uses ptr-cast to add Send/Sync (E0804 in rustc 1.96).
+# Local patch replaces those casts with transmute per the compiler's own suggestion.
+serde_traitobject = { path = "patches/serde_traitobject" }
