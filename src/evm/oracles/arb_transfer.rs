@@ -4,7 +4,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use revm_primitives::{Bytecode, HashSet};
+use revm_interpreter::bytecode::Bytecode;
+use revm_primitives::{HashSet};
 
 use crate::{
     evm::{

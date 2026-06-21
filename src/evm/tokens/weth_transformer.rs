@@ -3,7 +3,12 @@ use std::fmt::Debug;
 use alloy_primitives::hex;
 use bytes::Bytes;
 use libafl::schedulers::Scheduler;
-use revm_interpreter::{CallContext, CallScheme, Contract, Interpreter};
+use revm_interpreter::{
+    interpreter::{ExtBytecode, InputsImpl, SharedMemory},
+    interpreter_types::ReturnData as ReturnDataTr,
+    CallInput, Interpreter,
+};
+use revm_primitives::{hardfork::SpecId, Bytes as PrimBytes};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::{uniswap::CODE_REGISTRY, PairContext};
@@ -73,33 +78,34 @@ impl PairContext for WethContext {
 
         let addr = self.weth_address;
         let code = get_code_tokens!(addr, vm, state);
-        let call = Contract::new_with_context_analyzed(
-            if reverse {
-                // buy
-                Bytes::from(vec![])
-            } else {
-                // sell
-                withdraw_bytes(amount)
-            },
-            code,
-            &CallContext {
-                address: addr,
-                caller: if reverse { *next } else { *src },
-                code_address: addr,
-                apparent_value: if reverse { amount } else { EVMU256::ZERO },
-                scheme: CallScheme::Call,
-            },
+        let calldata = if reverse { Bytes::from(vec![]) } else { withdraw_bytes(amount) };
+        let caller = if reverse { *next } else { *src };
+        let call_value = if reverse { amount } else { EVMU256::ZERO };
+        let interp_input = InputsImpl {
+            target_address: addr,
+            bytecode_address: Some(addr),
+            caller_address: caller,
+            input: CallInput::Bytes(PrimBytes::copy_from_slice(calldata.as_ref())),
+            call_value,
+        };
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT),
+            ExtBytecode::new((*code).clone()),
+            interp_input,
+            false,
+            SpecId::PRAGUE,
+            1e10 as u64,
         );
-        let mut interp = Interpreter::new_with_memory_limit(call.clone(), 1e10 as u64, false, MEM_LIMIT);
         let ir = vm.host.run_inspect(&mut interp, state);
         if !is_call_success!(ir) {
             println!(
                 "call: {:?} => {:?} {:?}",
-                call.caller,
-                call.address,
-                hex::encode(call.input)
+                caller,
+                addr,
+                hex::encode(calldata.as_ref())
             );
-            panic!("Weth call failed: {:?} {:?}", ir, interp.return_value());
+            panic!("Weth call failed: {:?}", ir);
+            #[allow(unreachable_code)]
             return None;
         }
 

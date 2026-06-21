@@ -295,7 +295,7 @@ impl TokenContext {
             if let PairContextTy::Weth(ctx) = &self.swaps[0].route[0] {
                 ctx.deref()
                     .borrow_mut()
-                    .transform(&src, &EVMAddress::zero(), amount_in, state, vm, false)
+                    .transform(&src, &EVMAddress::ZERO, amount_in, state, vm, false)
                     .map(|_| ());
             } else {
                 panic!("Invalid weth context");
@@ -312,7 +312,7 @@ impl TokenContext {
             for (nth, pair) in path_ctx.route.iter().enumerate() {
                 let is_final = nth == path_len - 1;
                 let next = if is_final {
-                    EVMAddress::zero()
+                    EVMAddress::ZERO
                 } else {
                     match &path_ctx.route[nth + 1] {
                         PairContextTy::Uniswap(ctx) => ctx.borrow().pair_address,
@@ -753,7 +753,7 @@ mod tests {
     EVMAddress::from_str("0xf3ae5d769e153ef72b4e3591ac004e89f48107a1").
     unwrap();     let amount =
     EVMU256::from_str("2000000000000000000").unwrap();     // dpr => weth
-        trade("buy", token, amount, 1, 19044110, &EVMAddress::zero());
+        trade("buy", token, amount, 1, 19044110, &EVMAddress::ZERO);
     }
 
     const DPR_RICH: &str = "0x1959f0401e101620dd7e2ab5456f4b4a6e289aaf";
@@ -778,7 +778,7 @@ mod tests {
         let token =  EVMAddress::from_str("0xf3ae5d769e153ef72b4e3591ac004e89f48107a1").unwrap();
         let amount = EVMU256::from_str("2000000000000000000").unwrap();
         // dpr => usdc => weth
-        trade("buy", token, amount, 0, 19044110, &EVMAddress::zero());
+        trade("buy", token, amount, 0, 19044110, &EVMAddress::ZERO);
     }
 
     // https://www.tdly.co/shared/simulation/c1d5d70f-8718-4740-961a-3f789a0834c1
@@ -787,7 +787,7 @@ mod tests {
         let token = EVMAddress::from_str("0x72e4f9F808C49A2a61dE9C5896298920Dc4EEEa9").unwrap();
         let amount = EVMU256::from_str("2000000000000000000").unwrap();
         // HarryPotterObamaSonic10Inu => weth
-        trade("buy", token, amount, 0, 19044110, &EVMAddress::zero());
+        trade("buy", token, amount, 0, 19044110, &EVMAddress::ZERO);
     }
 
     // https://www.tdly.co/shared/simulation/83d283d4-b367-4893-85a4-4af19fc9a80b
@@ -796,7 +796,7 @@ mod tests {
         let token = EVMAddress::from_str("0x72e4f9F808C49A2a61dE9C5896298920Dc4EEEa9").unwrap();
         let amount = EVMU256::from_str("2000000000000000000").unwrap();
         // HarryPotterObamaSonic10Inu => OSAK => weth
-        trade("buy", token, amount, 1, 19044110, &EVMAddress::zero());
+        trade("buy", token, amount, 1, 19044110, &EVMAddress::ZERO);
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
         let token = EVMAddress::from_str("0x72e4f9F808C49A2a61dE9C5896298920Dc4EEEa9").unwrap();
         let amount = EVMU256::from_str("2000000000000000000").unwrap();
         // HarryPotterObamaSonic10Inu => weth
-        trade("buy", token, amount, 2, 19044110, &EVMAddress::zero());
+        trade("buy", token, amount, 2, 19044110, &EVMAddress::ZERO);
     }
 
     #[test]
@@ -813,7 +813,7 @@ mod tests {
         let token = EVMAddress::from_str("0xE77EC1bF3A5C95bFe3be7BDbACfe3ac1c7E454CD").unwrap();
         let amount = EVMU256::from_str("2000000000000000000").unwrap();
         // weth => MINER
-        trade("buy", token, amount, 0, 19226633, &EVMAddress::zero());
+        trade("buy", token, amount, 0, 19226633, &EVMAddress::ZERO);
     }
 
     #[test]

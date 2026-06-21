@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bytes::Bytes;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{

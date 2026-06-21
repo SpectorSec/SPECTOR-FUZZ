@@ -10,6 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use revm_primitives::Bytes as PrimBytes;
 use hex;
 use itertools::Itertools;
 use libafl::{
@@ -19,7 +20,8 @@ use libafl::{
     state::HasCorpus,
 };
 use libafl_bolts::impl_serdeany;
-use revm_primitives::{Bytecode, Env};
+use revm_interpreter::bytecode::Bytecode;
+use crate::evm::types::Env;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
@@ -206,7 +208,7 @@ where
             info!("Deploying contract: {}", contract.name);
             let deployed_address = if !contract.is_code_deployed {
                 match self.executor.deploy(
-                    Bytecode::new_raw(Bytes::from(contract.code.clone())),
+                    Bytecode::new_raw(PrimBytes::from(contract.code.clone())),
                     Some(Bytes::from(contract.constructor_args.clone())),
                     contract.deployed_address,
                     self.state,
@@ -221,7 +223,7 @@ where
             } else {
                 debug!("Contract {} is already deployed", contract.name);
                 // directly set bytecode
-                let contract_code = Bytecode::new_raw(Bytes::from(contract.code.clone()));
+                let contract_code = Bytecode::new_raw(PrimBytes::from(contract.code.clone()));
                 bytecode_analyzer::add_analysis_result_to_state(&contract_code, self.state);
                 self.executor
                     .host
@@ -370,7 +372,7 @@ where
             }
             artifacts
                 .address_to_bytecode
-                .insert(contract.deployed_address, Bytecode::new_raw(Bytes::from(code)));
+                .insert(contract.deployed_address, Bytecode::new_raw(PrimBytes::from(code)));
 
             let mut name = contract.name.clone().trim_end_matches('*').to_string();
             if name != format!("{:?}", contract.deployed_address) {
@@ -513,7 +515,7 @@ where
             self.state.add_caller(&caller);
             self.executor
                 .host
-                .set_code(caller, Bytecode::new_raw(Bytes::from(vec![0xfd, 0x00])), self.state);
+                .set_code(caller, Bytecode::new_raw(PrimBytes::from(vec![0xfd, 0x00])), self.state);
             self.executor
                 .host
                 .evmstate
@@ -525,7 +527,7 @@ where
         // TODO: enable cheatcode when https://github.com/matter-labs/zksync-era/issues/4581 is resolved
         // self.executor.host.set_code(
         //     CHEATCODE_ADDRESS,
-        //     Bytecode::new_raw(Bytes::from(vec![0xfd, 0x00])),
+        //     Bytecode::new_raw(PrimBytes::from(vec![0xfd, 0x00])),
         //     self.state,
         // );
     }

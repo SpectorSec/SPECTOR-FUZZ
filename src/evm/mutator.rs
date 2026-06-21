@@ -9,7 +9,7 @@ use libafl::{
     Error,
 };
 use libafl_bolts::{prelude::Rand, Named};
-use revm_interpreter::Interpreter;
+use revm_interpreter::{interpreter_types::Jumps, Interpreter};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::onchain::flashloan::CAN_LIQUIDATE;
@@ -84,7 +84,7 @@ impl AccessPattern {
 
     /// Record access pattern of current opcode executed by the interpreter
     pub fn decode_instruction(&mut self, interp: &Interpreter) {
-        match unsafe { *interp.instruction_pointer } {
+        match interp.bytecode.opcode() {
             0x31 => self.balance.push(convert_u256_to_h160(interp.stack.peek(0).unwrap())),
             0x33 => self.caller = true,
             0x3a => self.gas_price = true,

@@ -1,4 +1,4 @@
-use revm_interpreter::opcode::{INVALID, JUMP, JUMPI, RETURN, REVERT, STOP};
+use revm_interpreter::bytecode::opcode::{INVALID, JUMP, JUMPI, RETURN, REVERT, STOP};
 
 #[cfg(not(test))]
 pub static mut SKIP_CBOR: bool = false;

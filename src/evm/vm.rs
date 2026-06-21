@@ -17,18 +17,12 @@ use bytes::Bytes;
 use itertools::Itertools;
 use libafl::schedulers::Scheduler;
 use revm_interpreter::{
-    BytecodeLocked,
-    CallContext,
-    CallScheme,
-    Contract,
-    Gas,
-    InstructionResult,
-    InstructionResult::ControlLeak,
-    Interpreter,
-    Memory,
-    Stack,
+    interpreter::{ExtBytecode, InputsImpl, SharedMemory},
+    interpreter_types::{Jumps, ReturnData as ReturnDataTr},
+    CallInput, InstructionResult, Interpreter, Stack,
 };
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
+use revm_primitives::{hardfork::SpecId, Bytes as PrimBytes};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, error};
 
@@ -79,8 +73,13 @@ macro_rules! is_call_success {
     ($ret: expr) => {
         $ret == revm_interpreter::InstructionResult::Return ||
             $ret == revm_interpreter::InstructionResult::Stop ||
-            $ret == revm_interpreter::InstructionResult::ControlLeak ||
-            $ret == revm_interpreter::InstructionResult::SelfDestruct
+            $ret == revm_interpreter::InstructionResult::SelfDestruct ||
+            // control-leak is signalled via static flags + Revert, treat as success for token accounting
+            ($ret == revm_interpreter::InstructionResult::Revert && unsafe {
+                crate::evm::host::CONTROL_LEAK_DETECTED ||
+                crate::evm::host::ARBITRARY_CALL_DETECTED ||
+                crate::evm::host::UNBOUNDED_STATIC_CALL_DETECTED
+            })
     };
 }
 
@@ -107,30 +106,23 @@ pub enum Constraint {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SinglePostExecution {
     /// All continuation info
-    /// Instruction pointer.
+    /// Instruction pointer (byte offset into bytecode).
     pub program_counter: usize,
-    /// Return is main control flag, it tell us if we should continue
-    /// interpreter or break from it
-    pub instruction_result: InstructionResult,
-    /// Memory.
-    pub memory: Memory,
-    /// Stack.
-    pub stack: Stack,
-    /// Return value.
-    pub return_range: Range<usize>,
+    /// Memory snapshot (raw bytes).
+    pub memory: Vec<u8>,
+    /// Stack snapshot.
+    pub stack: Vec<EVMU256>,
     /// Is interpreter call static.
     pub is_static: bool,
-    /// Contract information and invoking data
-    pub input: Bytes,
-    /// Bytecode contains contract code, size of original code, analysis with
-    /// gas block and jump table. Note that current code is extended with
-    /// push padding and STOP at end.
+    /// Calldata bytes.
+    pub input: Vec<u8>,
+    /// Bytecode address (code_address).
     pub code_address: EVMAddress,
-    /// Contract address
+    /// Contract address (target_address).
     pub address: EVMAddress,
     /// Caller of the EVM.
     pub caller: EVMAddress,
-    /// Value send to contract.
+    /// Value sent to contract.
     pub value: EVMU256,
 
     /// Post execution related information
@@ -143,9 +135,8 @@ pub struct SinglePostExecution {
 impl Hash for SinglePostExecution {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.program_counter.hash(state);
-        self.memory.data.hash(state);
-        self.stack.data.hash(state);
-        self.return_range.hash(state);
+        self.memory.hash(state);
+        self.stack.hash(state);
         self.is_static.hash(state);
         self.input.hash(state);
         self.code_address.hash(state);
@@ -158,52 +149,55 @@ impl Hash for SinglePostExecution {
 }
 
 impl SinglePostExecution {
-    /// Convert the post execution context to revm [`CallContext`]
-    fn get_call_ctx(&self) -> CallContext {
-        CallContext {
-            address: self.address,
-            caller: self.caller,
-            apparent_value: self.value,
-            code_address: self.code_address,
-            scheme: CallScheme::Call,
-        }
-    }
+    fn get_interpreter(&self, bytecode: Arc<Bytecode>) -> Interpreter {
+        let mut ext_bytecode = ExtBytecode::new((*bytecode).clone());
+        ext_bytecode.absolute_jump(self.program_counter);
 
-    fn get_interpreter(&self, bytecode: Arc<BytecodeLocked>) -> Interpreter {
-        let contract = Contract::new_with_context_analyzed(self.input.clone(), bytecode, &self.get_call_ctx());
-
-        let mut stack = Stack::new();
-        for v in &self.stack.data {
-            let _ = stack.push(*v);
+        let mut mem = SharedMemory::new_with_memory_limit(MEM_LIMIT);
+        if !self.memory.is_empty() {
+            mem.resize(self.memory.len());
+            mem.set(0, &self.memory);
         }
 
-        Interpreter {
-            instruction_pointer: unsafe { contract.bytecode.as_ptr().add(self.program_counter) },
-            instruction_result: self.instruction_result,
-            gas: Gas::new(0),
-            memory: self.memory.clone(),
-            stack,
-            return_data_buffer: Bytes::new(),
-            return_range: self.return_range.clone(),
-            is_static: self.is_static,
-            contract,
-            memory_limit: MEM_LIMIT,
+        let interp_input = InputsImpl {
+            target_address: self.address,
+            bytecode_address: Some(self.code_address),
+            caller_address: self.caller,
+            input: CallInput::Bytes(PrimBytes::copy_from_slice(&self.input)),
+            call_value: self.value,
+        };
+
+        let mut interp = Interpreter::new(
+            mem,
+            ext_bytecode,
+            interp_input,
+            self.is_static,
+            SpecId::PRAGUE,
+            u64::MAX,
+        );
+
+        for v in &self.stack {
+            let _ = interp.stack.push(*v);
         }
+
+        interp
     }
 
     pub fn from_interp(interp: &Interpreter, (out_offset, out_len): (usize, usize)) -> Self {
+        let input_bytes = match &interp.input.input {
+            CallInput::Bytes(b) => b.to_vec(),
+            CallInput::SharedBuffer(_) => vec![],
+        };
         Self {
-            program_counter: interp.program_counter(),
-            instruction_result: interp.instruction_result,
-            memory: interp.memory.clone(),
-            stack: interp.stack.clone(),
-            return_range: interp.return_range.clone(),
-            is_static: interp.is_static,
-            input: interp.contract.input.clone(),
-            code_address: interp.contract.code_address,
-            address: interp.contract.address,
-            caller: interp.contract.caller,
-            value: interp.contract.value,
+            program_counter: interp.bytecode.pc(),
+            memory: interp.memory.context_memory().to_vec(),
+            stack: interp.stack.data().clone(),
+            is_static: interp.runtime_flag.is_static,
+            input: input_bytes,
+            code_address: interp.input.bytecode_address.unwrap_or(interp.input.target_address),
+            address: interp.input.target_address,
+            caller: interp.input.caller_address,
+            value: interp.input.call_value,
             output_len: out_len,
             output_offset: out_offset,
         }
@@ -465,12 +459,25 @@ macro_rules! init_host {
 }
 
 macro_rules! execute_call_single {
-    ($ctx:expr, $host:expr, $state:expr, $address: expr, $by: expr) => {{
+    ($caller:expr, $address:expr, $value:expr, $host:expr, $state:expr, $by: expr) => {{
         let code = $host.code.get($address).expect("no code").clone();
-        let call = Contract::new_with_context_analyzed($by.clone(), code, &$ctx);
-        let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
+        let interp_input = InputsImpl {
+            target_address: *$address,
+            bytecode_address: Some(*$address),
+            caller_address: $caller,
+            input: CallInput::Bytes(PrimBytes::copy_from_slice($by.as_ref())),
+            call_value: $value,
+        };
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT),
+            ExtBytecode::new((*code).clone()),
+            interp_input,
+            false,
+            SpecId::PRAGUE,
+            1e10 as u64,
+        );
         let ret = $host.run_inspect(&mut interp, $state);
-        (interp.return_value().to_vec(), is_call_success!(ret))
+        (interp.return_data.buffer().to_vec(), is_call_success!(ret))
     }};
 }
 
@@ -492,31 +499,29 @@ where
         unsafe {
             IS_FAST_CALL = true;
         }
-        // debug!("fast call: {:?} {:?} with {}", address, hex::encode(data.to_vec()),
-        // value);
-        let call = Contract::new_with_context_analyzed(
-            data,
-            self.host
-                .code
-                .get(&address)
-                .unwrap_or_else(|| panic!("no code {:?}", address))
-                .clone(),
-            &CallContext {
-                address,
-                caller: from,
-                code_address: address,
-                apparent_value: value,
-                scheme: CallScheme::Call,
-            },
-        );
+        let code = self.host.code.get(&address).unwrap_or_else(|| panic!("no code {:?}", address)).clone();
+        let interp_input = InputsImpl {
+            target_address: address,
+            bytecode_address: Some(address),
+            caller_address: from,
+            input: CallInput::Bytes(PrimBytes::copy_from_slice(data.as_ref())),
+            call_value: value,
+        };
         self.host.evmstate = vm_state.clone();
-        let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT),
+            ExtBytecode::new((*code).clone()),
+            interp_input,
+            false,
+            SpecId::PRAGUE,
+            1e10 as u64,
+        );
         let ret = self.host.run_inspect(&mut interp, state);
         *vm_state = self.host.evmstate.clone();
         unsafe {
             IS_FAST_CALL = false;
         }
-        (interp.return_value(), ret)
+        (Bytes::from(interp.return_data.buffer().to_vec()), ret)
     }
 
     /// Create a new EVM executor given a host and deployer address
@@ -544,7 +549,9 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn execute_from_pc(
         &mut self,
-        call_ctx: &CallContext,
+        caller: EVMAddress,
+        address: EVMAddress,
+        value: EVMU256,
         vm_state: &EVMState,
         data: Bytes,
         input: &EVMInput,
@@ -581,10 +588,10 @@ where
         let mut repeats = input.get_repeat();
 
         // Get the bytecode
-        let bytecode = match self.host.code.get(&call_ctx.code_address) {
+        let bytecode = match self.host.code.get(&address) {
             Some(i) => i.clone(),
             None => {
-                debug!("no code @ {:?}, did you forget to deploy?", call_ctx.code_address);
+                debug!("no code @ {:?}, did you forget to deploy?", address);
                 return IntermediateExecutionResult {
                     output: Bytes::new(),
                     new_state: EVMState::new(),
@@ -598,37 +605,43 @@ where
 
         // Create the interpreter
         let mut interp = if let Some(ref post_exec_ctx) = post_exec {
-            // If there is a post execution context, then we need to create the interpreter
-            // from the post execution context
+            // Restore interpreter from post-execution context (control-leak step)
             repeats = 1;
-            // setup the pc, memory, and stack as the post execution context
             let mut interp = post_exec_ctx.get_interpreter(bytecode);
-            // set return buffer as the input
-            // we remove the first 4 bytes because the first 4 bytes is the function hash
-            // (00000000 here)
-            interp.return_data_buffer = data.slice(4..);
-            let target_len = min(post_exec_ctx.output_len, interp.return_data_buffer.len());
-            interp
-                .memory
-                .set(post_exec_ctx.output_offset, &interp.return_data_buffer[..target_len]);
+            // Feed the fuzzer's data as the return buffer (skip 4-byte selector)
+            let ret_buf = PrimBytes::copy_from_slice(&data[4..]);
+            let target_len = min(post_exec_ctx.output_len, ret_buf.len());
+            let copy_data = ret_buf.slice(..target_len);
+            interp.memory.set(post_exec_ctx.output_offset, &copy_data);
+            interp.return_data.set_buffer(ret_buf);
             interp
         } else {
-            // if there is no post execution context, then we create the interpreter from
-            // the beginning
-            let call = Contract::new_with_context_analyzed(data, bytecode, call_ctx);
-            Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT)
+            // Fresh interpreter from the beginning
+            let interp_input = InputsImpl {
+                target_address: address,
+                bytecode_address: Some(address),
+                caller_address: caller,
+                input: CallInput::Bytes(PrimBytes::copy_from_slice(data.as_ref())),
+                call_value: value,
+            };
+            Interpreter::new(
+                SharedMemory::new_with_memory_limit(MEM_LIMIT),
+                ExtBytecode::new((*bytecode).clone()),
+                interp_input,
+                false,
+                SpecId::PRAGUE,
+                1e10 as u64,
+            )
         };
 
         // Execute the contract for `repeats` times or until revert
         let mut r = InstructionResult::Stop;
         for _v in 0..repeats - 1 {
-            // debug!("repeat: {:?}", v);
             r = self.host.run_inspect(&mut interp, state);
-            interp.stack.data.clear();
-            interp.memory.data.clear();
-            interp.instruction_pointer = interp.contract.bytecode.as_ptr();
+            interp.stack.data_mut().clear();
+            // re-point bytecode to start
+            interp.bytecode.absolute_jump(0);
             if !is_call_success!(r) {
-                interp.return_range = 0..0;
                 break;
             }
         }
@@ -638,12 +651,12 @@ where
 
         // Build the result
         let mut result = IntermediateExecutionResult {
-            output: interp.return_value(),
+            output: Bytes::from(interp.return_data.buffer().to_vec()),
             new_state: self.host.evmstate.clone(),
-            pc: interp.program_counter(),
+            pc: interp.bytecode.pc(),
             ret: r,
             stack: interp.stack.data().clone(),
-            memory: interp.memory.data().clone(),
+            memory: interp.memory.context_memory().to_vec(),
         };
 
         // [todo] remove this
@@ -672,7 +685,7 @@ where
         state: &mut EVMFuzzState,
     ) -> ExecutionResult<EVMAddress, EVMAddress, VS, Vec<u8>, CI> {
         // Get necessary info from input
-        let mut vm_state = unsafe { input.get_state().as_any().downcast_ref_unchecked::<EVMState>().clone() };
+        let mut vm_state = unsafe { input.get_state().as_any().downcast_ref::<EVMState>().unwrap().clone() };
 
         // check balance
         #[cfg(feature = "real_balance")]
@@ -726,8 +739,9 @@ where
                 for mut pe in post_exec.pes {
                     // we need push the output of CALL instruction
                     let _ = pe.stack.push(EVMU256::from(1));
+                    let (pe_caller, pe_address, pe_value) = (pe.caller, pe.address, pe.value);
                     let res =
-                        self.execute_from_pc(&pe.get_call_ctx(), &vm_state, data, input, Some(pe), state, cleanup);
+                        self.execute_from_pc(pe_caller, pe_address, pe_value, &vm_state, data, input, Some(pe), state, cleanup);
                     data = Bytes::from([vec![0; 4], res.output.to_vec()].concat());
                     local_res = Some(res);
                     if is_reverted_or_control_leak(&local_res.as_ref().unwrap().ret) {
@@ -741,13 +755,9 @@ where
                 let value = input.get_txn_value().unwrap_or(EVMU256::ZERO);
                 let contract_address = input.get_contract();
                 self.execute_from_pc(
-                    &CallContext {
-                        address: contract_address,
-                        caller,
-                        code_address: contract_address,
-                        apparent_value: value,
-                        scheme: CallScheme::Call,
-                    },
+                    caller,
+                    contract_address,
+                    value,
                     &vm_state,
                     data,
                     input,
@@ -769,46 +779,47 @@ where
             }
         }
         let mut r = r.unwrap();
-        match r.ret {
-            ControlLeak |
-            InstructionResult::ArbitraryExternalCallAddressBounded(_, _, _) |
-            InstructionResult::AddressUnboundedStaticCall => {
-                if r.new_state.post_execution.len() + 1 > MAX_POST_EXECUTION {
-                    return ExecutionResult {
-                        output: r.output.to_vec(),
-                        reverted: true,
-                        new_state: StagedVMState::new_uninitialized(),
-                        additional_info: None,
-                    };
-                }
-                let leak_ctx = self.host.leak_ctx.clone();
-                r.new_state.post_execution.push(PostExecutionCtx {
-                    pes: leak_ctx,
-                    must_step: match r.ret {
-                        ControlLeak => false,
-                        InstructionResult::ArbitraryExternalCallAddressBounded(_, _, _) => true,
-                        InstructionResult::AddressUnboundedStaticCall => false,
-                        _ => unreachable!(),
-                    },
-
-                    constraints: match r.ret {
-                        ControlLeak => vec![],
-                        InstructionResult::AddressUnboundedStaticCall => {
-                            vec![Constraint::MustStepNow]
-                        }
-                        InstructionResult::ArbitraryExternalCallAddressBounded(caller, target, value) => {
-                            vec![
-                                Constraint::Caller(caller),
-                                Constraint::Contract(target),
-                                Value(value),
-                                NoLiquidation,
-                            ]
-                        }
-                        _ => unreachable!(),
-                    },
-                });
+        let (is_control_leak, is_arbitrary_call, is_unbounded_static) = unsafe {
+            (
+                crate::evm::host::CONTROL_LEAK_DETECTED,
+                crate::evm::host::ARBITRARY_CALL_DETECTED,
+                crate::evm::host::UNBOUNDED_STATIC_CALL_DETECTED,
+            )
+        };
+        if is_control_leak || is_arbitrary_call || is_unbounded_static {
+            if r.new_state.post_execution.len() + 1 > MAX_POST_EXECUTION {
+                return ExecutionResult {
+                    output: r.output.to_vec(),
+                    reverted: true,
+                    new_state: StagedVMState::new_uninitialized(),
+                    additional_info: None,
+                };
             }
-            _ => {}
+            let leak_ctx = self.host.leak_ctx.clone();
+            let constraints = if is_arbitrary_call {
+                let (arb_caller, arb_target, arb_value) = unsafe {
+                    (
+                        EVMAddress::from(crate::evm::host::ARBITRARY_CALL_CALLER),
+                        EVMAddress::from(crate::evm::host::ARBITRARY_CALL_TARGET),
+                        crate::evm::host::ARBITRARY_CALL_VALUE,
+                    )
+                };
+                vec![
+                    Constraint::Caller(arb_caller),
+                    Constraint::Contract(arb_target),
+                    Value(arb_value),
+                    NoLiquidation,
+                ]
+            } else if is_unbounded_static {
+                vec![Constraint::MustStepNow]
+            } else {
+                vec![]
+            };
+            r.new_state.post_execution.push(PostExecutionCtx {
+                pes: leak_ctx,
+                must_step: is_arbitrary_call,
+                constraints,
+            });
         }
 
         r.new_state.typed_bug = HashSet::from_iter(
@@ -848,27 +859,22 @@ where
                 .chain(self.host.current_integer_overflow.iter().cloned()),
         );
 
-        unsafe {
-            ExecutionResult {
-                output: r.output.to_vec(),
-                reverted: !matches!(
-                    r.ret,
-                    InstructionResult::Return |
-                        InstructionResult::Stop |
-                        InstructionResult::ControlLeak |
-                        InstructionResult::SelfDestruct |
-                        InstructionResult::AddressUnboundedStaticCall |
-                        InstructionResult::ArbitraryExternalCallAddressBounded(_, _, _)
-                ),
-                new_state: StagedVMState::new_with_state(
-                    VMStateT::as_any(&r.new_state).downcast_ref_unchecked::<VS>().clone(),
-                ),
-                additional_info: if r.ret == ControlLeak {
-                    Some(vec![self.host.call_count as u8])
-                } else {
-                    None
-                },
-            }
+        ExecutionResult {
+            output: r.output.to_vec(),
+            reverted: !matches!(
+                r.ret,
+                InstructionResult::Return |
+                    InstructionResult::Stop |
+                    InstructionResult::SelfDestruct
+            ) && !is_control_leak && !is_arbitrary_call && !is_unbounded_static,
+            new_state: StagedVMState::new_with_state(
+                VMStateT::as_any(&r.new_state).downcast_ref::<VS>().unwrap().clone(),
+            ),
+            additional_info: if is_control_leak {
+                Some(vec![self.host.call_count as u8])
+            } else {
+                None
+            },
         }
     }
 
@@ -895,14 +901,7 @@ where
         let res = data
             .iter()
             .map(|(caller, address, by, value)| {
-                let ctx = CallContext {
-                    address: *address,
-                    caller: *caller,
-                    code_address: *address,
-                    apparent_value: *value,
-                    scheme: CallScheme::Call,
-                };
-                execute_call_single!(ctx, self.host, state, address, by)
+                execute_call_single!(*caller, address, *value, self.host, state, by)
             })
             .collect::<Vec<(Vec<u8>, bool)>>();
         (res, self.host.evmstate.clone())
@@ -920,14 +919,7 @@ where
         let res = data
             .iter()
             .map(|(caller, address, by)| {
-                let ctx = CallContext {
-                    address: *address,
-                    caller: *caller,
-                    code_address: *address,
-                    apparent_value: Default::default(),
-                    scheme: CallScheme::Call,
-                };
-                execute_call_single!(ctx, self.host, state, address, by)
+                execute_call_single!(*caller, address, EVMU256::ZERO, self.host, state, by)
             })
             .collect::<Vec<(Vec<u8>, bool)>>();
         (res, self.host.evmstate.clone())
@@ -953,19 +945,26 @@ where
         state: &mut EVMFuzzState,
     ) -> Option<EVMAddress> {
         debug!("deployer = 0x{} ", hex::encode(self.deployer));
-        let deployer = Contract::new(
-            constructor_args.unwrap_or_default(),
-            code,
-            deployed_address,
-            deployed_address,
-            self.deployer,
-            EVMU256::from(0),
-        );
+        let calldata = PrimBytes::copy_from_slice(constructor_args.unwrap_or_default().as_ref());
+        let interp_input = InputsImpl {
+            target_address: deployed_address,
+            bytecode_address: Some(deployed_address),
+            caller_address: self.deployer,
+            input: CallInput::Bytes(calldata),
+            call_value: EVMU256::ZERO,
+        };
         // disable middleware for deployment
         unsafe {
             IN_DEPLOY = true;
         }
-        let mut interp = Interpreter::new_with_memory_limit(deployer, 1e10 as u64, false, MEM_LIMIT);
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT),
+            ExtBytecode::new(code),
+            interp_input,
+            false,
+            SpecId::PRAGUE,
+            1e10 as u64,
+        );
         let mut dummy_state = EVMFuzzState::default();
         let r = self.host.run_inspect(&mut interp, &mut dummy_state);
         unsafe {
@@ -975,12 +974,8 @@ where
             error!("deploy failed: {:?}", r);
             return None;
         }
-        // debug!(
-        //     "deployer = 0x{} contract = {:?}",
-        //     hex::encode(self.deployer),
-        //     hex::encode(interp.return_value())
-        // );
-        let mut contract_code = Bytecode::new_raw(interp.return_value());
+        let runtime_bytes: PrimBytes = interp.return_data.buffer().clone();
+        let mut contract_code = Bytecode::new_raw(runtime_bytes);
         bytecode_analyzer::add_analysis_result_to_state(&contract_code, state);
         unsafe {
             invoke_middlewares!(
@@ -1017,11 +1012,10 @@ where
                         .unwrap_or_else(|| panic!("unknown token : {:?}", token))
                         .clone()
                 };
-                self.host.evmstate = unsafe {
-                    VMStateT::as_any(input.get_state())
-                        .downcast_ref_unchecked::<EVMState>()
-                        .clone()
-                };
+                self.host.evmstate = VMStateT::as_any(input.get_state())
+                    .downcast_ref::<EVMState>()
+                    .unwrap()
+                    .clone();
                 match token_ctx.buy(
                     input.get_txn_value().unwrap(),
                     input.get_caller(),
@@ -1029,31 +1023,29 @@ where
                     self,
                     input.get_randomness().as_slice(),
                 ) {
-                    Some(()) => unsafe {
-                        ExecutionResult {
-                            output: vec![],
-                            reverted: false,
-                            new_state: StagedVMState::new_with_state(
-                                VMStateT::as_any(&self.host.evmstate.clone())
-                                    .downcast_ref_unchecked::<VS>()
-                                    .clone(),
-                            ),
-                            additional_info: None,
-                        }
+                    Some(()) => ExecutionResult {
+                        output: vec![],
+                        reverted: false,
+                        new_state: StagedVMState::new_with_state(
+                            VMStateT::as_any(&self.host.evmstate.clone())
+                                .downcast_ref::<VS>()
+                                .unwrap()
+                                .clone(),
+                        ),
+                        additional_info: None,
                     },
-                    None => {
-                        ExecutionResult {
-                            // we don't have enough liquidity to buy the token
-                            output: vec![],
-                            reverted: true,
-                            new_state: StagedVMState::new_with_state(unsafe {
-                                VMStateT::as_any(input.get_state())
-                                    .downcast_ref_unchecked::<VS>()
-                                    .clone()
-                            }),
-                            additional_info: None,
-                        }
-                    }
+                    None => ExecutionResult {
+                        // we don't have enough liquidity to buy the token
+                        output: vec![],
+                        reverted: true,
+                        new_state: StagedVMState::new_with_state(
+                            VMStateT::as_any(input.get_state())
+                                .downcast_ref::<VS>()
+                                .unwrap()
+                                .clone(),
+                        ),
+                        additional_info: None,
+                    },
                 }
             }
             EVMInputTy::Liquidate => {
@@ -1073,7 +1065,7 @@ where
     ) -> Vec<Vec<u8>> {
         unsafe {
             IS_FAST_CALL_STATIC = true;
-            self.host.evmstate = vm_state.as_any().downcast_ref_unchecked::<EVMState>().clone();
+            self.host.evmstate = vm_state.as_any().downcast_ref::<EVMState>().unwrap().clone();
             self.host.transient_storage = HashMap::new();
             self.host.current_self_destructs = vec![];
             self.host.current_arbitrary_calls = vec![];
@@ -1087,19 +1079,25 @@ where
         let res = data
             .iter()
             .map(|(address, by)| {
-                let ctx = CallContext {
-                    address: *address,
-                    caller: Default::default(),
-                    code_address: *address,
-                    apparent_value: Default::default(),
-                    scheme: CallScheme::StaticCall,
-                };
                 let code = self.host.code.get(address).expect("no code").clone();
-                let call = Contract::new_with_context_analyzed(by.clone(), code.clone(), &ctx);
-                let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
+                let interp_input = InputsImpl {
+                    target_address: *address,
+                    bytecode_address: Some(*address),
+                    caller_address: EVMAddress::default(),
+                    input: CallInput::Bytes(PrimBytes::copy_from_slice(by.as_ref())),
+                    call_value: EVMU256::ZERO,
+                };
+                let mut interp = Interpreter::new(
+                    SharedMemory::new_with_memory_limit(MEM_LIMIT),
+                    ExtBytecode::new((*code).clone()),
+                    interp_input,
+                    true,
+                    SpecId::PRAGUE,
+                    1e10 as u64,
+                );
                 let ret = self.host.run_inspect(&mut interp, state);
                 if is_call_success!(ret) {
-                    interp.return_value().to_vec()
+                    interp.return_data.buffer().to_vec()
                 } else {
                     vec![]
                 }
@@ -1121,7 +1119,7 @@ where
     ) -> (Vec<(Vec<u8>, bool)>, VS) {
         unsafe {
             // IS_FAST_CALL = true;
-            self.host.evmstate = vm_state.as_any().downcast_ref_unchecked::<EVMState>().clone();
+            self.host.evmstate = vm_state.as_any().downcast_ref::<EVMState>().unwrap().clone();
         }
         init_host!(self.host);
 
@@ -1130,14 +1128,7 @@ where
         let res = data
             .iter()
             .map(|(caller, address, by)| {
-                let ctx = CallContext {
-                    address: *address,
-                    caller: *caller,
-                    code_address: *address,
-                    apparent_value: Default::default(),
-                    scheme: CallScheme::Call,
-                };
-                let res = execute_call_single!(ctx, self.host, state, address, by);
+                let res = execute_call_single!(*caller, address, EVMU256::ZERO, self.host, state, by);
                 if let Some((_, _, r)) = self.host.check_assert_result() {
                     return (r.to_vec(), false);
                 }
@@ -1146,7 +1137,7 @@ where
             .collect::<Vec<(Vec<u8>, bool)>>();
 
         (res, unsafe {
-            self.host.evmstate.as_any().downcast_ref_unchecked::<VS>().clone()
+            self.host.evmstate.as_any().downcast_ref::<VS>().unwrap().clone()
         })
     }
 
@@ -1182,7 +1173,7 @@ mod tests {
     use bytes::Bytes;
     use libafl::prelude::StdScheduler;
     use libafl_bolts::tuples::tuple_list;
-    use revm_primitives::Bytecode;
+    use revm_interpreter::bytecode::Bytecode;
     use tracing::debug;
 
     use crate::{

@@ -2,6 +2,7 @@
 #![feature(let_chains)]
 #![feature(unchecked_math)]
 #![feature(trait_alias)]
+#![allow(static_mut_refs)]
 
 extern crate core;
 

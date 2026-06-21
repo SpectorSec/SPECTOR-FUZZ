@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use itertools::Itertools;
 use libafl::state::HasMetadata;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{

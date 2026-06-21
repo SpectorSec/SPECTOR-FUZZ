@@ -584,13 +584,13 @@ where
                     .append(true)
                     .open(vuln_file)
                     .expect("Unable to open file");
-                f.write_all(unsafe {
+                let oracle_str = unsafe {
                     ORACLE_OUTPUT
                         .iter()
                         .map(|v| serde_json::to_string(v).expect("failed to json"))
                         .join("\n")
-                        .as_bytes()
-                })
+                };
+                f.write_all(oracle_str.as_bytes())
                 .expect("Unable to write data");
                 f.write_all(b"\n").expect("Unable to write data");
 

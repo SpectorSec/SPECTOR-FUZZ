@@ -8,7 +8,7 @@ use libafl::{
 };
 use primitive_types::U512;
 use revm_interpreter::Interpreter;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 use serde::{Deserialize, Serialize};
 
 use crate::evm::{

@@ -3,7 +3,21 @@ use crypto::{digest::Digest, sha3::Sha3};
 use libafl::prelude::HasRand;
 use libafl_bolts::bolts_prelude::{Rand, RomuDuoJrRand};
 use primitive_types::H160;
-use revm_primitives::{ruint::aliases::U512, Bytecode, B160, U256};
+use revm_context::{BlockEnv, CfgEnv, TxEnv};
+use revm_interpreter::bytecode::Bytecode;
+use revm_primitives::{hardfork::SpecId, ruint::aliases::U512, Address, U256};
+use serde::{Deserialize, Serialize};
+
+/// SpecId re-export for callers that previously used `revm_primitives::SpecId`
+pub use revm_primitives::hardfork::SpecId as EVMSpecId;
+
+/// Shim that mirrors the old `revm_primitives::Env` { cfg, block, tx } API.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Env {
+    pub cfg: CfgEnv,
+    pub block: BlockEnv,
+    pub tx: TxEnv,
+}
 
 /// Common generic types for EVM fuzzing
 use crate::evm::input::{ConciseEVMInput, EVMInput};
@@ -21,7 +35,7 @@ use crate::{
     state_input::StagedVMState,
 };
 
-pub type EVMAddress = B160;
+pub type EVMAddress = Address;
 pub type EVMU256 = U256;
 pub type EVMU512 = U512;
 pub type EVMFuzzState = FuzzState<EVMInput, EVMState, EVMAddress, EVMAddress, Vec<u8>, ConciseEVMInput>;
@@ -95,13 +109,17 @@ pub fn generate_random_address<S>(s: &mut S) -> EVMAddress
 where
     S: HasRand,
 {
-    let mut rand_seed: RomuDuoJrRand = RomuDuoJrRand::with_seed(s.rand_mut().next());
-    EVMAddress::random_using(&mut rand_seed)
+    let mut bytes = [0u8; 20];
+    for chunk in bytes.chunks_mut(8) {
+        let val = s.rand_mut().next().to_le_bytes();
+        chunk.copy_from_slice(&val[..chunk.len()]);
+    }
+    EVMAddress::from(bytes)
 }
 
 /// Generate a fixed H160 address from a hex string.
 pub fn fixed_address(s: &str) -> EVMAddress {
-    let mut address = EVMAddress::zero();
+    let mut address = EVMAddress::ZERO;
     address.0.copy_from_slice(&hex::decode(s).unwrap());
     address
 }

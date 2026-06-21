@@ -52,8 +52,6 @@ use num_cpus;
 use onchain::endpoints::{Chain, OnChainConfig};
 use oracles::{erc20::IERC20OracleFlashloan, v2_pair::PairBalanceOracle};
 use producers::erc20::ERC20Producer;
-use revm_primitives::B160;
-// use revm_primitives::ruint::aliases::B160;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
@@ -562,18 +560,18 @@ pub fn evm_main(mut args: EvmArgs) {
             RefCell<
                 dyn Oracle<
                     EVMState,
-                    revm_primitives::B160,
-                    revm_primitives::Bytecode,
+                    EVMAddress,
+                    revm_interpreter::bytecode::Bytecode,
                     bytes::Bytes,
-                    revm_primitives::B160,
+                    EVMAddress,
                     revm_primitives::ruint::Uint<256, 4>,
                     Vec<u8>,
                     EVMInput,
                     FuzzState<
                         EVMInput,
                         EVMState,
-                        revm_primitives::B160,
-                        revm_primitives::B160,
+                        EVMAddress,
+                        EVMAddress,
                         Vec<u8>,
                         ConciseEVMInput,
                     >,
@@ -885,14 +883,14 @@ fn test_evm_offchain_setup() {
             RefCell<
                 dyn Oracle<
                     EVMState,
-                    B160,
-                    revm_primitives::Bytecode,
+                    EVMAddress,
+                    revm_interpreter::bytecode::Bytecode,
                     bytes::Bytes,
-                    B160,
+                    EVMAddress,
                     revm_primitives::ruint::Uint<256, 4>,
                     Vec<u8>,
                     EVMInput,
-                    FuzzState<EVMInput, EVMState, B160, B160, Vec<u8>, ConciseEVMInput>,
+                    FuzzState<EVMInput, EVMState, EVMAddress, EVMAddress, Vec<u8>, ConciseEVMInput>,
                     ConciseEVMInput,
                     EVMQueueExecutor,
                 >,

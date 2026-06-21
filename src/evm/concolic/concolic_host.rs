@@ -12,7 +12,7 @@ use bytes::Bytes;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use libafl::schedulers::Scheduler;
-use revm_interpreter::Interpreter;
+use revm_interpreter::{interpreter_types::{InputsTr, Jumps}, Interpreter};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 use z3::{
@@ -624,7 +624,7 @@ impl ConcolicHost {
 
     pub fn push_ctx(&mut self, interp: &mut Interpreter) {
         // interp.stack.data()[interp.stack.len() - 1 - $idx]
-        let (arg_offset, arg_len) = match unsafe { *interp.instruction_pointer } {
+        let (arg_offset, arg_len) = match interp.bytecode.opcode() {
             0xf1 | 0xf2 => (interp.stack.peek(3).unwrap(), interp.stack.peek(4).unwrap()),
             0xf4 | 0xfa => (interp.stack.peek(2).unwrap(), interp.stack.peek(3).unwrap()),
             _ => {
@@ -820,13 +820,13 @@ where
         {
             debug!(
                 "[concolic] on_step @ {:x}: {:x}",
-                interp.program_counter(),
-                *interp.instruction_pointer
+                interp.bytecode.pc(),
+                interp.bytecode.opcode()
             );
             debug!("[concolic] stack: {:?}", interp.stack);
             debug!("[concolic] symbolic_stack: {:?}", self.symbolic_stack);
             for idx in 0..interp.stack.len() {
-                let real = interp.stack.data[idx];
+                let real = interp.stack.data()[idx];
                 let sym = self.symbolic_stack[idx].clone();
                 if sym.is_some() {
                     if let ConcolicOp::EVMU256(v) = sym.unwrap().op {
@@ -837,7 +837,8 @@ where
             assert_eq!(interp.stack.len(), self.symbolic_stack.len());
         }
 
-        let bv: Vec<Option<Box<Expr>>> = match *interp.instruction_pointer {
+        let opcode = interp.bytecode.opcode();
+        let bv: Vec<Option<Box<Expr>>> = match opcode {
             // ADD
             0x01 => {
                 let res = Some(stack_bv!(0).add(stack_bv!(1)));
@@ -1223,8 +1224,8 @@ where
                     debug!("[concolic] skip solving due to call depth: {}", self.call_depth);
                     need_solve = false;
                 } else {
-                    let pc = interp.program_counter();
-                    let address = &interp.contract.address;
+                    let pc = interp.bytecode.pc();
+                    let address = &interp.input.target_address;
 
                     match SOURCE_MAP_PROVIDER.lock().unwrap().get_source_code(address, pc) {
                         SourceCodeResult::SourceCode(_) => {
@@ -1331,12 +1332,12 @@ where
             }
             // DUP
             0x80..=0x8f => {
-                let _n = (*interp.instruction_pointer) - 0x80;
+                let _n = opcode - 0x80;
                 vec![Some(stack_bv!(usize::from(_n)).clone())]
             }
             // SWAP
             0x90..=0x9f => {
-                let _n = (*interp.instruction_pointer) - 0x90 + 1;
+                let _n = opcode - 0x90 + 1;
                 let swapper = stack_bv!(usize::from(_n));
                 let swappee = stack_bv!(0);
                 let symbolic_stack_len = self.symbolic_stack.len();
@@ -1346,7 +1347,7 @@ where
             }
             // LOG
             0xa0..=0xa4 => {
-                let _n = (*interp.instruction_pointer) - 0xa0;
+                let _n = opcode - 0xa0;
                 concrete_eval!(_n + 2, 0)
             }
             // CREATE
@@ -1394,7 +1395,7 @@ where
                 vec![]
             }
             _ => {
-                panic!("Unsupported opcode: {:?}", *interp.instruction_pointer);
+                panic!("Unsupported opcode: {:?}", opcode);
             }
         };
         // debug!("[concolic] adding bv to stack {:?}", bv);

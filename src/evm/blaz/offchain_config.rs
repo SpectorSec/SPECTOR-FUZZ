@@ -29,7 +29,7 @@ impl OffchainConfig {
 
     pub fn from_json(json: String) -> Result<Self, Box<dyn Error>> {
         let json = serde_json::from_str::<Value>(&json)?;
-        let mut configs = HashMap::new();
+        let mut configs = HashMap::default();
         for (filename, contract) in json.as_object().expect("get contract failed") {
             let contract_obj = contract.as_object().expect("get contract failed");
             for (contract_name, config) in contract_obj {

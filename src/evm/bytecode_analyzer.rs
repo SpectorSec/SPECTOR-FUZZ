@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use libafl::state::{HasMetadata, State};
-use revm_interpreter::opcode::JUMPI;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::opcode::JUMPI;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::evm::bytecode_iterator::all_bytecode;
 /// Analysis passes for EVM bytecode
@@ -66,7 +66,7 @@ where
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use revm_primitives::Bytecode;
+    use revm_interpreter::bytecode::Bytecode;
     use tracing::debug;
 
     use super::*;

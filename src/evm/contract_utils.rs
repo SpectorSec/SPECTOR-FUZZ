@@ -21,7 +21,8 @@ use itertools::Itertools;
 use libafl::{schedulers::StdScheduler, state::HasMetadata};
 use libafl_bolts::AsSlice;
 use regex::Regex;
-use revm_primitives::{bitvec::vec, Bytecode, Env};
+use revm_interpreter::bytecode::Bytecode;
+use crate::evm::types::Env;
 use serde_json::Value;
 
 use crate::{
@@ -38,7 +39,7 @@ use crate::{
 };
 
 extern crate crypto;
-use revm_interpreter::opcode::PUSH4;
+use revm_interpreter::bytecode::opcode::PUSH4;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
@@ -1077,7 +1078,7 @@ impl ContractLoader {
         // Deploy preset WETH
         let weth_addr = EVMAddress::from_str(PRESET_WETH).unwrap();
         let hex_code = include_str!("../../tests/presets/v2_pair/WETH9.bytecode").trim();
-        let weth_code = Bytes::from(hex::decode(hex_code).unwrap());
+        let weth_code: revm_primitives::Bytes = hex::decode(hex_code).unwrap().into();
         let deployed_weth = evm_executor.deploy(Bytecode::new_raw(weth_code), None, weth_addr, &mut state);
         assert!(deployed_weth.is_some(), "failed to deploy WETH");
 
@@ -1087,7 +1088,7 @@ impl ContractLoader {
             // finish link
             for (key, value) in _libs.unwrap().into_iter() {
                 let lib_bytecode = value.deploy_bytecode_str;
-                let lib_bytecode_hex = Bytes::from(hex::decode(lib_bytecode.clone()).unwrap());
+                let lib_bytecode_hex: revm_primitives::Bytes = hex::decode(lib_bytecode.clone()).unwrap().into();
                 let lib_addr = compute_address(&key);
                 let lib_addr = EVMAddress::from_str(lib_addr.as_str()).unwrap();
                 let lib_addr =
@@ -1111,7 +1112,7 @@ impl ContractLoader {
                 assert!(lib_addr.is_some(), "failed to deploy lib");
             }
         }
-        let deploy_code = Bytes::from(hex::decode(deploy_code_str).unwrap());
+        let deploy_code: revm_primitives::Bytes = hex::decode(deploy_code_str).unwrap().into();
         let addr = evm_executor.deploy(
             Bytecode::new_raw(deploy_code),
             None,
@@ -1293,7 +1294,7 @@ impl ContractLoader {
             for middleware in evm_executor.host.middlewares.read().unwrap().clone().into_iter() {
                 if middleware.borrow().get_type() == MiddlewareType::OnChain {
                     unsafe {
-                        let onchain = middleware.borrow().as_any().downcast_ref_unchecked::<OnChain>().clone();
+                        let onchain = middleware.borrow().as_any().downcast_ref::<OnChain>().unwrap().clone();
                         onchain_middleware = Some(onchain);
                     }
                 }

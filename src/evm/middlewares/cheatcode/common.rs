@@ -5,8 +5,9 @@ use alloy_sol_types::SolValue;
 use bytes::Bytes;
 use foundry_cheatcodes::Vm::{self, CallerMode};
 use libafl::schedulers::Scheduler;
-use revm_interpreter::{analysis::to_analysed, BytecodeLocked};
-use revm_primitives::{Bytecode, Env, SpecId, B160, U256};
+use revm_interpreter::bytecode::Bytecode;
+use crate::evm::types::Env;
+use revm_primitives::{hardfork::SpecId, U256};
 
 use super::Cheatcode;
 use crate::evm::{
@@ -71,7 +72,7 @@ where
     /// Sets `block.basefee`.
     #[inline]
     pub fn fee(&self, env: &mut Env, args: Vm::feeCall) -> Option<Vec<u8>> {
-        env.block.basefee = args.newBasefee;
+        env.block.basefee = args.newBasefee.saturating_to::<u64>();
         None
     }
 
@@ -80,7 +81,7 @@ where
     /// instead.
     #[inline]
     pub fn difficulty(&self, env: &mut Env, args: Vm::difficultyCall) -> Option<Vec<u8>> {
-        if env.cfg.spec_id < SpecId::MERGE {
+        if env.cfg.spec < SpecId::MERGE {
             env.block.difficulty = args.newDifficulty;
         }
         None
@@ -90,7 +91,7 @@ where
     /// Not available on EVM versions before Paris. Use `difficulty` instead.
     #[inline]
     pub fn prevrandao(&self, env: &mut Env, args: Vm::prevrandaoCall) -> Option<Vec<u8>> {
-        if env.cfg.spec_id >= SpecId::MERGE {
+        if env.cfg.spec >= SpecId::MERGE {
             env.block.prevrandao = Some(args.newPrevrandao.0.into());
         }
         None
@@ -100,7 +101,7 @@ where
     #[inline]
     pub fn chain_id(&self, env: &mut Env, args: Vm::chainIdCall) -> Option<Vec<u8>> {
         if args.newChainId <= U256::from(u64::MAX) {
-            env.cfg.chain_id = args.newChainId;
+            env.cfg.chain_id = args.newChainId.saturating_to::<u64>();
         }
         None
     }
@@ -108,14 +109,14 @@ where
     /// Sets `tx.gasprice`.
     #[inline]
     pub fn tx_gas_price(&self, env: &mut Env, args: Vm::txGasPriceCall) -> Option<Vec<u8>> {
-        env.tx.gas_price = args.newGasPrice;
+        env.tx.gas_price = args.newGasPrice.saturating_to::<u128>();
         None
     }
 
     /// Sets `block.coinbase`.
     #[inline]
     pub fn coinbase(&self, env: &mut Env, args: Vm::coinbaseCall) -> Option<Vec<u8>> {
-        env.block.coinbase = B160(args.newCoinbase.into());
+        env.block.beneficiary = args.newCoinbase;
         None
     }
 
@@ -126,7 +127,7 @@ where
 
         Some(
             state
-                .sload(B160(target.into()), slot.into())
+                .sload(target, slot.into())
                 .unwrap_or_default()
                 .abi_encode(),
         )
@@ -136,7 +137,7 @@ where
     #[inline]
     pub fn store(&self, state: &mut EVMState, args: Vm::storeCall) -> Option<Vec<u8>> {
         let Vm::storeCall { target, slot, value } = args;
-        state.sstore(B160(target.into()), slot.into(), value.into());
+        state.sstore(target, slot.into(), value.into());
         None
     }
 
@@ -147,12 +148,12 @@ where
             target,
             newRuntimeBytecode,
         } = args;
-        let bytecode = to_analysed(Bytecode::new_raw(Bytes::from(newRuntimeBytecode)));
+        let bytecode = Bytecode::new_legacy(Bytes::from(newRuntimeBytecode));
 
         // set code but don't invoke middlewares
         host.code.insert(
-            B160(target.into()),
-            Arc::new(BytecodeLocked::try_from(bytecode).unwrap()),
+            target,
+            Arc::new(bytecode),
         );
         None
     }
@@ -161,7 +162,7 @@ where
     #[inline]
     pub fn deal(&self, state: &mut EVMState, args: Vm::dealCall) -> Option<Vec<u8>> {
         let Vm::dealCall { account, newBalance } = args;
-        state.set_balance(B160(account.into()), newBalance);
+        state.set_balance(account, newBalance);
         None
     }
 
@@ -203,7 +204,7 @@ where
     #[inline]
     pub fn accesses(&mut self, args: Vm::accessesCall) -> Option<Vec<u8>> {
         let Vm::accessesCall { target } = args;
-        let target = B160(target.into());
+        let target = target;
 
         let result = self
             .accesses
@@ -244,7 +245,7 @@ where
         host.prank = Some(Prank::new(
             *old_caller,
             None,
-            B160(msgSender.into()),
+            msgSender,
             None,
             true,
             host.call_depth,
@@ -267,8 +268,8 @@ where
         host.prank = Some(Prank::new(
             *old_caller,
             Some(*old_origin),
-            B160(msgSender.into()),
-            Some(B160(txOrigin.into())),
+            msgSender,
+            Some(txOrigin),
             true,
             host.call_depth,
         ));
@@ -289,7 +290,7 @@ where
         host.prank = Some(Prank::new(
             *old_caller,
             None,
-            B160(msgSender.into()),
+            msgSender,
             None,
             false,
             host.call_depth,
@@ -312,8 +313,8 @@ where
         host.prank = Some(Prank::new(
             *old_caller,
             Some(*old_origin),
-            B160(msgSender.into()),
-            Some(B160(txOrigin.into())),
+            msgSender,
+            Some(txOrigin),
             false,
             host.call_depth,
         ));

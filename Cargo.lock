@@ -5957,6 +5957,7 @@ dependencies = [
  "reqwest 0.11.27",
  "retry",
  "revm",
+ "revm-context",
  "revm-interpreter",
  "revm-primitives 41.0.0",
  "rlp",

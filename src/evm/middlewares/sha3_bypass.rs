@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use libafl::schedulers::Scheduler;
-use revm_interpreter::{opcode::JUMPI, Interpreter};
+use revm_interpreter::{bytecode::opcode::JUMPI, interpreter_types::{InputsTr, Jumps}, Interpreter};
 use tracing::debug;
 
 use crate::evm::{
@@ -142,7 +142,7 @@ impl Sha3TaintAnalysis {
         //   CALL/CALLCODE (0xf1/0xf2): gas, recipient, value, arg_offset, arg_size, ret_offset, ret_size
         //   DELEGATECALL/STATICCALL (0xf4/0xfa): gas, recipient, arg_offset, arg_size, ret_offset, ret_size
         // In both cases arg_offset is at peek(3) and arg_size is at peek(2).
-        let (arg_offset, arg_len) = match unsafe { *interp.instruction_pointer } {
+        let (arg_offset, arg_len) = match interp.bytecode.opcode() {
             0xf1 | 0xf2 | 0xf4 | 0xfa => {
                 (interp.stack.peek(3).unwrap(), interp.stack.peek(2).unwrap())
             }
@@ -163,7 +163,7 @@ impl Sha3TaintAnalysis {
         });
         eprintln!(
             "push_ctx op={:#x} saved_dirty_len={} ctxs_after={}",
-            unsafe { *interp.instruction_pointer },
+            interp.bytecode.opcode(),
             saved_dirty_len,
             self.ctxs.len(),
         );
@@ -277,24 +277,26 @@ where
             }};
         }
 
+        let opcode = interp.bytecode.opcode();
+
         if interp.stack.len() != self.dirty_stack.len() {
             eprintln!(
                 "STACK MISMATCH real={} dirty={} pc={:#x} addr={:#x} depth={} \
                  prev_opcode={:#x} prev_dirty_len={} current_op={:#x} ctxs_len={}",
                 interp.stack.len(),
                 self.dirty_stack.len(),
-                interp.program_counter(),
-                interp.contract.address,
+                interp.bytecode.pc(),
+                interp.input.target_address,
                 host.call_depth,
                 self.prev_opcode,
                 self.prev_dirty_len,
-                *interp.instruction_pointer,
+                opcode,
                 self.ctxs.len(),
             );
         }
         assert_eq!(interp.stack.len(), self.dirty_stack.len());
 
-        match *interp.instruction_pointer {
+        match opcode {
             0x00 => {}
             0x01..=0x7 => {
                 pop_push!(2, 1)
@@ -443,11 +445,11 @@ where
                 if v {
                     debug!(
                         "new tainted jumpi: {:x} {:x}",
-                        interp.contract.address,
-                        interp.program_counter()
+                        interp.input.target_address,
+                        interp.bytecode.pc()
                     );
                     self.tainted_jumpi
-                        .insert((interp.contract.address, interp.program_counter()));
+                        .insert((interp.input.target_address, interp.bytecode.pc()));
                 }
             }
             // PC
@@ -462,19 +464,19 @@ where
             }
             // DUP
             0x80..=0x8f => {
-                let _n = (*interp.instruction_pointer) - 0x80 + 1;
+                let _n = opcode - 0x80 + 1;
                 self.dirty_stack
                     .push(self.dirty_stack[self.dirty_stack.len() - _n as usize]);
             }
             // SWAP
             0x90..=0x9f => {
-                let _n = (*interp.instruction_pointer) - 0x90 + 2;
+                let _n = opcode - 0x90 + 2;
                 let _l = self.dirty_stack.len();
                 self.dirty_stack.swap(_l - _n as usize, _l - 1);
             }
             // LOG
             0xa0..=0xa4 => {
-                let _n = (*interp.instruction_pointer) - 0xa0 + 2;
+                let _n = opcode - 0xa0 + 2;
                 stack_pop_n!(_n);
             }
             0xf0 => {
@@ -517,12 +519,12 @@ where
             0xff => {
                 // stack_pop_n!(1);
             }
-            _ => panic!("unknown opcode: {:x}", *interp.instruction_pointer),
+            _ => panic!("unknown opcode: {:x}", opcode),
         }
 
         // Record AFTER handler runs so the next on_step sees the actual
         // previous opcode and the dirty_stack length it produced.
-        self.prev_opcode = *interp.instruction_pointer;
+        self.prev_opcode = opcode;
         self.prev_dirty_len = self.dirty_stack.len();
     }
 
@@ -581,16 +583,16 @@ where
     SC: Scheduler<State = EVMFuzzState> + Clone,
 {
     unsafe fn on_step(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>, _state: &mut EVMFuzzState) {
-        if *interp.instruction_pointer == JUMPI {
-            let jumpi = interp.program_counter();
+        if interp.bytecode.opcode() == JUMPI {
+            let jumpi = interp.bytecode.pc();
             if self
                 .sha3_taints
                 .borrow()
                 .tainted_jumpi
-                .contains(&(interp.contract.address, jumpi))
+                .contains(&(interp.input.target_address, jumpi))
             {
                 let stack_len = interp.stack.len();
-                interp.stack.data[stack_len - 2] = EVMU256::from((jumpi + host.randomness[0] as usize) % 2);
+                interp.stack.data_mut()[stack_len - 2] = EVMU256::from((jumpi + host.randomness[0] as usize) % 2);
             }
         }
     }
@@ -610,12 +612,10 @@ mod tests {
     use bytes::Bytes;
     use itertools::Itertools;
     use libafl::schedulers::StdScheduler;
-    use revm_interpreter::{
-        analysis::to_analysed,
+    use revm_interpreter::bytecode::{
         opcode::{ADD, EQ, JUMPDEST, JUMPI, MSTORE, PUSH0, PUSH1, SHA3, STOP},
-        BytecodeLocked,
+        Bytecode,
     };
-    use revm_primitives::Bytecode;
 
     use super::*;
     use crate::{
@@ -644,7 +644,7 @@ mod tests {
         let target_addr = generate_random_address(&mut state);
         evm_executor.host.code.insert(
             target_addr,
-            Arc::new(BytecodeLocked::try_from(to_analysed(Bytecode::new_raw(code))).unwrap()),
+            Arc::new(Bytecode::new_legacy(code)),
         );
 
         let sha3 = Rc::new(RefCell::new(Sha3TaintAnalysis::new()));

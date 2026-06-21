@@ -13,10 +13,11 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use revm_primitives::Bytes as PrimBytes;
 use reqwest::{blocking, header::HeaderMap};
 use retry::{delay::Fixed, retry_with_index, OperationResult};
-use revm_interpreter::analysis::to_analysed;
-use revm_primitives::{Bytecode, B160};
+use revm_interpreter::bytecode::Bytecode;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
@@ -133,7 +134,7 @@ impl Chain {
             .and_then(|result| u64::from_str_radix(result.trim_start_matches("0x"), 16).ok())
             .ok_or_else(|| anyhow!("Failed to parse chain id from response: {}", rpc_url))?;
 
-        env::set_var("ETH_RPC_URL", rpc_url);
+        unsafe { env::set_var("ETH_RPC_URL", rpc_url) };
 
         Ok(match chain_id {
             1 => Self::ETH,
@@ -1208,10 +1209,9 @@ impl OnChainConfig {
         }
 
         let code = self.get_contract_code(address, force_cache);
-        let contract_code = to_analysed(Bytecode::new_raw(Bytes::from(
+        let contract_code = Bytecode::new_legacy(PrimBytes::from(
             hex::decode(code).expect("fail to decode contract code"),
-        )));
-        let contract_code = to_analysed(contract_code);
+        ));
         self.code_cache_analyzed.insert(address, contract_code.clone());
         contract_code
     }
@@ -1354,7 +1354,7 @@ impl OnChainConfig {
 
         if result.len() != 196 {
             let rpc = &self.endpoint_url;
-            let pair_code = self.clone().get_contract_code(B160::from_str(pair).unwrap(), true);
+            let pair_code = self.clone().get_contract_code(EVMAddress::from_str(pair).unwrap(), true);
             info!("rpc: {rpc}, result: {result}, pair: {pair}, pair code: {pair_code}");
             info!("Unexpected RPC error, consider setting env <ETH_RPC_URL> ");
             return None;

@@ -6,7 +6,8 @@ use std::{
 use bytes::Bytes;
 use libafl::prelude::HasMetadata;
 use libafl_bolts::impl_serdeany;
-use revm_primitives::{Bytecode, HashSet};
+use revm_interpreter::bytecode::Bytecode;
+use revm_primitives::{HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{

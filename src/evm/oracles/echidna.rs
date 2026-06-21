@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use itertools::Itertools;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{

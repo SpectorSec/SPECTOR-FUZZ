@@ -49,7 +49,7 @@ impl<OT> ConcolicStage<OT> {
         Self {
             enabled,
             allow_symbolic_addresses,
-            known_state_input: HashSet::new(),
+            known_state_input: HashSet::default(),
             vm_executor,
             phantom: std::marker::PhantomData,
             num_threads,

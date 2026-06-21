@@ -13,7 +13,7 @@ use bytes::Bytes;
 use foundry_cheatcodes::Vm::{self, VmCalls};
 use libafl::schedulers::Scheduler;
 use revm_interpreter::{opcode, InstructionResult, Interpreter};
-use revm_primitives::{B160, U256};
+use revm_primitives::U256;
 use tracing::{debug, error, warn};
 
 use super::middleware::{Middleware, MiddlewareType};
@@ -31,7 +31,7 @@ pub use expect::{ExpectedCallData, ExpectedCallTracker, ExpectedCallType, Expect
 
 /// 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D
 /// address(bytes20(uint160(uint256(keccak256('hevm cheat code')))))
-pub const CHEATCODE_ADDRESS: B160 = B160([
+pub const CHEATCODE_ADDRESS: Address = Address::new([
     113, 9, 112, 158, 207, 169, 26, 128, 98, 111, 243, 152, 157, 104, 246, 127, 91, 29, 209, 45,
 ]);
 
@@ -596,10 +596,8 @@ fn try_memory_resize(interp: &mut Interpreter, offset: usize, len: usize) -> Res
 fn get_opcode_type(op: u8, interp: &Interpreter) -> OpcodeType {
     match op {
         opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
-            let target: B160 = B160(
-                interp.stack().peek(1).unwrap().to_be_bytes::<{ U256::BYTES }>()[12..]
-                    .try_into()
-                    .unwrap(),
+            let target = Address::from_slice(
+                &interp.stack().peek(1).unwrap().to_be_bytes::<{ U256::BYTES }>()[12..],
             );
 
             if target.as_slice() == CHEATCODE_ADDRESS.as_slice() {
@@ -688,7 +686,7 @@ mod tests {
 
     use bytes::Bytes;
     use libafl::prelude::StdScheduler;
-    use revm_primitives::Bytecode;
+    use revm_interpreter::bytecode::Bytecode;
 
     use super::*;
     use crate::{
@@ -712,15 +710,15 @@ mod tests {
         let mut state: EVMFuzzState = FuzzState::new(0);
 
         // Reverter.sol: tests/presets/cheatcode/Reverter.sol
-        let reverter_addr = B160::from_str("0xaAbeB5BA46709f61CFd0090334C6E71513ED7BCf").unwrap();
+        let reverter_addr = Address::from_str("0xaAbeB5BA46709f61CFd0090334C6E71513ED7BCf").unwrap();
         let reverter_code = load_bytecode("tests/presets/cheatcode/Reverter.bytecode");
 
         // Emitter.sol: tests/presets/cheatcode/Emitter.sol
-        let emitter_addr = B160::from_str("0xC6829a4b1a9bCCc842387F223dd2bC5FA50fd9eD").unwrap();
+        let emitter_addr = Address::from_str("0xC6829a4b1a9bCCc842387F223dd2bC5FA50fd9eD").unwrap();
         let emitter_code = load_bytecode("tests/presets/cheatcode/Emitter.bytecode");
 
         // Caller.sol: tests/presets/cheatcode/Caller.sol
-        let caller_addr = B160::from_str("0xBE8d2A52f21dce4b17Ec809BCE76cb403BbFbaCE").unwrap();
+        let caller_addr = Address::from_str("0xBE8d2A52f21dce4b17Ec809BCE76cb403BbFbaCE").unwrap();
         let caller_code = load_bytecode("tests/presets/cheatcode/Caller.bytecode");
 
         // Cheatcode.t.sol: tests/presets/cheatcode/Cheatcode.t.sol

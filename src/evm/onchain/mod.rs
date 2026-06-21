@@ -17,8 +17,8 @@ use bytes::Bytes;
 use crypto::{digest::Digest, sha3::Sha3};
 use itertools::Itertools;
 use libafl::{prelude::HasMetadata, schedulers::Scheduler};
-use revm_interpreter::{analysis::to_analysed, Interpreter};
-use revm_primitives::Bytecode;
+use revm_interpreter::{interpreter_types::Jumps, Interpreter};
+use revm_interpreter::bytecode::Bytecode;
 use tracing::debug;
 
 use self::endpoints::PairData;
@@ -164,10 +164,11 @@ where
         #[cfg(feature = "force_cache")]
         macro_rules! force_cache {
             ($ty: expr, $target: expr) => {{
-                let pc = interp.program_counter();
-                match $ty.get_mut(&(interp.contract.address, pc)) {
+                let pc = interp.bytecode.pc();
+                let addr = interp.input.target_address;
+                match $ty.get_mut(&(addr, pc)) {
                     None => {
-                        $ty.insert((interp.contract.address, pc), HashSet::from([$target]));
+                        $ty.insert((addr, pc), HashSet::from([$target]));
                         false
                     }
                     Some(v) => {
@@ -188,10 +189,10 @@ where
             };
         }
 
-        match *interp.instruction_pointer {
+        match interp.bytecode.opcode() {
             // SLOAD / TLOAD
             0x54 | 0x5c => {
-                let address = interp.contract.address;
+                let address = interp.input.target_address;
                 let slot_idx: alloy_primitives::Uint<256, 4> = interp.stack.peek(0).unwrap();
 
                 macro_rules! load_data {
@@ -235,15 +236,15 @@ where
             #[cfg(feature = "real_balance")]
             // 	SELFBALANCE
             0x47 => {
-                let address = interp.contract.address;
+                let address = interp.input.target_address;
                 debug!("onchain selfbalance for {:?}", address);
                 // std::thread::sleep(std::time::Duration::from_secs(3));
                 host.next_slot = self.endpoint.get_balance(address);
             }
             // COINBASE
             0x41 => {
-                if host.env.block.coinbase == EVMAddress::zero() {
-                    host.env.block.coinbase = self.endpoint.fetch_blk_coinbase();
+                if host.env.block.beneficiary == EVMAddress::ZERO {
+                    host.env.block.beneficiary = self.endpoint.fetch_blk_coinbase();
                 }
             }
             // TIMESTAMP
@@ -254,8 +255,8 @@ where
             }
             // GASLIMIT
             0x45 => {
-                if host.env.block.gas_limit == EVMU256::MAX {
-                    host.env.block.gas_limit = self.endpoint.fetch_blk_gaslimit();
+                if host.env.block.gas_limit == u64::MAX {
+                    host.env.block.gas_limit = self.endpoint.fetch_blk_gaslimit().saturating_to::<u64>();
                 }
             }
             // CHAINID
@@ -264,8 +265,8 @@ where
             }
             // CALL | CALLCODE | DELEGATECALL | STATICCALL | EXTCODESIZE | EXTCODECOPY | EXTCODEHASH
             0xf1 | 0xf2 | 0xf4 | 0xfa | 0x3b | 0x3c | 0x3f => {
-                let caller = interp.contract.address;
-                let address = match *interp.instruction_pointer {
+                let caller = interp.input.target_address;
+                let address = match interp.bytecode.opcode() {
                     0xf1 | 0xf2 => {
                         // CALL | CALLCODE
                         #[cfg(feature = "real_balance")]
@@ -286,8 +287,8 @@ where
                     return;
                 }
                 let force_cache = force_cache!(self.calls, address_h160);
-                let is_proxy_call = matches!(*interp.instruction_pointer, 0xf2 | 0xf4);
-                let should_setup_abi = *interp.instruction_pointer != 0x3b && *interp.instruction_pointer != 0x3c;
+                let is_proxy_call = matches!(interp.bytecode.opcode(), 0xf2 | 0xf4);
+                let should_setup_abi = interp.bytecode.opcode() != 0x3b && interp.bytecode.opcode() != 0x3c;
                 self.load_code(
                     address_h160,
                     host,
@@ -327,7 +328,7 @@ impl OnChain {
     {
         let contract_code = self.endpoint.get_contract_code(address_h160, force_cache);
         let code = hex::decode(contract_code).unwrap();
-        let contract_code = to_analysed(Bytecode::new_raw(Bytes::from(code)));
+        let contract_code = Bytecode::new_legacy(revm_primitives::Bytes::from(code));
 
         if contract_code.is_empty() || force_cache {
             self.loaded_code.insert(address_h160);
@@ -383,7 +384,7 @@ impl OnChain {
                     // 3. Reconfirm on failures of EVMole
                     debug!("Contract {:?} has no abi", address_h160);
                     let contract_code = contract_code.bytes();
-                    let contract_code_str = hex::encode(contract_code);
+                    let contract_code_str = hex::encode(&contract_code);
                     let sigs = extract_sig_from_contract(&contract_code_str);
                     let mut unknown_sigs: usize = 0;
                     for sig in &sigs {
@@ -403,7 +404,7 @@ impl OnChain {
 
                     if unknown_sigs >= sigs.len() / 30 {
                         debug!("Too many unknown function signature ({:?}) for {:?}, we are going to decompile this contract using EVMole", unknown_sigs, address_h160);
-                        let abis = fetch_abi_evmole(contract_code)
+                        let abis = fetch_abi_evmole(contract_code.as_ref())
                             .iter()
                             .map(|abi| {
                                 if let Some(known_abi) =

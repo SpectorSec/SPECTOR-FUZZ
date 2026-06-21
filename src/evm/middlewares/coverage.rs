@@ -12,10 +12,13 @@ use std::{
 use itertools::Itertools;
 use libafl::schedulers::Scheduler;
 use revm_interpreter::{
-    opcode::{INVALID, JUMPDEST, JUMPI, STOP},
+    bytecode::{
+        opcode::{INVALID, JUMPDEST, JUMPI, STOP},
+        Bytecode,
+    },
+    interpreter_types::{InputsTr, Jumps},
     Interpreter,
 };
-use revm_primitives::Bytecode;
 use serde::Serialize;
 use serde_json;
 use tracing::info;
@@ -298,11 +301,11 @@ where
         if IN_DEPLOY || !EVAL_COVERAGE {
             return;
         }
-        let address = interp.contract.code_address;
-        let pc = interp.program_counter();
+        let address = interp.input.bytecode_address().copied().unwrap_or(interp.input.target_address);
+        let pc = interp.bytecode.pc();
         self.pc_coverage.entry(address).or_default().insert(pc);
 
-        if *interp.instruction_pointer == JUMPI {
+        if interp.bytecode.opcode() == JUMPI {
             let condition = if is_zero(interp.stack.peek(1).unwrap()) {
                 false
             } else {

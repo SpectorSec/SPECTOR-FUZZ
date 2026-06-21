@@ -8,7 +8,7 @@ use std::{
 
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 use tracing::{debug, info, warn};
 
 use super::{

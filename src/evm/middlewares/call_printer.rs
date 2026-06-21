@@ -3,7 +3,7 @@ use std::{any, collections::HashMap, fmt::Debug};
 use bytes::Bytes;
 use itertools::Itertools;
 use libafl::schedulers::Scheduler;
-use revm_interpreter::Interpreter;
+use revm_interpreter::{interpreter_types::{InputsTr, Jumps}, CallInput, Interpreter};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tracing::debug;
@@ -117,41 +117,48 @@ where
     unsafe fn on_step(&mut self, interp: &mut Interpreter, _host: &mut FuzzHost<SC>, _state: &mut EVMFuzzState) {
         if self.entry {
             self.entry = false;
-            let code_address = interp.contract.address;
+            let code_address = interp.input.bytecode_address().copied().unwrap_or(interp.input.target_address);
+            let input_hex = match interp.input.input() {
+                CallInput::Bytes(b) => hex::encode(b),
+                CallInput::SharedBuffer(_) => String::new(),
+            };
             self.results.data.push((
                 self.current_layer,
                 SingleCall {
                     call_type: CallType::FirstLevelCall,
-                    caller: self.translate_address(interp.contract.caller),
-                    contract: self.translate_address(interp.contract.address),
-                    input: hex::encode(interp.contract.input.clone()),
-                    value: format!("{}", interp.contract.value),
+                    caller: self.translate_address(interp.input.caller_address),
+                    contract: self.translate_address(interp.input.target_address),
+                    input: input_hex,
+                    value: format!("{}", interp.input.call_value()),
                     source: SOURCE_MAP_PROVIDER
                         .lock()
                         .unwrap()
-                        .get_raw_source_map_info(&code_address, interp.program_counter()),
+                        .get_raw_source_map_info(&code_address, interp.bytecode.pc()),
                     results: "".to_string(),
                 },
             ));
         }
 
+        let opcode = interp.bytecode.opcode();
+
         // events
-        if *interp.instruction_pointer >= 0xa0 && *interp.instruction_pointer <= 0xa4 {
+        if opcode >= 0xa0 && opcode <= 0xa4 {
             let offset = as_u64(interp.stack.peek(0).unwrap()) as usize;
             let len = as_u64(interp.stack.peek(1).unwrap()) as usize;
             let arg = if interp.memory.len() < offset {
                 debug!(
                     "encountered unknown event at PC {} of contract {:?}",
-                    interp.program_counter(),
-                    interp.contract.address
+                    interp.bytecode.pc(),
+                    interp.input.target_address
                 );
                 "unknown".to_string()
             } else if interp.memory.len() < offset + len {
-                hex::encode(&interp.memory.data[offset..])
+                let avail = interp.memory.len() - offset;
+                hex::encode(&*interp.memory.slice_len(offset, avail))
             } else {
-                hex::encode(interp.memory.get_slice(offset, len))
+                hex::encode(&*interp.memory.slice_len(offset, len))
             };
-            let topic_amount = *interp.instruction_pointer - 0xa0;
+            let topic_amount = opcode - 0xa0;
             let mut topics = Vec::new();
             for i in 0..topic_amount {
                 let topic = interp.stack.peek(i as usize + 2).unwrap();
@@ -165,8 +172,8 @@ where
                 self.current_layer,
                 SingleCall {
                     call_type: CallType::Event,
-                    caller: self.translate_address(interp.contract.caller),
-                    contract: self.translate_address(interp.contract.address),
+                    caller: self.translate_address(interp.input.caller_address),
+                    contract: self.translate_address(interp.input.target_address),
                     input: arg.clone(),
                     value: "".to_string(),
                     source: None,
@@ -175,8 +182,8 @@ where
             ));
         }
         // external calls
-        else if *interp.instruction_pointer <= 0xfa && *interp.instruction_pointer >= 0xf1 {
-            let (arg_offset, arg_len) = match unsafe { *interp.instruction_pointer } {
+        else if opcode <= 0xfa && opcode >= 0xf1 {
+            let (arg_offset, arg_len) = match opcode {
                 0xf1 | 0xf2 => (interp.stack.peek(3).unwrap(), interp.stack.peek(4).unwrap()),
                 0xf4 | 0xfa => (interp.stack.peek(2).unwrap(), interp.stack.peek(3).unwrap()),
                 _ => {
@@ -184,7 +191,7 @@ where
                 }
             };
 
-            let call_type = match unsafe { *interp.instruction_pointer } {
+            let call_type = match opcode {
                 0xf1 => CallType::Call,
                 0xf2 => CallType::CallCode,
                 0xf4 => CallType::DelegateCall,
@@ -200,13 +207,14 @@ where
             let arg_len = as_u64(arg_len) as usize;
 
             let arg = if interp.memory.len() < arg_offset + arg_len {
-                hex::encode(&interp.memory.data[arg_len..])
+                let avail = interp.memory.len().saturating_sub(arg_len);
+                hex::encode(&*interp.memory.slice_len(arg_len.min(interp.memory.len()), avail))
             } else {
-                hex::encode(interp.memory.get_slice(arg_offset, arg_len))
+                hex::encode(&*interp.memory.slice_len(arg_offset, arg_len))
             };
 
-            let caller = interp.contract.address;
-            let address = match *interp.instruction_pointer {
+            let caller = interp.input.target_address;
+            let address = match opcode {
                 0xf1 | 0xf2 | 0xf4 | 0xfa => interp.stack.peek(1).unwrap(),
                 0x3b | 0x3c => interp.stack.peek(0).unwrap(),
                 _ => {
@@ -214,14 +222,14 @@ where
                 }
             };
 
-            let value = match *interp.instruction_pointer {
+            let value = match opcode {
                 0xf1 | 0xf2 => interp.stack.peek(2).unwrap(),
                 _ => EVMU256::ZERO,
             };
 
             let target = convert_u256_to_h160(address);
 
-            let caller_code_address = interp.contract.code_address;
+            let caller_code_address = interp.input.bytecode_address().copied().unwrap_or(interp.input.target_address);
 
             self.offsets = 0;
             self.results.data.push((
@@ -235,7 +243,7 @@ where
                     source: SOURCE_MAP_PROVIDER
                         .lock()
                         .unwrap()
-                        .get_raw_source_map_info(&caller_code_address, interp.program_counter()),
+                        .get_raw_source_map_info(&caller_code_address, interp.bytecode.pc()),
                     results: "".to_string(),
                 },
             ));

@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use itertools::Itertools;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 
 use super::REENTRANCY_BUG_IDX;
 use crate::{
@@ -66,12 +66,11 @@ impl
         >,
         _stage: u64,
     ) -> Vec<u64> {
-        let reetrancy_metadata = unsafe {
-            &ctx.post_state
-                .as_any()
-                .downcast_ref_unchecked::<EVMState>()
-                .reentrancy_metadata
-        };
+        let reetrancy_metadata = &ctx.post_state
+            .as_any()
+            .downcast_ref::<EVMState>()
+            .unwrap()
+            .reentrancy_metadata;
         if reetrancy_metadata.found.is_empty() {
             return vec![];
         }

@@ -10,8 +10,12 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use itertools::Itertools;
 use libafl::schedulers::{Scheduler, StdScheduler};
-use revm_interpreter::{analysis::to_analysed, BytecodeLocked, CallContext, CallScheme, Contract, Host, Interpreter};
-use revm_primitives::Bytecode;
+use revm_interpreter::{
+    interpreter::{ExtBytecode, InputsImpl, SharedMemory},
+    CallInput, Interpreter,
+};
+use revm_primitives::Bytes as PrimBytes;
+use revm_interpreter::bytecode::Bytecode;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::debug;
 
@@ -56,7 +60,7 @@ impl OffChainConfig {
         fuzz_host.evmstate = setup_data.evmstate.clone();
         fuzz_host.env = setup_data.env.clone();
         for (addr, bytecode) in &setup_data.code {
-            let code = Arc::new(BytecodeLocked::try_from(to_analysed(Bytecode::new_raw(bytecode.clone()))).unwrap());
+            let code = Arc::new(Bytecode::new_legacy(bytecode.clone().into()));
             fuzz_host.code.insert(*addr, code);
         }
         let mut vm: EVMExecutor<EVMState, ConciseEVMInput, StdScheduler<EVMFuzzState>> =
@@ -89,17 +93,21 @@ impl OffChainConfig {
         SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
         debug!("Building cache for pair: {:?}", pair);
-        let (pair_code, _) = vm
+        let pair_code = vm
             .host
-            .code(pair)
+            .code
+            .get(&pair)
+            .cloned()
             .ok_or_else(|| anyhow!("Pair {:?} code not found", pair))?;
 
         // token0
         let res = self.call(self.token0_input(), pair_code.clone(), pair, state, vm)?;
         let token0 = EVMAddress::from_slice(&res[12..32]);
-        let (token0_code, _) = vm
+        let token0_code = vm
             .host
-            .code(token0)
+            .code
+            .get(&token0)
+            .cloned()
             .ok_or_else(|| anyhow!("Token0 {:?} code not found", token0))?;
         let res = self.call(self.decimals_input(), token0_code.clone(), token0, state, vm)?;
         let decimals_0 = res[31] as u32;
@@ -107,9 +115,11 @@ impl OffChainConfig {
         // token1
         let res = self.call(self.token1_input(), pair_code.clone(), pair, state, vm)?;
         let token1 = EVMAddress::from_slice(&res[12..32]);
-        let (token1_code, _) = vm
+        let token1_code = vm
             .host
-            .code(token1)
+            .code
+            .get(&token1)
+            .cloned()
             .ok_or_else(|| anyhow!("Token1 {:?} code not found", token1))?;
         let res = self.call(self.decimals_input(), token1_code.clone(), token1, state, vm)?;
         let decimals_1 = res[31] as u32;
@@ -143,11 +153,11 @@ impl OffChainConfig {
         self.reserves_cache.insert(pair, (reserves0, reserves1));
         self.balance_cache.insert((pair, token0), balance0);
         self.balance_cache.insert((pair, token1), balance1);
-        let pair_code = Bytecode::new_raw(Bytes::from(pair_code.bytecode().to_vec()));
+        let pair_code = Bytecode::new_raw(PrimBytes::from(pair_code.bytecode().to_vec()));
         self.code_cache.insert(pair, pair_code);
-        let token0_code = Bytecode::new_raw(Bytes::from(token0_code.bytecode().to_vec()));
+        let token0_code = Bytecode::new_raw(PrimBytes::from(token0_code.bytecode().to_vec()));
         self.code_cache.insert(token0, token0_code);
-        let token1_code = Bytecode::new_raw(Bytes::from(token1_code.bytecode().to_vec()));
+        let token1_code = Bytecode::new_raw(PrimBytes::from(token1_code.bytecode().to_vec()));
         self.code_cache.insert(token1, token1_code);
 
         Ok(())
@@ -176,7 +186,7 @@ impl OffChainConfig {
     fn call<VS, CI, SC>(
         &self,
         input: Bytes,
-        code: Arc<BytecodeLocked>,
+        code: Arc<Bytecode>,
         target: EVMAddress,
         state: &mut EVMFuzzState,
         vm: &mut EVMExecutor<VS, CI, SC>,
@@ -186,25 +196,29 @@ impl OffChainConfig {
         CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
         SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
-        let call = Contract::new_with_context_analyzed(
-            input,
-            code,
-            &CallContext {
-                address: target,
-                caller: EVMAddress::default(),
-                code_address: target,
-                apparent_value: EVMU256::ZERO,
-                scheme: CallScheme::StaticCall,
-            },
-        );
+        use revm_interpreter::interpreter_types::ReturnData as ReturnDataTr;
 
-        let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, true, MEM_LIMIT);
+        let interp_input = InputsImpl {
+            target_address: target,
+            bytecode_address: Some(target),
+            caller_address: EVMAddress::default(),
+            input: CallInput::Bytes(PrimBytes::copy_from_slice(input.as_ref())),
+            call_value: EVMU256::ZERO,
+        };
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT as u64),
+            ExtBytecode::new((*code).clone()),
+            interp_input,
+            true, // is_static
+            vm.host.spec_id,
+            u64::MAX,
+        );
         let ir = vm.host.run_inspect(&mut interp, state);
         if !is_call_success!(ir) {
             return Err(anyhow!("Call failed: {:?}", ir));
         }
 
-        Ok(interp.return_value())
+        Ok(Bytes::from(interp.return_data.buffer().to_vec()))
     }
 
     // token0()
@@ -236,7 +250,7 @@ impl OffChainConfig {
     fn balance_of_input(&self, addr: EVMAddress) -> Bytes {
         let mut input = hex!("70a08231").to_vec(); // balanceOf
         input.extend_from_slice(&[0x00; 12]); // padding
-        input.extend_from_slice(&addr.0); // addr
+        input.extend_from_slice(addr.as_slice()); // addr
         Bytes::from(input)
     }
 }

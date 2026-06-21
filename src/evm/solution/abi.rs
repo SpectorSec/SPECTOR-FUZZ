@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt, ResolveSolType};
+use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt, Specifier};
 use alloy_json_abi::Function;
 use alloy_primitives::{hex, U256};
 use anyhow::Result;
@@ -82,7 +82,7 @@ impl Abi {
     pub fn decode_input(&mut self, sig: &str, input: &str) -> Result<Vec<DecodedArg>> {
         let func = Function::parse(sig)?;
         let calldata = hex::decode(input)?;
-        let tokens = func.abi_decode_input(&calldata[4..], false)?;
+        let tokens = func.abi_decode_input(&calldata[4..])?;
         let mut args = vec![];
         for (i, t) in tokens.iter().enumerate() {
             let token_type = func.inputs[i].resolve()?;

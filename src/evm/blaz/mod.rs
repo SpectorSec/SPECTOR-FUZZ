@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use revm_primitives::{Bytecode, HashSet};
+use revm_interpreter::bytecode::Bytecode;
+use revm_primitives::Bytes as PrimBytes;
+use revm_primitives::{HashSet};
 
 // SKIP_CBOR is used in the `skip_cbor` macro
 #[allow(unused_imports)]
@@ -41,8 +43,8 @@ pub fn is_bytecode_similar_lax(hay: Vec<u8>, needle: Vec<u8>) -> usize {
 
 pub fn is_bytecode_similar_strict_ranking(hay: Vec<u8>, needle: Vec<u8>) -> usize {
     skip_cbor!({
-        let constants_hay = find_constants(&Bytecode::new_raw(Bytes::from(hay)));
-        let constants_needle = find_constants(&Bytecode::new_raw(Bytes::from(needle)));
+        let constants_hay = find_constants(&Bytecode::new_raw(PrimBytes::from(hay)));
+        let constants_needle = find_constants(&Bytecode::new_raw(PrimBytes::from(needle)));
         constants_needle.difference(&constants_hay).count() + constants_hay.difference(&constants_needle).count()
     })
 }

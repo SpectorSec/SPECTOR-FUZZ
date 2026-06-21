@@ -10,7 +10,7 @@ use libafl::{
     Fuzzer,
 };
 use libafl_bolts::tuples::tuple_list;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 use tracing::{debug, error, info};
 
 use crate::{
@@ -461,14 +461,14 @@ pub fn evm_fuzzer(
     let objective: OracleFeedback<
         '_,
         EVMState,
-        revm_primitives::B160,
+        EVMAddress,
         Bytecode,
         Bytes,
-        revm_primitives::B160,
+        EVMAddress,
         revm_primitives::ruint::Uint<256, 4>,
         Vec<u8>,
         EVMInput,
-        FuzzState<EVMInput, EVMState, revm_primitives::B160, revm_primitives::B160, Vec<u8>, ConciseEVMInput>,
+        FuzzState<EVMInput, EVMState, EVMAddress, EVMAddress, Vec<u8>, ConciseEVMInput>,
         ConciseEVMInput,
         EVMQueueExecutor,
     > = OracleFeedback::new(&mut oracles, &mut producers, evm_executor_ref.clone());

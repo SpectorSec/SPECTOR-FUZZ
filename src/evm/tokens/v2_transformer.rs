@@ -2,7 +2,12 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use bytes::Bytes;
 use libafl::schedulers::Scheduler;
-use revm_interpreter::{CallContext, CallScheme, Contract, Interpreter};
+use revm_interpreter::{
+    interpreter::{ExtBytecode, InputsImpl, SharedMemory},
+    interpreter_types::ReturnData as ReturnDataTr,
+    CallInput, Interpreter,
+};
+use revm_primitives::{hardfork::SpecId, Bytes as PrimBytes};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::{uniswap::CODE_REGISTRY, PairContext, UniswapInfo};
@@ -61,7 +66,7 @@ pub fn transfer_bytes(dst: &EVMAddress, amount: EVMU256) -> Bytes {
     let mut ret = Vec::new();
     ret.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]); // transfer
     ret.extend_from_slice(&[0x00; 12]); // padding
-    ret.extend_from_slice(&dst.0); // dst
+    ret.extend_from_slice(dst.as_slice()); // dst
     ret.extend_from_slice(&amount.to_be_bytes::<32>()); // amount
     Bytes::from(ret)
 }
@@ -70,7 +75,7 @@ pub fn balance_of_bytes(addr: &EVMAddress) -> Bytes {
     let mut ret = Vec::new();
     ret.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]); // balanceOf
     ret.extend_from_slice(&[0x00; 12]); // padding
-    ret.extend_from_slice(&addr.0); // addr
+    ret.extend_from_slice(addr.as_slice()); // addr
     Bytes::from(ret)
 }
 
@@ -88,19 +93,22 @@ impl UniswapPairContext {
         CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
         SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
-        let call = Contract::new_with_context_analyzed(
-            transfer_bytes(next, amount),
-            get_code_tokens!(self.in_token_address, vm, state),
-            &CallContext {
-                address: self.in_token_address,
-                caller: *src,
-                code_address: self.in_token_address,
-                apparent_value: EVMU256::ZERO,
-                scheme: CallScheme::Call,
-            },
+        let code = get_code_tokens!(self.in_token_address, vm, state);
+        let interp_input = InputsImpl {
+            target_address: self.in_token_address,
+            bytecode_address: Some(self.in_token_address),
+            caller_address: *src,
+            input: CallInput::Bytes(PrimBytes::copy_from_slice(transfer_bytes(next, amount).as_ref())),
+            call_value: EVMU256::ZERO,
+        };
+        let mut interp = Interpreter::new(
+            SharedMemory::new_with_memory_limit(MEM_LIMIT),
+            ExtBytecode::new((*code).clone()),
+            interp_input,
+            false,
+            SpecId::PRAGUE,
+            1e10 as u64,
         );
-
-        let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
         let ir = vm.host.run_inspect(&mut interp, state);
         if !is_call_success!(ir) {
             // println!("transfer failed1");
@@ -141,36 +149,34 @@ impl PairContext for UniswapPairContext {
         macro_rules! balanceof_token {
             ($dir: expr, $who: expr) => {{
                 let addr = if $dir { in_token_address } else { out_token_address };
-                let call = Contract::new_with_context_analyzed(
-                    balance_of_bytes($who),
-                    if $dir {
-                        in_token_code.clone()
-                    } else {
-                        out_token_code.clone()
-                    },
-                    &CallContext {
-                        address: addr,
-                        caller: EVMAddress::default(),
-                        code_address: addr,
-                        apparent_value: EVMU256::ZERO,
-                        scheme: CallScheme::Call,
-                    },
+                let code = if $dir { in_token_code.clone() } else { out_token_code.clone() };
+                let calldata = balance_of_bytes($who);
+                let interp_input = InputsImpl {
+                    target_address: addr,
+                    bytecode_address: Some(addr),
+                    caller_address: EVMAddress::default(),
+                    input: CallInput::Bytes(PrimBytes::copy_from_slice(calldata.as_ref())),
+                    call_value: EVMU256::ZERO,
+                };
+                let mut interp = Interpreter::new(
+                    SharedMemory::new_with_memory_limit(MEM_LIMIT),
+                    ExtBytecode::new((*code).clone()),
+                    interp_input,
+                    false,
+                    SpecId::PRAGUE,
+                    1e10 as u64,
                 );
-                let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
                 let ir = vm.host.run_inspect(&mut interp, state);
                 if !is_call_success!(ir) {
                     return None;
                 }
                 let in_balance =
-                    if let Some(num) = EVMU256::try_from_be_slice(interp.return_value().to_vec().as_slice()) {
+                    if let Some(num) = EVMU256::try_from_be_slice(interp.return_data.buffer().as_ref()) {
                         num
                     } else {
-                        // println!("balance of failed");
-                        // println!("return value: {:?}", interp.return_value());
                         return None;
                     };
 
-                // println!("balance of {:?}@{:?}: {:?}", $who, addr, in_balance);
                 in_balance
             }};
         }
@@ -179,36 +185,27 @@ impl PairContext for UniswapPairContext {
         macro_rules! transfer_token {
             ($dir: expr, $who: expr, $dst: expr, $amt: expr) => {{
                 let addr = if $dir { in_token_address } else { out_token_address };
-                let call = Contract::new_with_context_analyzed(
-                    transfer_bytes($dst, $amt),
-                    if $dir {
-                        in_token_code.clone()
-                    } else {
-                        out_token_code.clone()
-                    },
-                    &CallContext {
-                        address: addr,
-                        caller: $who,
-                        code_address: addr,
-                        apparent_value: EVMU256::ZERO,
-                        scheme: CallScheme::Call,
-                    },
+                let code = if $dir { in_token_code.clone() } else { out_token_code.clone() };
+                let calldata = transfer_bytes($dst, $amt);
+                let interp_input = InputsImpl {
+                    target_address: addr,
+                    bytecode_address: Some(addr),
+                    caller_address: $who,
+                    input: CallInput::Bytes(PrimBytes::copy_from_slice(calldata.as_ref())),
+                    call_value: EVMU256::ZERO,
+                };
+                let mut interp = Interpreter::new(
+                    SharedMemory::new_with_memory_limit(MEM_LIMIT),
+                    ExtBytecode::new((*code).clone()),
+                    interp_input,
+                    false,
+                    SpecId::PRAGUE,
+                    1e10 as u64,
                 );
-
-                // println!("transfer {:?}@{:?} for {:?} => {:?}", $amt, addr, $who, $dst);
-                // println!("pre_vm_state: {:?}", vm.host.evmstate.state);
-
-                let mut interp = Interpreter::new_with_memory_limit(call, 1e10 as u64, false, MEM_LIMIT);
-
                 let ir = vm.host.run_inspect(&mut interp, state);
-                // println!("bytes: {:?}", transfer_bytes($dst, $amt));
-                // println!("from: {:?} => {:?}, {:?}", $who, $dst, addr);
                 if !is_call_success!(ir) {
-                    // println!("transfer failed2");
-                    // println!("return value: {:?}", interp.return_value());
                     return None;
                 }
-                // println!("transfer success");
             }};
         }
 

@@ -21,7 +21,7 @@ use libafl::{
     schedulers::Scheduler,
     state::HasMetadata,
 };
-use revm_interpreter::Interpreter;
+use revm_interpreter::{interpreter_types::{InputsTr, Jumps}, Interpreter};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -257,17 +257,18 @@ where
         //     return;
         // }
 
-        match *interp.instruction_pointer {
+        let opcode = interp.bytecode.opcode();
+        match opcode {
             // detect whether it mutates token balance
             0xf1 | 0xfa => {}
             0x55 | 0x5d => {
-                if self.pair_address.contains(&interp.contract.address) {
+                if self.pair_address.contains(&interp.input.target_address) {
                     let key = interp.stack.peek(0).unwrap();
                     if key == EVMU256::from(8) {
                         host.evmstate
                             .flashloan_data
                             .oracle_recheck_reserve
-                            .insert(interp.contract.address);
+                            .insert(interp.input.target_address);
                     }
                 }
                 return;
@@ -277,7 +278,7 @@ where
             }
         };
 
-        let value_transfer = match *interp.instruction_pointer {
+        let value_transfer = match opcode {
             0xf1 | 0xf2 => interp.stack.peek(2).unwrap(),
             _ => EVMU256::ZERO,
         };

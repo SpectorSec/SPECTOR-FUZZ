@@ -8,7 +8,7 @@ use libafl::{
     prelude::{HasBytesVec, HasMaxSize, HasMetadata, HasRand, State},
 };
 use libafl_bolts::{prelude::Rand, HasLen};
-use revm_primitives::Env;
+use crate::evm::types::Env;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
@@ -795,11 +795,56 @@ impl<'a> HasBytesVec for MutatorInput<'a> {
 }
 
 impl EVMInput {
-    impl_env_mutator_u256!(basefee, block, false);
     impl_env_mutator_u256!(timestamp, block, true);
-    impl_env_mutator_h160!(coinbase, block);
-    impl_env_mutator_u256!(gas_limit, block, false);
+    impl_env_mutator_h160!(beneficiary, block);
     impl_env_mutator_u256!(number, block, true);
+
+    // coinbase is an alias for block.beneficiary (renamed in revm-context-41)
+    pub fn coinbase<S>(input: &mut EVMInput, state_: &mut S) -> MutationResult
+    where
+        S: State + HasCaller<EVMAddress> + HasRand,
+    {
+        EVMInput::beneficiary(input, state_)
+    }
+
+    // basefee and gas_limit are u64 in revm-context-41, handle separately
+    pub fn basefee<S>(input: &mut EVMInput, state_: &mut S) -> MutationResult
+    where
+        S: State + HasCaller<EVMAddress> + HasRand + HasMetadata,
+    {
+        let vm_slots = input.get_state().get(&input.get_contract()).cloned();
+        let fee = input.get_vm_env().block.basefee;
+        let mut input_by = [0u8; 32];
+        input_by[24..].copy_from_slice(&fee.to_be_bytes());
+        let mut input_vec = input_by.to_vec();
+        let mut wrapper = MutatorInput::new(&mut input_vec);
+        let res = byte_mutator(state_, &mut wrapper, vm_slots);
+        if res == MutationResult::Skipped {
+            return res;
+        }
+        let result_val = EVMU256::try_from_be_slice(&input_vec).unwrap();
+        input.get_vm_env_mut().block.basefee = result_val.to::<u64>();
+        res
+    }
+
+    pub fn gas_limit<S>(input: &mut EVMInput, state_: &mut S) -> MutationResult
+    where
+        S: State + HasCaller<EVMAddress> + HasRand + HasMetadata,
+    {
+        let vm_slots = input.get_state().get(&input.get_contract()).cloned();
+        let gas = input.get_vm_env().block.gas_limit;
+        let mut input_by = [0u8; 32];
+        input_by[24..].copy_from_slice(&gas.to_be_bytes());
+        let mut input_vec = input_by.to_vec();
+        let mut wrapper = MutatorInput::new(&mut input_vec);
+        let res = byte_mutator(state_, &mut wrapper, vm_slots);
+        if res == MutationResult::Skipped {
+            return res;
+        }
+        let result_val = EVMU256::try_from_be_slice(&input_vec).unwrap();
+        input.get_vm_env_mut().block.gas_limit = result_val.to::<u64>();
+        res
+    }
     // impl_env_mutator_u256!(chain_id, cfg, false);
 
     pub fn prevrandao<S>(_input: &mut EVMInput, _state_: &mut S) -> MutationResult

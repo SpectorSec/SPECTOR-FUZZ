@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap, ops::Deref, rc::Rc};
 
 use bytes::Bytes;
-use revm_primitives::Bytecode;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{
