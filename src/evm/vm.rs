@@ -572,6 +572,8 @@ where
             self.host.expected_emits.clear();
             self.host.expected_revert = None;
             self.host.expected_calls.clear();
+            self.host.assert_msg = None;
+            self.host.prank = None;
             self.host.call_depth = 0;
             // Initially, there is no state change
             unsafe {

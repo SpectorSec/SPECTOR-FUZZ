@@ -146,3 +146,93 @@ impl
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, path::Path, rc::Rc, str::FromStr};
+
+    use bytes::Bytes;
+    use libafl::prelude::StdScheduler;
+    use revm_interpreter::{bytecode::Bytecode, InstructionResult};
+
+    use crate::{
+        evm::{
+            host::FuzzHost,
+            middlewares::cheatcode::{Cheatcode, CHEATCODE_ADDRESS},
+            types::{EVMAddress, generate_random_address, EVMFuzzState, EVMU256},
+            vm::{EVMExecutor, EVMState},
+        },
+        generic_vm::vm_executor::GenericVM,
+        logger,
+        state::FuzzState,
+    };
+
+    fn load_bytecode(path: &str) -> Bytecode {
+        let hex_code = std::fs::read_to_string(path).expect("bytecode not found").trim().to_string();
+        let bytes = hex::decode(&hex_code).unwrap();
+        Bytecode::new_raw(revm_primitives::Bytes::from(bytes))
+    }
+
+    #[test]
+    fn test_invariant_violation_detected() {
+        logger::init_test();
+
+        let counter_addr = EVMAddress::from_str("0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEF1234").unwrap();
+        let counter_code = load_bytecode("tests/presets/invariant/Counter.bytecode");
+
+        let path = Path::new("work_dir");
+        if !path.exists() {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut deploy_state: EVMFuzzState = FuzzState::new(0);
+
+        let mut fuzz_host = FuzzHost::new(StdScheduler::new(), "work_dir".to_string());
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(Cheatcode::new(""))));
+        fuzz_host.set_code(
+            CHEATCODE_ADDRESS,
+            Bytecode::new_raw(revm_primitives::Bytes::from(vec![0xfd, 0x00])),
+            &mut deploy_state,
+        );
+
+        let mut evm_executor: EVMExecutor<EVMState, crate::evm::input::ConciseEVMInput, StdScheduler<EVMFuzzState>> =
+            EVMExecutor::new(fuzz_host, generate_random_address(&mut deploy_state));
+        evm_executor.deploy(counter_code, None, counter_addr, &mut deploy_state).unwrap();
+
+        let caller = generate_random_address(&mut deploy_state);
+
+        // Invariant holds before drain(): invariant_value_positive() should return OK
+        let mut vm_state: EVMState = evm_executor.host.evmstate.clone();
+        let (_, before) = evm_executor.fast_call_(
+            counter_addr,
+            Bytes::from(hex::decode("fd6fdaab").unwrap()), // invariant_value_positive()
+            &mut vm_state,
+            &mut deploy_state,
+            EVMU256::ZERO,
+            caller,
+        );
+        assert!(before.is_ok(), "invariant should hold initially, got {before:?}");
+
+        // Call drain() to zero out value
+        let mut vm_state2: EVMState = evm_executor.host.evmstate.clone();
+        let (_, drain_res) = evm_executor.fast_call_(
+            counter_addr,
+            Bytes::from(hex::decode("9890220b").unwrap()), // drain()
+            &mut vm_state2,
+            &mut deploy_state,
+            EVMU256::ZERO,
+            caller,
+        );
+        assert!(drain_res.is_ok(), "drain() should succeed");
+
+        // Invariant violated: invariant_value_positive() should revert
+        let (_, after) = evm_executor.fast_call_(
+            counter_addr,
+            Bytes::from(hex::decode("fd6fdaab").unwrap()), // invariant_value_positive()
+            &mut vm_state2,
+            &mut deploy_state,
+            EVMU256::ZERO,
+            caller,
+        );
+        assert_eq!(after, InstructionResult::Revert, "invariant_value_positive() must revert after drain()");
+    }
+}
