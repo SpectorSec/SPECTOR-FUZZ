@@ -53,6 +53,7 @@ use crate::{
             arb_call::ArbitraryCallOracle,
             arb_transfer::ArbitraryERC20TransferOracle,
             echidna::EchidnaOracle,
+            fee_on_transfer::FeeOnTransferOracle,
             invariant::InvariantOracle,
             nft::NFTOwnershipOracle,
             reentrancy::ReentrancyOracle,
@@ -401,6 +402,11 @@ pub fn evm_fuzzer(
     if config.nft_oracle {
         let nft_oracle = NFTOwnershipOracle::new(artifacts.address_to_name.clone());
         oracles.push(Rc::new(RefCell::new(nft_oracle)));
+    }
+
+    if config.fee_on_transfer_oracle {
+        let fee_oracle = FeeOnTransferOracle::new(artifacts.address_to_name.clone());
+        oracles.push(Rc::new(RefCell::new(fee_oracle)));
     }
 
     // if let Some(path) = config.state_comp_oracle {

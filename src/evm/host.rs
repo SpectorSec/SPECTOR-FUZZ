@@ -1629,6 +1629,18 @@ where
             }
         }
 
+        // ERC-20 Transfer(address indexed from, address indexed to, uint256 value)
+        // 3 topics: sig + from + to; value is in data (not indexed).
+        if topics.len() == 3 && topics[0].0 == ERC721_TRANSFER_SIG && _data.len() == 32 {
+            let from  = EVMAddress::from_slice(&topics[1].0[12..]);
+            let to    = EVMAddress::from_slice(&topics[2].0[12..]);
+            let value = EVMU256::from_be_slice(&_data[..32]);
+            // Skip mint (from == zero) and trivial zero-value transfers
+            if !from.is_zero() && value > EVMU256::ZERO {
+                self.evmstate.erc20_transfers.push((_address, from, to, value));
+            }
+        }
+
         // ERC-721 Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
         // 4 topics: sig + from + to + tokenId. Distinguished from ERC-20 (3 topics) by 4th indexed tokenId.
         if topics.len() == 4 && topics[0].0 == ERC721_TRANSFER_SIG {

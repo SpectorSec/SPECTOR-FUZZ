@@ -4,6 +4,7 @@ pub mod arb_call;
 pub mod arb_transfer;
 pub mod echidna;
 pub mod erc20;
+pub mod fee_on_transfer;
 pub mod function;
 pub mod invariant;
 pub mod nft;
@@ -26,6 +27,7 @@ pub static REENTRANCY_BUG_IDX: u64 = 9;
 pub static INVARIANT_BUG_IDX: u64 = 10;
 pub static INTEGER_OVERFLOW_BUG_IDX: u64 = 11;
 pub static NFT_BUG_IDX: u64 = 12;
+pub static FEE_ON_TRANSFER_BUG_IDX: u64 = 13;
 
 /// Divide a U512 by another U512 and return a string with the decimal point at
 /// the correct position For example, 1000 / 3 = 333.333, then a = 1000e6, b =

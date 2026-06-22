@@ -262,9 +262,12 @@ pub struct EVMState {
     pub reentrancy_metadata: ReentrancyData,
     #[serde(skip)]
     pub swap_data: SwapData,
-    /// ERC-721 Transfer events: (token_contract, from, to, token_id)
+    /// ERC-721 / ERC-1155 Transfer events: (token_contract, from, to, token_id)
     #[serde(skip)]
     pub nft_transfers: Vec<(EVMAddress, EVMAddress, EVMAddress, revm_primitives::B256)>,
+    /// ERC-20 Transfer events: (token_contract, from, to, value)
+    #[serde(skip)]
+    pub erc20_transfers: Vec<(EVMAddress, EVMAddress, EVMAddress, EVMU256)>,
 }
 
 pub trait EVMStateT {
