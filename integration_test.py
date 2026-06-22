@@ -65,7 +65,7 @@ def test_one(path):
     ]
     # exit(0)
 
-    if "concolic" in path:
+    if "concolic" in path or "external_calls" in path:
         cmd.append("--concolic --concolic-caller")
 
     if "taint" in path:
