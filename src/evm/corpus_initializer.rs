@@ -581,6 +581,59 @@ where
             swap_data: HashMap::new(),
         };
         add_input_to_corpus!(self.state, &mut self.scheduler, input.clone(), artifacts);
+
+        // permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+        // Selector: 0xd505accf. Inject seeds with zero-signature + protocol-as-owner to fuzz
+        // signature validation bypasses (e.g. permit() accepting v=0 or v=27, r=0, s=0).
+        if abi.function == [0xd5, 0x05, 0xac, 0xcf] {
+            let callers: Vec<EVMAddress> = self.state.callers_pool.clone();
+            let protocol_addrs: Vec<EVMAddress> = artifacts.address_to_name.keys().cloned().collect();
+            // For each (protocol_owner, attacker_spender) pair, add zero-sig and max-deadline seeds
+            for owner in &protocol_addrs {
+                for spender in &callers {
+                    for v_byte in [0u8, 27u8, 28u8] {
+                        let mut calldata = vec![0xd5u8, 0x05, 0xac, 0xcf];
+                        // owner: left-padded to 32 bytes
+                        calldata.extend_from_slice(&[0u8; 12]);
+                        calldata.extend_from_slice(owner.as_slice());
+                        // spender
+                        calldata.extend_from_slice(&[0u8; 12]);
+                        calldata.extend_from_slice(spender.as_slice());
+                        // value: type(uint256).max
+                        calldata.extend_from_slice(&[0xff; 32]);
+                        // deadline: type(uint256).max
+                        calldata.extend_from_slice(&[0xff; 32]);
+                        // v
+                        calldata.extend_from_slice(&[0u8; 31]);
+                        calldata.push(v_byte);
+                        // r: zero
+                        calldata.extend_from_slice(&[0u8; 32]);
+                        // s: zero
+                        calldata.extend_from_slice(&[0u8; 32]);
+
+                        let permit_seed = EVMInput {
+                            caller: *spender,
+                            contract: deployed_address,
+                            data: None,
+                            sstate: StagedVMState::new_uninitialized(),
+                            sstate_idx: 0,
+                            txn_value: None,
+                            step: false,
+                            env: artifacts.initial_env.clone(),
+                            access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+                            liquidation_percent: 0,
+                            input_type: EVMInputTy::ABI,
+                            direct_data: Bytes::from(calldata),
+                            randomness: vec![0],
+                            repeat: 1,
+                            swap_data: HashMap::new(),
+                        };
+                        add_input_to_corpus!(self.state, &mut self.scheduler, permit_seed, artifacts);
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "print_txn_corpus")]
         {
             let corpus_dir = format!("{}/corpus", self.work_dir.as_str());
