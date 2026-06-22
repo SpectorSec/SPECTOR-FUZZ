@@ -1070,7 +1070,7 @@ mod tests {
         // testExpectMultipleCallsWithData()
         assert_fn_success!("b5a49624");
         // test() — monolith, run last
-        // assert_fn_success!("f8a8fd6d");
+        assert_fn_success!("f8a8fd6d");
     }
 
     fn load_bytecode(path: &str) -> Bytecode {
