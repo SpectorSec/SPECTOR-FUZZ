@@ -107,6 +107,17 @@ pub fn clear_branch_status() {
         }
 
         BRANCH_STATUS_IDX = 0;
+
+        // Control-leak signal flags are per-execution. Without this reset, a
+        // flag set during one fuzzer input stays set forever, corrupting
+        // subsequent runs (is_call_success! returns true on Revert, and
+        // execute_abi keeps pushing PostExecutionCtx on every input).
+        CONTROL_LEAK_DETECTED = false;
+        ARBITRARY_CALL_DETECTED = false;
+        ARBITRARY_CALL_CALLER = [0u8; 20];
+        ARBITRARY_CALL_TARGET = [0u8; 20];
+        ARBITRARY_CALL_VALUE = EVMU256::ZERO;
+        UNBOUNDED_STATIC_CALL_DETECTED = false;
     }
 }
 
