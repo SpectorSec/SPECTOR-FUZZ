@@ -457,6 +457,10 @@ impl OracleType {
                     OracleType::StateComparison,
                     OracleType::TypedBug,
                     OracleType::SelfDestruct,
+                    OracleType::Invariant,
+                    OracleType::NFT,
+                    OracleType::FeeOnTransfer,
+                    OracleType::Approval,
                 ];
             }
             if detector == "high_confidence" {
