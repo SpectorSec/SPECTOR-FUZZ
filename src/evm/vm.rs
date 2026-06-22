@@ -569,6 +569,10 @@ where
             self.host.current_arbitrary_calls = vec![];
             self.host.current_arbitrary_transfers = vec![];
             self.host.transient_storage = HashMap::new();
+            self.host.expected_emits.clear();
+            self.host.expected_revert = None;
+            self.host.expected_calls.clear();
+            self.host.call_depth = 0;
             // Initially, there is no state change
             unsafe {
                 STATE_CHANGE = false;

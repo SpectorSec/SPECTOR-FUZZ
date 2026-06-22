@@ -570,10 +570,10 @@ where
                     let action = interp.take_next_action();
                     match action {
                         InterpreterAction::NewFrame(FrameInput::Call(inputs)) => {
+                            let call_gas_limit = inputs.gas_limit;
                             let (ir, mem_offset, out_bytes) = self.call_internal(inputs, interp, state);
-                            if ir != InstructionResult::Return && ir != InstructionResult::Stop {
-                                eprintln!("[run_inspect] call_internal returned {:?} target={:?} out={:?}", ir, interp.input.target_address, String::from_utf8_lossy(&out_bytes));
-                            }
+                            // Refund forwarded gas: ItyFuzz doesn't track sub-call gas consumption
+                            interp.gas.erase_cost(call_gas_limit);
                             // Feed result back into parent interpreter
                             interp.return_data.set_buffer(out_bytes.clone().into());
                             let target_len = min(mem_offset.len(), out_bytes.len());
@@ -592,7 +592,10 @@ where
                             }
                         }
                         InterpreterAction::NewFrame(FrameInput::Create(inputs)) => {
+                            let create_gas_limit = inputs.gas_limit();
                             let (result, created_addr, output) = self.create_internal(inputs, state);
+                            // Refund forwarded gas: ItyFuzz doesn't track sub-call gas consumption
+                            interp.gas.erase_cost(create_gas_limit);
                             // Feed result back into parent interpreter
                             if result == InstructionResult::Revert {
                                 interp.return_data.set_buffer(output.into());
@@ -619,7 +622,6 @@ where
                         InterpreterAction::Return(result) => {
                             // Make output available to caller via return_data.buffer()
                             // (revm 41 puts output in the action; callers read return_data).
-                            eprintln!("[run_inspect] Suspend→Return result={:?} target={:?}", result.result, interp.input.target_address);
                             interp.return_data.set_buffer(result.output.clone());
                             return result.result;
                         }
@@ -627,10 +629,6 @@ where
                 }
                 Err(e) => {
                     // Halt — may be a normal stop/return or an error
-                    {
-                        let pc = interp.bytecode.pc();
-                        eprintln!("[run_inspect] halt e={:?} at pc={:#x} target={:?}", e, pc, interp.input.target_address);
-                    }
                     if interp.bytecode.action.is_none() {
                         interp.halt(e);
                     }
@@ -1036,15 +1034,11 @@ where
     /// Apply the prank — override msg.sender (and tx.origin if set) for the subcall.
     pub fn apply_prank(&mut self, contract_caller: &EVMAddress, input: &mut CallInputs) {
         if let Some(ref prank) = self.prank {
-            eprintln!("[prank] apply_prank: depth={} prank.depth={} contract_caller={:?} old_caller={:?} target={:?}",
-                self.call_depth, prank.depth, contract_caller, prank.old_caller, input.target_address);
             if self.call_depth >= prank.depth && contract_caller == &prank.old_caller {
                 if self.call_depth == prank.depth {
-                    eprintln!("[prank] -> setting caller to {:?}", prank.new_caller);
                     input.caller = prank.new_caller;
                 }
                 if let Some(new_origin) = prank.new_origin {
-                    eprintln!("[prank] -> setting origin to {:?}", new_origin);
                     self.env.tx.caller = new_origin;
                 }
             }
@@ -1101,8 +1095,29 @@ where
             return (InstructionResult::Return, range, retdata);
         };
 
-        // Strip ABI-encoded wrapper if present (Error(string) or CheatCodeError prefix)
         let actual: &[u8] = retdata.as_ref();
+
+        // Check 1: exact prefix match (expected is raw revert data or custom error selector)
+        let exact_match = actual.starts_with(expected_reason.as_ref());
+
+        // Check 2: expected is a plain string — wrap it as Error(string) and compare
+        // REVERT_PREFIX = 0x08c379a0 = Error(string) selector
+        let error_string_match = {
+            let msg = expected_reason.as_ref();
+            let mut encoded = REVERT_PREFIX.to_vec();
+            // ABI-encode string: 32-byte offset + 32-byte length + padded data
+            encoded.extend_from_slice(&[0u8; 31]);
+            encoded.push(0x20); // offset = 32
+            let len = msg.len() as u64;
+            encoded.extend_from_slice(&[0u8; 24]);
+            encoded.extend_from_slice(&len.to_be_bytes());
+            encoded.extend_from_slice(msg);
+            let pad = (32 - msg.len() % 32) % 32;
+            encoded.extend(std::iter::repeat(0u8).take(pad));
+            actual.starts_with(&encoded)
+        };
+
+        // Check 3: strip selector, then compare against expected (legacy behavior)
         let stripped: &[u8] = if actual.len() >= 4
             && (actual[..4] == ERROR_PREFIX || actual[..4] == REVERT_PREFIX)
         {
@@ -1110,9 +1125,9 @@ where
         } else {
             actual
         };
+        let stripped_match = stripped.starts_with(expected_reason.as_ref());
 
-        if !stripped.starts_with(expected_reason.as_ref()) {
-
+        if !exact_match && !error_string_match && !stripped_match {
             return (
                 InstructionResult::Revert,
                 range,
