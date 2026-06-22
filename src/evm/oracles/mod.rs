@@ -2,6 +2,7 @@ use super::types::EVMU512;
 
 pub mod approval;
 pub mod arb_call;
+pub mod crosschain;
 pub mod arb_transfer;
 pub mod echidna;
 pub mod erc20;
@@ -30,6 +31,7 @@ pub static INTEGER_OVERFLOW_BUG_IDX: u64 = 11;
 pub static NFT_BUG_IDX: u64 = 12;
 pub static FEE_ON_TRANSFER_BUG_IDX: u64 = 13;
 pub static APPROVAL_BUG_IDX: u64 = 14;
+pub static CROSSCHAIN_BUG_IDX: u64 = 15;
 
 /// Divide a U512 by another U512 and return a string with the decimal point at
 /// the correct position For example, 1000 / 3 = 333.333, then a = 1000e6, b =

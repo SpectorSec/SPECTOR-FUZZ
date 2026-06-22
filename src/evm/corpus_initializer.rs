@@ -634,6 +634,72 @@ where
             }
         }
 
+        // Cross-chain receiver seeds: lzReceive / ccipReceive / xReceive.
+        // Selectors: 0x001d3567, 0x85572ffb, 0x2901504d.
+        // Inject seeds where msg.sender = each attacker address (not the trusted
+        // bridge endpoint) to fuzz access-control bypass in the receiver.
+        const CROSSCHAIN_SELECTORS: [[u8; 4]; 3] = [
+            [0x00, 0x1d, 0x35, 0x67], // lzReceive(uint16,bytes,uint64,bytes)
+            [0x85, 0x57, 0x2f, 0xfb], // ccipReceive((bytes32,uint64,bytes,bytes,...))
+            [0x29, 0x01, 0x50, 0x4d], // xReceive(bytes32,uint256,address,bytes32,string,bytes)
+        ];
+        if CROSSCHAIN_SELECTORS.iter().any(|s| abi.function == *s) {
+            let sel = abi.function;
+            let callers: Vec<EVMAddress> = self.state.callers_pool.clone();
+            // Representative (srcChainId, srcSender) combinations to probe:
+            // chain IDs 0, 1, 0xffff (boundary), and a few arbitrary values.
+            let chain_ids: &[u16] = &[0, 1, 0x65, 0x89, 0xffff]; // 0=invalid,1=mainnet,101=LZ ETH,137=polygon,65535=max
+            for caller in &callers {
+                for &chain_id in chain_ids {
+                    // Build minimal valid-looking ABI for the receiver:
+                    // lzReceive: (uint16 srcChainId, bytes srcAddress, uint64 nonce, bytes payload)
+                    // All other receivers share a "bytes payload" field — we send a zero payload.
+                    let mut calldata = vec![sel[0], sel[1], sel[2], sel[3]];
+                    // srcChainId (uint16 → uint256 slot): chain_id left-padded
+                    calldata.extend_from_slice(&[0u8; 30]);
+                    calldata.extend_from_slice(&chain_id.to_be_bytes());
+                    // srcAddress (bytes): offset=0x80, length=20, value=caller
+                    // For simplicity use a fixed layout with caller address as src:
+                    // offset to srcAddress bytes (4th slot = 0x80)
+                    calldata.extend_from_slice(&[0u8; 31]);
+                    calldata.push(0x80);
+                    // nonce (uint64): 0
+                    calldata.extend_from_slice(&[0u8; 32]);
+                    // offset to payload bytes (6th slot = 0xc0)
+                    calldata.extend_from_slice(&[0u8; 31]);
+                    calldata.push(0xc0);
+                    // srcAddress bytes: length=20, data=caller
+                    calldata.extend_from_slice(&[0u8; 31]);
+                    calldata.push(20u8);
+                    calldata.extend_from_slice(&[0u8; 12]);
+                    calldata.extend_from_slice(caller.as_slice());
+                    // pad to 32 bytes
+                    calldata.extend_from_slice(&[0u8; 12]);
+                    // payload bytes: length=0
+                    calldata.extend_from_slice(&[0u8; 32]);
+
+                    let cc_seed = EVMInput {
+                        caller: *caller,
+                        contract: deployed_address,
+                        data: None,
+                        sstate: StagedVMState::new_uninitialized(),
+                        sstate_idx: 0,
+                        txn_value: None,
+                        step: false,
+                        env: artifacts.initial_env.clone(),
+                        access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+                        liquidation_percent: 0,
+                        input_type: EVMInputTy::ABI,
+                        direct_data: Bytes::from(calldata),
+                        randomness: vec![0],
+                        repeat: 1,
+                        swap_data: HashMap::new(),
+                    };
+                    add_input_to_corpus!(self.state, &mut self.scheduler, cc_seed, artifacts);
+                }
+            }
+        }
+
         #[cfg(feature = "print_txn_corpus")]
         {
             let corpus_dir = format!("{}/corpus", self.work_dir.as_str());

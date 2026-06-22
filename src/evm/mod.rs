@@ -397,6 +397,7 @@ enum OracleType {
     NFT,
     FeeOnTransfer,
     Approval,
+    CrossChain,
 }
 
 impl OracleType {
@@ -415,6 +416,7 @@ impl OracleType {
             OracleType::NFT => "nft",
             OracleType::FeeOnTransfer => "fee_on_transfer",
             OracleType::Approval => "approval",
+            OracleType::CrossChain => "crosschain",
         }
     }
 
@@ -433,6 +435,7 @@ impl OracleType {
             "nft" => OracleType::NFT,
             "fee_on_transfer" => OracleType::FeeOnTransfer,
             "approval" => OracleType::Approval,
+            "crosschain" => OracleType::CrossChain,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -461,6 +464,7 @@ impl OracleType {
                     OracleType::NFT,
                     OracleType::FeeOnTransfer,
                     OracleType::Approval,
+                    OracleType::CrossChain,
                 ];
             }
             if detector == "high_confidence" {
@@ -788,6 +792,7 @@ pub fn evm_main(mut args: EvmArgs) {
         nft_oracle: oracle_types.contains(&OracleType::NFT),
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
         approval_oracle: oracle_types.contains(&OracleType::Approval),
+        crosschain_oracle: oracle_types.contains(&OracleType::CrossChain),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
@@ -963,6 +968,7 @@ fn test_evm_offchain_setup() {
         nft_oracle: oracle_types.contains(&OracleType::NFT),
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
         approval_oracle: oracle_types.contains(&OracleType::Approval),
+        crosschain_oracle: oracle_types.contains(&OracleType::CrossChain),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),

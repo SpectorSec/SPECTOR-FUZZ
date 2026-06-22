@@ -420,6 +420,17 @@ pub fn evm_fuzzer(
         oracles.push(Rc::new(RefCell::new(approval_oracle)));
     }
 
+    if config.crosschain_oracle {
+        use crate::evm::oracles::crosschain::CrossChainOracle;
+        use std::collections::HashSet as StdHashSet;
+        // Start with an empty trusted_bridges set. In practice, users can add
+        // known bridge endpoints via the onchain config; the fuzzer will flag
+        // any non-trusted caller that successfully invokes a receiver.
+        let trusted_bridges: StdHashSet<EVMAddress> = StdHashSet::new();
+        let cc_oracle = CrossChainOracle::new(trusted_bridges, artifacts.address_to_name.clone());
+        oracles.push(Rc::new(RefCell::new(cc_oracle)));
+    }
+
     // if let Some(path) = config.state_comp_oracle {
     //     let mut file = File::open(path.clone()).expect("Failed to open state comp
     // oracle file");     let mut buf = String::new();
