@@ -582,6 +582,9 @@ where
                             let _ = interp.stack.push(EVMU256::from(1));
                         }
                         InterpreterAction::Return(result) => {
+                            // Make output available to caller via return_data.buffer()
+                            // (revm 41 puts output in the action; callers read return_data).
+                            interp.return_data.set_buffer(result.output.clone());
                             return result.result;
                         }
                     }
@@ -592,7 +595,10 @@ where
                         interp.halt(e);
                     }
                     return match interp.take_next_action() {
-                        InterpreterAction::Return(r) => r.result,
+                        InterpreterAction::Return(r) => {
+                            interp.return_data.set_buffer(r.output.clone());
+                            r.result
+                        }
                         _ => InstructionResult::Stop,
                     };
                 }
