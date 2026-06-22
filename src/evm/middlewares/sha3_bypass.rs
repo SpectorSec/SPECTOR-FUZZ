@@ -458,6 +458,36 @@ where
             }
             // JUMPDEST
             0x5b => {}
+            // MCOPY (EIP-5656, Cancun)
+            0x5e => {
+                stack_pop_n!(3);
+                let size = as_u64(interp.stack.peek(0).expect("stack is empty")) as usize;
+                let src = as_u64(interp.stack.peek(1).expect("stack is empty")) as usize;
+                let dest = as_u64(interp.stack.peek(2).expect("stack is empty")) as usize;
+                if let Some(size) = size.checked_sub(1) {
+                    if let (Some(src_end), Some(dest_end)) = (safe_mem_end(src, size), safe_mem_end(dest, size)) {
+                        let max_end = src_end.max(dest_end);
+                        ensure_size!(self.dirty_memory, max_end);
+                        if src < self.dirty_memory.len() && dest < self.dirty_memory.len() {
+                            let src_slice: Vec<bool> = {
+                                let end = src + size;
+                                if end > self.dirty_memory.len() {
+                                    let mut v = self.dirty_memory[src..].to_vec();
+                                    v.resize(size, false);
+                                    v
+                                } else {
+                                    self.dirty_memory[src..end].to_vec()
+                                }
+                            };
+                            let dest_end = dest + size;
+                            if dest_end > self.dirty_memory.len() {
+                                self.dirty_memory.resize(dest_end, false);
+                            }
+                            self.dirty_memory[dest..dest_end].copy_from_slice(&src_slice);
+                        }
+                    }
+                }
+            }
             // PUSH
             0x5f..=0x7f => {
                 push_false!();
