@@ -268,6 +268,9 @@ pub struct EVMState {
     /// ERC-20 Transfer events: (token_contract, from, to, value)
     #[serde(skip)]
     pub erc20_transfers: Vec<(EVMAddress, EVMAddress, EVMAddress, EVMU256)>,
+    /// ERC-20 Approval events: (token_contract, owner, spender, value)
+    #[serde(skip)]
+    pub erc20_approvals: Vec<(EVMAddress, EVMAddress, EVMAddress, EVMU256)>,
 }
 
 pub trait EVMStateT {

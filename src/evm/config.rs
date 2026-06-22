@@ -82,6 +82,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub invariant_oracle: bool,
     pub nft_oracle: bool,
     pub fee_on_transfer_oracle: bool,
+    pub approval_oracle: bool,
     pub panic_on_bug: bool,
     pub spec_id: String,
     pub only_fuzz: HashSet<EVMAddress>,

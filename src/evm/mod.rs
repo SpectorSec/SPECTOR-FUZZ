@@ -396,6 +396,7 @@ enum OracleType {
     Invariant,
     NFT,
     FeeOnTransfer,
+    Approval,
 }
 
 impl OracleType {
@@ -413,6 +414,7 @@ impl OracleType {
             OracleType::Invariant => "invariant",
             OracleType::NFT => "nft",
             OracleType::FeeOnTransfer => "fee_on_transfer",
+            OracleType::Approval => "approval",
         }
     }
 
@@ -430,6 +432,7 @@ impl OracleType {
             "invariant" => OracleType::Invariant,
             "nft" => OracleType::NFT,
             "fee_on_transfer" => OracleType::FeeOnTransfer,
+            "approval" => OracleType::Approval,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -780,6 +783,7 @@ pub fn evm_main(mut args: EvmArgs) {
         invariant_oracle: oracle_types.contains(&OracleType::Invariant),
         nft_oracle: oracle_types.contains(&OracleType::NFT),
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
+        approval_oracle: oracle_types.contains(&OracleType::Approval),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
@@ -954,6 +958,7 @@ fn test_evm_offchain_setup() {
         invariant_oracle: oracle_types.contains(&OracleType::Invariant),
         nft_oracle: oracle_types.contains(&OracleType::NFT),
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
+        approval_oracle: oracle_types.contains(&OracleType::Approval),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),

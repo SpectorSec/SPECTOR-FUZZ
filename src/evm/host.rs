@@ -141,6 +141,13 @@ const ERC721_TRANSFER_SIG: [u8; 32] = [
     0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ];
 
+/// Approval(address indexed owner, address indexed spender, uint256 value)
+/// ERC-20 approval event. 3 topics: sig + owner + spender; value in data.
+const ERC20_APPROVAL_SIG: [u8; 32] = [
+    0x8c, 0x5b, 0xe1, 0xe5, 0xeb, 0xec, 0x7d, 0x5b, 0xd1, 0x4f, 0x71, 0x42, 0x7d, 0x1e, 0x84, 0xf3,
+    0xdd, 0x03, 0x14, 0xc0, 0xf7, 0xb2, 0x29, 0x1e, 0x5b, 0x20, 0x0a, 0xc8, 0xc7, 0xc3, 0xb9, 0x25,
+];
+
 /// TransferSingle(address operator, address from, address to, uint256 id, uint256 value)
 /// ERC-1155 single-token transfer event. 4 topics: sig + operator + from + to; id+value in data.
 const ERC1155_TRANSFER_SINGLE_SIG: [u8; 32] = [
@@ -1626,6 +1633,17 @@ where
                 }
                 self.current_typed_bug
                     .push((data_string.trim_end_matches('\u{0}').to_string(), (_address, self._pc)));
+            }
+        }
+
+        // ERC-20 Approval(address indexed owner, address indexed spender, uint256 value)
+        // 3 topics: sig + owner + spender; value in data (not indexed).
+        if topics.len() == 3 && topics[0].0 == ERC20_APPROVAL_SIG && _data.len() == 32 {
+            let owner   = EVMAddress::from_slice(&topics[1].0[12..]);
+            let spender = EVMAddress::from_slice(&topics[2].0[12..]);
+            let value   = EVMU256::from_be_slice(&_data[..32]);
+            if value > EVMU256::ZERO {
+                self.evmstate.erc20_approvals.push((_address, owner, spender, value));
             }
         }
 

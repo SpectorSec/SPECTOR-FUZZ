@@ -50,6 +50,7 @@ use crate::{
         mutator::FuzzMutator,
         onchain::{flashloan::Flashloan, offchain::OffChainConfig, ChainConfig, OnChain, WHITELIST_ADDR},
         oracles::{
+            approval::SuspiciousApprovalOracle,
             arb_call::ArbitraryCallOracle,
             arb_transfer::ArbitraryERC20TransferOracle,
             echidna::EchidnaOracle,
@@ -407,6 +408,16 @@ pub fn evm_fuzzer(
     if config.fee_on_transfer_oracle {
         let fee_oracle = FeeOnTransferOracle::new(artifacts.address_to_name.clone());
         oracles.push(Rc::new(RefCell::new(fee_oracle)));
+    }
+
+    if config.approval_oracle {
+        use std::collections::HashSet as StdHashSet;
+        let known_contracts: StdHashSet<EVMAddress> = artifacts.address_to_name.keys().cloned().collect();
+        let approval_oracle = SuspiciousApprovalOracle::new(
+            known_contracts,
+            artifacts.address_to_name.clone(),
+        );
+        oracles.push(Rc::new(RefCell::new(approval_oracle)));
     }
 
     // if let Some(path) = config.state_comp_oracle {
