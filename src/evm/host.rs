@@ -896,11 +896,15 @@ where
                     input.target_address,
                     self._pc,
                 ));
-                // ERC20 transfer detection for arbitrary_transfers oracle
+                // Token transfer detection for arbitrary_transfers oracle
                 let selector = &input_bytes[..4];
-                // transfer(address,uint256) = a9059cbb
-                // transferFrom(address,address,uint256) = 23b872dd
-                if selector == b"\xa9\x05\x9c\xbb" || selector == b"\x23\xb8\x72\xdd" {
+                // ERC-20: transfer(address,uint256)=a9059cbb, transferFrom(address,address,uint256)=23b872dd
+                // ERC-777: send(address,uint256,bytes)=9bd9bbc6, operatorSend(address,address,uint256,bytes,bytes)=62ad1b83
+                if selector == b"\xa9\x05\x9c\xbb"
+                    || selector == b"\x23\xb8\x72\xdd"
+                    || selector == b"\x9b\xd9\xbb\xc6"
+                    || selector == b"\x62\xad\x1b\x83"
+                {
                     self.current_arbitrary_transfers.push((
                         input.caller,
                         self._pc,
