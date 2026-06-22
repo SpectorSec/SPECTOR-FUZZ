@@ -431,6 +431,14 @@ pub fn evm_fuzzer(
         oracles.push(Rc::new(RefCell::new(cc_oracle)));
     }
 
+    if config.rebasing_oracle {
+        use crate::evm::oracles::rebasing::RebasingOracle;
+        use std::collections::HashSet as StdHashSet;
+        let known_contracts: StdHashSet<EVMAddress> = artifacts.address_to_name.keys().cloned().collect();
+        let rebasing_oracle = RebasingOracle::new(known_contracts, artifacts.address_to_name.clone());
+        oracles.push(Rc::new(RefCell::new(rebasing_oracle)));
+    }
+
     // if let Some(path) = config.state_comp_oracle {
     //     let mut file = File::open(path.clone()).expect("Failed to open state comp
     // oracle file");     let mut buf = String::new();

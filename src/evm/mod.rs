@@ -398,6 +398,7 @@ enum OracleType {
     FeeOnTransfer,
     Approval,
     CrossChain,
+    Rebasing,
 }
 
 impl OracleType {
@@ -417,6 +418,7 @@ impl OracleType {
             OracleType::FeeOnTransfer => "fee_on_transfer",
             OracleType::Approval => "approval",
             OracleType::CrossChain => "crosschain",
+            OracleType::Rebasing => "rebasing",
         }
     }
 
@@ -436,6 +438,7 @@ impl OracleType {
             "fee_on_transfer" => OracleType::FeeOnTransfer,
             "approval" => OracleType::Approval,
             "crosschain" => OracleType::CrossChain,
+            "rebasing" => OracleType::Rebasing,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -465,6 +468,7 @@ impl OracleType {
                     OracleType::FeeOnTransfer,
                     OracleType::Approval,
                     OracleType::CrossChain,
+                    OracleType::Rebasing,
                 ];
             }
             if detector == "high_confidence" {
@@ -793,6 +797,7 @@ pub fn evm_main(mut args: EvmArgs) {
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
         approval_oracle: oracle_types.contains(&OracleType::Approval),
         crosschain_oracle: oracle_types.contains(&OracleType::CrossChain),
+        rebasing_oracle: oracle_types.contains(&OracleType::Rebasing),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
@@ -969,6 +974,7 @@ fn test_evm_offchain_setup() {
         fee_on_transfer_oracle: oracle_types.contains(&OracleType::FeeOnTransfer),
         approval_oracle: oracle_types.contains(&OracleType::Approval),
         crosschain_oracle: oracle_types.contains(&OracleType::CrossChain),
+        rebasing_oracle: oracle_types.contains(&OracleType::Rebasing),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),

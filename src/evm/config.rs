@@ -84,6 +84,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub fee_on_transfer_oracle: bool,
     pub approval_oracle: bool,
     pub crosschain_oracle: bool,
+    pub rebasing_oracle: bool,
     pub panic_on_bug: bool,
     pub spec_id: String,
     pub only_fuzz: HashSet<EVMAddress>,
