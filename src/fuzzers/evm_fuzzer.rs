@@ -121,10 +121,6 @@ pub fn evm_fuzzer(
                 config.onchain_storage_fetching.unwrap(),
             )));
 
-            if let Some(builder) = config.builder.clone() {
-                mid.borrow_mut().add_builder(builder);
-            }
-
             debug!("onchain middleware enabled");
             fuzz_host.add_middlewares(mid.clone());
             mid
@@ -138,9 +134,6 @@ pub fn evm_fuzzer(
             match &config.contract_loader.setup_data.clone().map(|s| s.onchain_middleware) {
                 Some(Some(mid)) => {
                     let mid = Rc::new(RefCell::new(mid.clone()));
-                    if let Some(builder) = config.builder.clone() {
-                        mid.borrow_mut().add_builder(builder);
-                    }
                     fuzz_host.add_middlewares(mid.clone());
                     Some(mid)
                 }

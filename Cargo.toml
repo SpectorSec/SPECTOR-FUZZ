@@ -35,20 +35,6 @@ force_cache = []
 use_presets = []
 print_logs = []
 z3_debug = []
-# sui_support is disabled during EVM modernization — the ityfuzz-sui-fork
-# workspace-hack references several stale/yanked crates (core2 0.4.0,
-# wasm-bindgen-backend "spans" feature) that block fresh Cargo resolution.
-# Re-enable once the Sui fork is updated to a current workspace-hack.
-# sui_support = [
-#     "dep:move-binary-format",
-#     "dep:move-core-types",
-#     "dep:move-stdlib",
-#     "dep:move-vm-runtime",
-#     "dep:move-vm-types",
-#     "dep:sui-move-natives-latest",
-#     "dep:sui-protocol-config",
-#     "dep:sui-types",
-# ]
 debug = []
 flashloan_debug = []
 no_etherscan = []
@@ -91,20 +77,6 @@ revm-context = { version = "41.0.0", features = ["serde"] }
 revm-primitives = { version = "41.0.0", features = ["serde"] }
 revm-interpreter = { version = "41.0.0", features = ["serde", "memory_limit"] }
 
-# Sui optional deps disabled — see sui_support feature comment above.
-# move-binary-format = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-# move-core-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
-#     "address32",
-# ], optional = true }
-# move-stdlib = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-# move-vm-runtime = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", features = [
-#     "lazy_natives",
-# ], optional = true }
-# move-vm-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-# sui-move-natives-latest = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-# sui-protocol-config = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-# sui-types = { git = "https://github.com/fuzzland/ityfuzz-sui-fork.git", optional = true }
-
 # template engine
 handlebars = "4.4"
 
@@ -128,6 +100,10 @@ semver = "1.0.22"
 # These patches replicate foundry's own Cargo.lock pinning so our dep resolution
 # agrees with what foundry's workspace compiled against.
 [patch.crates-io]
+# libafl_bolts 0.11.2: unpack_type_id uses aligned dereference on 16-byte TypeId;
+# Rust nightly ≥1.82 enforces alignment at runtime → panics in ctor on startup.
+# Fix: use read_unaligned so 8-byte-aligned TypeId is handled correctly.
+libafl_bolts = { path = "vendor/libafl_bolts-0.11.2" }
 # foundry-rs/foundry-core — three different revs, one per package group
 foundry-compilers = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }
 foundry-compilers-artifacts = { git = "https://github.com/foundry-rs/foundry-core", rev = "39f19b016c2ba793b24255bda83bd3822c8cb525" }

@@ -401,7 +401,7 @@ mod tests {
             .expect("bytecode not found")
             .trim()
             .to_string();
-        let bytecode = Bytecode::new_raw(Bytes::from(hex::decode(hex_code).unwrap()));
+        let bytecode = Bytecode::new_raw(revm_primitives::Bytes::from(hex::decode(hex_code).unwrap()));
 
         vm.deploy(bytecode, None, *address, state);
     }

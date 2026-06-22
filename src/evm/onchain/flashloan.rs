@@ -207,7 +207,7 @@ impl Flashloan {
 
     pub fn on_pair_insertion<SC>(&mut self, host: &FuzzHost<SC>, state: &mut EVMFuzzState, pair: EVMAddress)
     where
-        SC: Scheduler<State = EVMFuzzState> + Clone,
+        SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
         let slots = host.find_static_call_read_slot(
             pair,
@@ -249,7 +249,7 @@ impl Flashloan {
 
 impl<SC> Middleware<SC> for Flashloan
 where
-    SC: Scheduler<State = EVMFuzzState> + Clone,
+    SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
 {
     unsafe fn on_step(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>, s: &mut EVMFuzzState) {
         // if simply static call, we dont care
@@ -301,6 +301,10 @@ where
     }
 
     fn as_any(&self) -> &dyn any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any {
         self
     }
 }

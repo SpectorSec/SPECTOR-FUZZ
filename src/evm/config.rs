@@ -10,7 +10,6 @@ use std::{
 use crate::evm::contract_utils::ContractLoader;
 use crate::{
     evm::{
-        blaz::builder::BuildJob,
         onchain::endpoints::OnChainConfig,
         oracles::erc20::IERC20OracleFlashloan,
         types::EVMAddress,
@@ -87,7 +86,6 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub typed_bug: bool,
     pub arbitrary_external_call: bool,
     pub math_calculate_oracle: bool,
-    pub builder: Option<BuildJob>,
     pub local_files_basedir_pattern: Option<String>,
     pub load_corpus: String,
     #[cfg(feature = "use_presets")]

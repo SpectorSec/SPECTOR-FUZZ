@@ -19,7 +19,7 @@ use crate::evm::{
 /// Cheat VmCalls
 impl<SC> Cheatcode<SC>
 where
-    SC: Scheduler<State = EVMFuzzState> + Clone,
+    SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
 {
     #[inline]
     pub fn create_select_fork0(&self, host: &mut FuzzHost<SC>, args: Vm::createSelectFork_0Call) -> Option<Vec<u8>> {

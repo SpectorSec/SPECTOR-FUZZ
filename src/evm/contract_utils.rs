@@ -57,7 +57,7 @@ use super::{
 use crate::evm::{
     abi::get_abi_type_boxed_with_address,
     blaz::{
-        builder::{BuildJob, BuildJobResult},
+        builder::BuildJobResult,
         linking::Linker,
         offchain_artifacts::{ContractArtifact, OffChainArtifact},
         offchain_config::OffchainConfig,
@@ -567,7 +567,7 @@ impl ContractLoader {
         }
     }
 
-    pub fn from_address(onchain: &mut OnChainConfig, address: HashSet<EVMAddress>, builder: Option<BuildJob>) -> Self {
+    pub fn from_address(onchain: &mut OnChainConfig, address: HashSet<EVMAddress>) -> Self {
         let mut contracts: Vec<ContractInfo> = vec![];
         let mut abis: Vec<ABIInfo> = vec![];
         let mut setup_data: SetupData = Default::default();
@@ -585,18 +585,9 @@ impl ContractLoader {
         for addr in address {
             let mut abi = None;
             let mut bytecode = None;
-            let mut build_artifact = None;
+            let build_artifact: Option<BuildJobResult> = None;
 
-            if let Some(builder) = builder.clone() {
-                let result = builder.onchain_job(onchain.chain_name.clone(), addr);
-                if let Some(result) = result {
-                    abi = Some(result.abi.clone());
-                    bytecode = Some(onchain.get_contract_code(addr, false));
-                    build_artifact = Some(result);
-                }
-            }
-
-            if abi.is_none() || bytecode.is_none() {
+            {
                 abi = onchain.fetch_abi(addr);
                 bytecode = Some(onchain.get_contract_code(addr, false));
             }

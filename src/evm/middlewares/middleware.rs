@@ -115,4 +115,6 @@ where
     fn get_type(&self) -> MiddlewareType;
 
     fn as_any(&self) -> &dyn any::Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any;
 }

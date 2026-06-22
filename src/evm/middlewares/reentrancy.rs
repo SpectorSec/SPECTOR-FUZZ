@@ -186,6 +186,10 @@ where
     fn as_any(&self) -> &dyn any::Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

@@ -1214,7 +1214,7 @@ mod tests {
 
         let deployment_loc = evm_executor
             .deploy(
-                Bytecode::new_raw(Bytes::from(deployment_bytecode)),
+                Bytecode::new_raw(revm_primitives::Bytes::from(deployment_bytecode)),
                 None,
                 generate_random_address(&mut state),
                 &mut FuzzState::new(0),

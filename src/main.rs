@@ -26,14 +26,8 @@ pub mod state;
 pub mod state_input;
 pub mod tracer;
 
-#[cfg(feature = "sui_support")]
-pub mod r#move;
-
 use clap::{Parser, Subcommand};
 use evm::{evm_main, EvmArgs};
-
-#[cfg(feature = "sui_support")]
-use crate::r#move::{move_main, MoveArgs};
 
 pub fn init_sentry() {
     let _guard = sentry::init((
@@ -56,8 +50,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Evm(EvmArgs),
-    #[cfg(feature = "sui_support")]
-    Move(MoveArgs),
 }
 
 fn main() {
@@ -68,10 +60,6 @@ fn main() {
     match args.command {
         Commands::Evm(args) => {
             evm_main(args);
-        }
-        #[cfg(feature = "sui_support")]
-        Commands::Move(args) => {
-            move_main(args);
         }
     }
 }

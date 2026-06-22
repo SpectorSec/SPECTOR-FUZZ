@@ -44,7 +44,7 @@ use crate::{
         corpus_initializer::ABIMap,
         input::{EVMInput, EVMInputTy},
         middlewares::{
-            cheatcode::{ExpectedCallTracker, ExpectedCallType, ExpectedEmit, ExpectedRevert, Prank, ERROR_PREFIX, REVERT_PREFIX},
+            cheatcode::{Cheatcode, CHEATCODE_ADDRESS, ExpectedCallTracker, ExpectedCallType, ExpectedEmit, ExpectedRevert, Prank, ERROR_PREFIX, REVERT_PREFIX},
             middleware::{add_corpus, CallMiddlewareReturn, Middleware, MiddlewareType},
         },
         mutator::AccessPattern,
@@ -347,7 +347,7 @@ macro_rules! u256_to_u8 {
 
 impl<SC> FuzzHost<SC>
 where
-    SC: Scheduler<State = EVMFuzzState> + Clone,
+    SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
 {
     pub fn new(scheduler: SC, workdir: String) -> Self {
         Self {
@@ -412,7 +412,6 @@ where
 
         loop {
             // ---- pre-step inspection (was Host::step in old API) ----
-            let pc_before = interp.bytecode.pc();
             unsafe {
                 let opcode = interp.bytecode.opcode();
                 let pc = interp.bytecode.pc();
@@ -562,10 +561,6 @@ where
             }
 
             // ---- execute the instruction ----
-            // If a middleware advanced the PC (e.g. cheatcode intercepted a CALL), skip step.
-            if interp.bytecode.pc() != pc_before {
-                continue;
-            }
             match interp.step(&table, &gas_tbl, self) {
                 Ok(()) => {
                     // instruction completed normally, loop
@@ -576,6 +571,9 @@ where
                     match action {
                         InterpreterAction::NewFrame(FrameInput::Call(inputs)) => {
                             let (ir, mem_offset, out_bytes) = self.call_internal(inputs, interp, state);
+                            if ir != InstructionResult::Return && ir != InstructionResult::Stop {
+                                eprintln!("[run_inspect] call_internal returned {:?} target={:?} out={:?}", ir, interp.input.target_address, String::from_utf8_lossy(&out_bytes));
+                            }
                             // Feed result back into parent interpreter
                             interp.return_data.set_buffer(out_bytes.clone().into());
                             let target_len = min(mem_offset.len(), out_bytes.len());
@@ -588,6 +586,7 @@ where
                             // Propagate any control-leak signal immediately
                             unsafe {
                                 if CONTROL_LEAK_DETECTED || ARBITRARY_CALL_DETECTED || UNBOUNDED_STATIC_CALL_DETECTED {
+                                    tracing::debug!("[run_inspect] control-leak exit: CONTROL={} ARBITRARY={} UNBOUNDED={}", CONTROL_LEAK_DETECTED, ARBITRARY_CALL_DETECTED, UNBOUNDED_STATIC_CALL_DETECTED);
                                     return InstructionResult::Revert;
                                 }
                             }
@@ -620,6 +619,7 @@ where
                         InterpreterAction::Return(result) => {
                             // Make output available to caller via return_data.buffer()
                             // (revm 41 puts output in the action; callers read return_data).
+                            eprintln!("[run_inspect] Suspend→Return result={:?} target={:?}", result.result, interp.input.target_address);
                             interp.return_data.set_buffer(result.output.clone());
                             return result.result;
                         }
@@ -627,6 +627,10 @@ where
                 }
                 Err(e) => {
                     // Halt — may be a normal stop/return or an error
+                    {
+                        let pc = interp.bytecode.pc();
+                        eprintln!("[run_inspect] halt e={:?} at pc={:#x} target={:?}", e, pc, interp.input.target_address);
+                    }
                     if interp.bytecode.action.is_none() {
                         interp.halt(e);
                     }
@@ -1032,12 +1036,15 @@ where
     /// Apply the prank — override msg.sender (and tx.origin if set) for the subcall.
     pub fn apply_prank(&mut self, contract_caller: &EVMAddress, input: &mut CallInputs) {
         if let Some(ref prank) = self.prank {
+            eprintln!("[prank] apply_prank: depth={} prank.depth={} contract_caller={:?} old_caller={:?} target={:?}",
+                self.call_depth, prank.depth, contract_caller, prank.old_caller, input.target_address);
             if self.call_depth >= prank.depth && contract_caller == &prank.old_caller {
                 if self.call_depth == prank.depth {
-                    // In revm 41, `input.caller` is both msg.sender and the transfer source.
+                    eprintln!("[prank] -> setting caller to {:?}", prank.new_caller);
                     input.caller = prank.new_caller;
                 }
                 if let Some(new_origin) = prank.new_origin {
+                    eprintln!("[prank] -> setting origin to {:?}", new_origin);
                     self.env.tx.caller = new_origin;
                 }
             }
@@ -1061,6 +1068,7 @@ where
 
     pub fn check_assert_result(&mut self) -> Option<(InstructionResult, std::ops::Range<usize>, Bytes)> {
         if let Some(ref msg) = self.assert_msg {
+            tracing::debug!("[assert] check_assert_result triggered: {:?}", msg);
             return Some((InstructionResult::Revert, 0..0, msg.abi_encode().into()));
         }
         None
@@ -1193,7 +1201,19 @@ where
         state: &mut EVMFuzzState,
     ) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
         let mut input = *input;
-        self.apply_prank(&interp.input.caller_address, &mut input);
+
+        // Revm 41 CALL/STATICCALL instructions store calldata as SharedBuffer(range)
+        // where the range is an ABSOLUTE position in the SharedMemory slab
+        // (get_memory_input_and_out_ranges already adds local_memory_offset).
+        // Use global_slice_range (base=0) to avoid double-adding my_checkpoint.
+        if let CallInput::SharedBuffer(ref range) = input.input {
+            let bytes = PrimBytes::copy_from_slice(&*interp.memory.global_slice_range(range.clone()));
+            input.input = CallInput::Bytes(bytes);
+        }
+
+
+        let caller_addr = input.caller;
+        self.apply_prank(&caller_addr, &mut input);
         self.call_depth += 1;
 
         let value = match input.value {
@@ -1225,19 +1245,66 @@ where
 
         let output_info = (unsafe { RET_OFFSET }, unsafe { RET_SIZE });
 
-        let mut res = if is_precompile(input.target_address, self.precompiles.len()) {
-            self.call_precompile(&mut input, state)
-        } else if unsafe { IS_FAST_CALL_STATIC || IS_FAST_CALL } {
-            self.call_forbid_control_leak(&mut input, state)
+        // Intercept cheatcode calls at the call boundary (not opcode level).
+        // By this point input.input is always CallInput::Bytes (SharedBuffer resolved above).
+        let mut res = if input.target_address == CHEATCODE_ADDRESS {
+            let calldata = Self::get_input_bytes(&input.input);
+            let caller = input.caller;
+            let tx_origin = self.env.tx.caller;
+            let cheat_result = if self.middlewares_enabled {
+                let middlewares = self.middlewares.read().unwrap().clone();
+                let mut result = None;
+                for mw in middlewares.iter() {
+                    let mut mw_ref = mw.borrow_mut();
+                    if mw_ref.get_type() == MiddlewareType::Cheatcode {
+                        let cheat = mw_ref.as_any_mut().downcast_mut::<Cheatcode<SC>>().unwrap();
+                        result = cheat.dispatch(calldata.as_ref(), &caller, &tx_origin, self);
+                        break;
+                    }
+                }
+                result
+            } else {
+                None
+            };
+            match cheat_result {
+                Some(ret) => (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::from(ret)),
+                None => (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::new()),
+            }
         } else {
-            self.call_allow_control_leak(&mut input, interp, output_info, state)
+            // For real calls, track expectCall counts before executing.
+            if self.middlewares_enabled && !self.expected_calls.is_empty() {
+                let calldata = Self::get_input_bytes(&input.input);
+                let value = match input.value { CallValue::Transfer(v) => v, _ => EVMU256::ZERO };
+                let target = input.target_address;
+                let mut expected = std::mem::take(&mut self.expected_calls);
+                let middlewares = self.middlewares.read().unwrap().clone();
+                for mw in middlewares.iter() {
+                    let mut mw_ref = mw.borrow_mut();
+                    if mw_ref.get_type() == MiddlewareType::Cheatcode {
+                        let cheat = mw_ref.as_any_mut().downcast_mut::<Cheatcode<SC>>().unwrap();
+                        cheat.check_expected_call(&target, calldata.as_ref(), value, &mut expected);
+                        break;
+                    }
+                }
+                self.expected_calls = expected;
+            }
+            if is_precompile(input.target_address, self.precompiles.len()) {
+                self.call_precompile(&mut input, state)
+            } else if unsafe { IS_FAST_CALL_STATIC || IS_FAST_CALL } {
+                self.call_forbid_control_leak(&mut input, state)
+            } else {
+                self.call_allow_control_leak(&mut input, interp, output_info, state)
+            }
         };
 
         let ret_buffer = res.2.clone();
+        let was_cheatcode = input.target_address == CHEATCODE_ADDRESS;
 
         self.call_depth -= 1;
-        res = self.check_expected(&input, res);
-        self.clean_prank();
+        if !was_cheatcode {
+            res = self.check_expected(&input, res);
+            self.clean_prank();
+        }
 
         unsafe {
             if self.middlewares_enabled {
@@ -1623,7 +1690,8 @@ where
         let (code_hash, code) = if load_code {
             match self.code.get(&address) {
                 Some(c) => (c.hash_slow(), Some((**c).clone())),
-                None => (KECCAK_EMPTY, None),
+                // No bytecode → return empty bytecode so extcodesize doesn't unwrap None
+                None => (KECCAK_EMPTY, Some(Bytecode::default())),
             }
         } else {
             match self.code.get(&address) {

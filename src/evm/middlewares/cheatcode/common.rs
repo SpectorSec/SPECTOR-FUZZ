@@ -252,13 +252,15 @@ where
         args: Vm::prank_0Call,
     ) -> Option<Vec<u8>> {
         let Vm::prank_0Call { msgSender } = args;
+        // call_depth was incremented before dispatch; subtract 1 to match the
+        // test-frame depth where apply_prank is checked (before increment).
         host.prank = Some(Prank::new(
             *old_caller,
             None,
             msgSender,
             None,
             true,
-            host.call_depth,
+            host.call_depth - 1,
         ));
 
         None
@@ -281,7 +283,7 @@ where
             msgSender,
             Some(txOrigin),
             true,
-            host.call_depth,
+            host.call_depth - 1,
         ));
 
         None
@@ -303,7 +305,7 @@ where
             msgSender,
             None,
             false,
-            host.call_depth,
+            host.call_depth - 1,
         ));
 
         None
@@ -326,7 +328,7 @@ where
             msgSender,
             Some(txOrigin),
             false,
-            host.call_depth,
+            host.call_depth - 1,
         ));
 
         None

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use bytes::Bytes;
 use revm_interpreter::bytecode::Bytecode;
 use revm_primitives::Bytes as PrimBytes;
@@ -12,17 +10,20 @@ use crate::{
     skip_cbor,
 };
 
-pub mod builder;
-pub(crate) mod linking;
-pub mod offchain_artifacts;
-pub mod offchain_config;
+use std::time::Duration;
 
-fn get_client() -> reqwest::blocking::Client {
+pub(crate) fn get_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .expect("build client failed")
 }
+
+pub mod builder;
+pub(crate) mod linking;
+pub mod offchain_artifacts;
+pub mod offchain_config;
+
 
 /// In this, we'll just check all push4
 /// Hay = longer contract, with constructor args

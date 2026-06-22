@@ -26,7 +26,7 @@ use super::{corpus_initializer::EnvMetadata, types::EVMFuzzState};
 use crate::{
     evm::{
         abi::{get_abi_type_boxed, register_abi_instance},
-        blaz::builder::{ArtifactInfoMetadata, BuildJob},
+        blaz::builder::ArtifactInfoMetadata,
         bytecode_analyzer,
         config::StorageFetchingMode,
         contract_utils::{extract_sig_from_contract, ABIConfig, ContractLoader},
@@ -74,7 +74,6 @@ pub struct OnChain {
     pub storage_fetching: StorageFetchingMode,
     pub storage_all: HashMap<EVMAddress, Arc<HashMap<String, EVMU256>>>,
     pub storage_dump: HashMap<EVMAddress, Arc<HashMap<EVMU256, EVMU256>>>,
-    pub builder: Option<BuildJob>,
     pub address_to_abi: HashMap<EVMAddress, Vec<ABIConfig>>,
 }
 
@@ -127,15 +126,11 @@ impl OnChain {
             ]),
             storage_all: Default::default(),
             storage_dump: Default::default(),
-            builder: None,
             address_to_abi: Default::default(),
             storage_fetching,
         }
     }
 
-    pub fn add_builder(&mut self, builder: BuildJob) {
-        self.builder = Some(builder);
-    }
     pub fn add_abi(&mut self, abi: HashMap<EVMAddress, Vec<ABIConfig>>) {
         self.address_to_abi = abi;
     }
@@ -158,7 +153,7 @@ pub fn keccak256(input: &[u8]) -> EVMU256 {
 
 impl<SC> Middleware<SC> for OnChain
 where
-    SC: Scheduler<State = EVMFuzzState> + Clone,
+    SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
 {
     unsafe fn on_step(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>, state: &mut EVMFuzzState) {
         #[cfg(feature = "force_cache")]
@@ -310,6 +305,10 @@ where
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 impl OnChain {
@@ -324,7 +323,7 @@ impl OnChain {
         caller: EVMAddress,
         state: &mut EVMFuzzState,
     ) where
-        SC: Scheduler<State = EVMFuzzState> + Clone,
+        SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
         let contract_code = self.endpoint.get_contract_code(address_h160, force_cache);
         let code = hex::decode(contract_code).unwrap();
@@ -351,26 +350,7 @@ impl OnChain {
             parsed_abi = abis.clone();
         } else {
             let mut abi = None;
-            if let Some(builder) = &self.builder {
-                debug!("onchain job {:?}", address_h160);
-                let build_job = builder.onchain_job(self.endpoint.chain_name.clone(), address_h160);
-
-                if let Some(job) = build_job {
-                    abi = Some(job.abi.clone());
-                    // replace the code with the one from builder
-                    // debug!("replace code for {:?} with builder's", address_h160);
-                    // host.set_codedata(address_h160, contract_code.clone());
-                    state
-                        .metadata_map_mut()
-                        .get_mut::<ArtifactInfoMetadata>()
-                        .expect("artifact info metadata")
-                        .add(address_h160, job.clone());
-
-                    job.save_source_map(&address_h160);
-                }
-            }
-
-            if abi.is_none() {
+            {
                 debug!("fetching abi {:?}", address_h160);
                 abi = self.endpoint.fetch_abi(address_h160);
             }

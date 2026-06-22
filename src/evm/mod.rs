@@ -38,7 +38,6 @@ use std::{
 };
 
 use blaz::{
-    builder::{BuildJob, BuildJobResult},
     offchain_artifacts::OffChainArtifact,
     offchain_config::OffchainConfig,
 };
@@ -243,15 +242,6 @@ pub struct EvmArgs {
     #[arg(long, default_value = "Latest")]
     spec_id: String,
 
-    /// Builder URL. If specified, will use this builder to build contracts
-    /// instead of using bins and abis.
-    #[arg(long, default_value = "")]
-    onchain_builder: String,
-
-    /// Replacement config (replacing bytecode) for onchain campaign
-    #[arg(long, default_value = "")]
-    onchain_replacements_file: String,
-
     /// Builder Artifacts url. If specified, will use this artifact to derive
     /// code coverage.
     #[arg(long, default_value = "")]
@@ -345,12 +335,6 @@ impl fmt::Display for EvmArgs {
         write!(f, "    only_fuzz: {},\n", self.only_fuzz)?;
         write!(f, "    base_path: {},\n", self.base_path)?;
         write!(f, "    spec_id: {},\n", self.spec_id)?;
-        write!(f, "    onchain_builder: {},\n", self.onchain_builder)?;
-        write!(
-            f,
-            "    onchain_replacements_file: {},\n",
-            self.onchain_replacements_file
-        )?;
         write!(f, "    builder_artifacts_url: {},\n", self.builder_artifacts_url)?;
         write!(f, "    builder_artifacts_file: {},\n", self.builder_artifacts_file)?;
         write!(f, "    offchain_config_url: {},\n", self.offchain_config_url)?;
@@ -651,22 +635,6 @@ pub fn evm_main(mut args: EvmArgs) {
 
     let constructor_args_map = parse_constructor_args_string(args.constructor_args);
 
-    let onchain_replacements = if !args.onchain_replacements_file.is_empty() {
-        BuildJobResult::from_multi_file(args.onchain_replacements_file)
-    } else {
-        HashMap::new()
-    };
-
-    let builder = if args.onchain_builder.len() > 1 {
-        Some(BuildJob::new(
-            args.onchain_builder,
-            onchain_replacements,
-            args.work_dir.clone(),
-        ))
-    } else {
-        None
-    };
-
     if !args.builder_artifacts_url.is_empty() || !args.builder_artifacts_file.is_empty() || args.build_command.len() > 0
     {
         if onchain.is_some() {
@@ -755,7 +723,6 @@ pub fn evm_main(mut args: EvmArgs) {
             ContractLoader::from_address(
                 onchain.as_mut().unwrap(),
                 HashSet::from_iter(addresses),
-                builder.clone(),
             )
         }
     };
@@ -810,7 +777,6 @@ pub fn evm_main(mut args: EvmArgs) {
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
         arbitrary_external_call: oracle_types.contains(&OracleType::ArbitraryCall),
         math_calculate_oracle: oracle_types.contains(&OracleType::MathCalculate),
-        builder,
         local_files_basedir_pattern: match target_type {
             EVMTargetType::Glob => Some(args.target),
             _ => None,
@@ -931,8 +897,6 @@ fn test_evm_offchain_setup() {
 
     let mut state: EVMFuzzState = FuzzState::new(args.seed);
 
-    let builder = None;
-
     let offchain_artifacts = if !args.builder_artifacts_url.is_empty() {
         Some(OffChainArtifact::from_json_url(args.builder_artifacts_url).expect("failed to parse builder artifacts"))
     } else if !args.builder_artifacts_file.is_empty() {
@@ -985,7 +949,6 @@ fn test_evm_offchain_setup() {
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
         arbitrary_external_call: oracle_types.contains(&OracleType::ArbitraryCall),
         math_calculate_oracle: oracle_types.contains(&OracleType::MathCalculate),
-        builder,
         local_files_basedir_pattern: match target_type {
             EVMTargetType::Glob => Some(args.target),
             _ => None,

@@ -189,6 +189,10 @@ impl Sha3TaintAnalysis {
     fn as_any(&self) -> &dyn any::Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any {
+        self
+    }
 }
 
 impl<SC> Middleware<SC> for Sha3TaintAnalysis
@@ -595,6 +599,10 @@ where
     fn as_any(&self) -> &dyn any::Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any {
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -630,7 +638,12 @@ where
     fn get_type(&self) -> MiddlewareType {
         MiddlewareType::Sha3Bypass
     }
+
     fn as_any(&self) -> &dyn any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn any::Any {
         self
     }
 }
@@ -643,7 +656,7 @@ mod tests {
     use itertools::Itertools;
     use libafl::schedulers::StdScheduler;
     use revm_interpreter::bytecode::{
-        opcode::{ADD, EQ, JUMPDEST, JUMPI, MSTORE, PUSH0, PUSH1, SHA3, STOP},
+        opcode::{ADD, EQ, JUMPDEST, JUMPI, MSTORE, PUSH0, PUSH1, KECCAK256, STOP},
         Bytecode,
     };
 
@@ -674,7 +687,7 @@ mod tests {
         let target_addr = generate_random_address(&mut state);
         evm_executor.host.code.insert(
             target_addr,
-            Arc::new(Bytecode::new_legacy(code)),
+            Arc::new(Bytecode::new_legacy(revm_primitives::Bytes::from(code))),
         );
 
         let sha3 = Rc::new(RefCell::new(Sha3TaintAnalysis::new()));
@@ -723,7 +736,7 @@ mod tests {
     #[test]
     fn test_hash_simple() {
         let bys = vec![
-            PUSH0, PUSH1, 0x42, MSTORE, PUSH0, PUSH1, 0x1, SHA3, PUSH1, 0x2, EQ, PUSH1, 0xe, JUMPI, JUMPDEST, STOP,
+            PUSH0, PUSH1, 0x42, MSTORE, PUSH0, PUSH1, 0x1, KECCAK256, PUSH1, 0x2, EQ, PUSH1, 0xe, JUMPI, JUMPDEST, STOP,
         ];
         let taints = execute(Bytes::new(), Bytes::from(bys));
         assert_eq!(taints.len(), 1);
@@ -733,7 +746,7 @@ mod tests {
     #[test]
     fn test_hash_simple_none() {
         let bys = vec![
-            PUSH0, PUSH1, 0x42, MSTORE, PUSH0, PUSH1, 0x1, SHA3, PUSH1, 0x2, EQ, PUSH0, PUSH1, 0xf, JUMPI, JUMPDEST,
+            PUSH0, PUSH1, 0x42, MSTORE, PUSH0, PUSH1, 0x1, KECCAK256, PUSH1, 0x2, EQ, PUSH0, PUSH1, 0xf, JUMPI, JUMPDEST,
             STOP,
         ];
         let taints = execute(Bytes::new(), Bytes::from(bys));
