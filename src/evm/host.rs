@@ -134,6 +134,13 @@ pub fn add_branch(branch: (EVMAddress, usize, bool)) {
     }
 }
 
+/// Transfer(address,address,uint256) — shared by ERC-20 and ERC-721.
+/// ERC-721 has tokenId as a 4th *indexed* topic; ERC-20 puts value in data.
+const ERC721_TRANSFER_SIG: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
+];
+
 const SCRIBBLE_EVENT_HEX: [u8; 32] = [
     0xb4, 0x26, 0x04, 0xcb, 0x10, 0x5a, 0x16, 0xc8, 0xf6, 0xdb, 0x8a, 0x41, 0xe6, 0xb0, 0x0c, 0x0c, 0x1b, 0x48, 0x26,
     0x46, 0x5e, 0x8b, 0xc5, 0x04, 0xb3, 0xeb, 0x3e, 0x88, 0xb3, 0xe6, 0xa4, 0xa0,
@@ -1612,6 +1619,19 @@ where
                 }
                 self.current_typed_bug
                     .push((data_string.trim_end_matches('\u{0}').to_string(), (_address, self._pc)));
+            }
+        }
+
+        // ERC-721 Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
+        // Signature: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+        // Distinguished from ERC-20 Transfer by having 4 topics (tokenId is indexed).
+        if topics.len() == 4 && topics[0].0 == ERC721_TRANSFER_SIG {
+            let from = EVMAddress::from_slice(&topics[1].0[12..]);
+            let to   = EVMAddress::from_slice(&topics[2].0[12..]);
+            let token_id = topics[3];
+            // Skip mints (from == zero address)
+            if !from.is_zero() {
+                self.evmstate.nft_transfers.push((_address, from, to, token_id));
             }
         }
 

@@ -54,6 +54,7 @@ use crate::{
             arb_transfer::ArbitraryERC20TransferOracle,
             echidna::EchidnaOracle,
             invariant::InvariantOracle,
+            nft::NFTOwnershipOracle,
             reentrancy::ReentrancyOracle,
             selfdestruct::SelfdestructOracle,
             typed_bug::TypedBugOracle,
@@ -395,6 +396,11 @@ pub fn evm_fuzzer(
                 .collect::<HashMap<Vec<u8>, String>>(),
         );
         oracles.push(Rc::new(RefCell::new(invariant_oracle)));
+    }
+
+    if config.nft_oracle {
+        let nft_oracle = NFTOwnershipOracle::new(artifacts.address_to_name.clone());
+        oracles.push(Rc::new(RefCell::new(nft_oracle)));
     }
 
     // if let Some(path) = config.state_comp_oracle {

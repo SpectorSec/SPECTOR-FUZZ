@@ -394,6 +394,7 @@ enum OracleType {
     TypedBug,
     SelfDestruct,
     Invariant,
+    NFT,
 }
 
 impl OracleType {
@@ -409,6 +410,7 @@ impl OracleType {
             OracleType::TypedBug => "typed_bug",
             OracleType::SelfDestruct => "selfdestruct",
             OracleType::Invariant => "invariant",
+            OracleType::NFT => "nft",
         }
     }
 
@@ -424,6 +426,7 @@ impl OracleType {
             "typed_bug" => OracleType::TypedBug,
             "selfdestruct" => OracleType::SelfDestruct,
             "invariant" => OracleType::Invariant,
+            "nft" => OracleType::NFT,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -772,6 +775,7 @@ pub fn evm_main(mut args: EvmArgs) {
         base_path: args.base_path,
         echidna_oracle: oracle_types.contains(&OracleType::Echidna),
         invariant_oracle: oracle_types.contains(&OracleType::Invariant),
+        nft_oracle: oracle_types.contains(&OracleType::NFT),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
@@ -944,6 +948,7 @@ fn test_evm_offchain_setup() {
         base_path: args.base_path,
         echidna_oracle: oracle_types.contains(&OracleType::Echidna),
         invariant_oracle: oracle_types.contains(&OracleType::Invariant),
+        nft_oracle: oracle_types.contains(&OracleType::NFT),
         panic_on_bug: args.panic_on_bug,
         spec_id: args.spec_id,
         typed_bug: oracle_types.contains(&OracleType::TypedBug),
