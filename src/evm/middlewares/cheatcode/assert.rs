@@ -27,9 +27,9 @@ where
 
     #[inline]
     pub fn assert_true1(&self, args: Vm::assertTrue_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertTrue_1Call { condition, error } = args;
+        let Vm::assertTrue_1Call { condition, err } = args;
         if !condition {
-            assert_msg.replace(error);
+            assert_msg.replace(err);
         }
         None
     }
@@ -45,9 +45,9 @@ where
 
     #[inline]
     pub fn assert_false1(&self, args: Vm::assertFalse_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertFalse_1Call { condition, error } = args;
+        let Vm::assertFalse_1Call { condition, err } = args;
         if condition {
-            assert_msg.replace(error);
+            assert_msg.replace(err);
         }
         None
     }
@@ -63,9 +63,9 @@ where
 
     #[inline]
     pub fn assert_eq1(&self, args: Vm::assertEq_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_1Call { left, right, error } = args;
+        let Vm::assertEq_1Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -81,9 +81,9 @@ where
 
     #[inline]
     pub fn assert_eq3(&self, args: Vm::assertEq_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_3Call { left, right, error } = args;
+        let Vm::assertEq_3Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -99,9 +99,9 @@ where
 
     #[inline]
     pub fn assert_eq5(&self, args: Vm::assertEq_5Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_5Call { left, right, error } = args;
+        let Vm::assertEq_5Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -117,9 +117,9 @@ where
 
     #[inline]
     pub fn assert_eq7(&self, args: Vm::assertEq_7Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_7Call { left, right, error } = args;
+        let Vm::assertEq_7Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -135,9 +135,9 @@ where
 
     #[inline]
     pub fn assert_eq9(&self, args: Vm::assertEq_9Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_9Call { left, right, error } = args;
+        let Vm::assertEq_9Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -153,9 +153,9 @@ where
 
     #[inline]
     pub fn assert_eq11(&self, args: Vm::assertEq_11Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_11Call { left, right, error } = args;
+        let Vm::assertEq_11Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -171,9 +171,9 @@ where
 
     #[inline]
     pub fn assert_eq13(&self, args: Vm::assertEq_13Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_13Call { left, right, error } = args;
+        let Vm::assertEq_13Call { left, right, err } = args;
         if let Err(e) = assert_eq(&hex::encode_prefixed(left), &hex::encode_prefixed(right)) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -189,9 +189,9 @@ where
 
     #[inline]
     pub fn assert_eq15(&self, args: Vm::assertEq_15Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_15Call { left, right, error } = args;
+        let Vm::assertEq_15Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -207,9 +207,9 @@ where
 
     #[inline]
     pub fn assert_eq17(&self, args: Vm::assertEq_17Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_17Call { left, right, error } = args;
+        let Vm::assertEq_17Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -225,9 +225,9 @@ where
 
     #[inline]
     pub fn assert_eq19(&self, args: Vm::assertEq_19Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_19Call { left, right, error } = args;
+        let Vm::assertEq_19Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -243,9 +243,9 @@ where
 
     #[inline]
     pub fn assert_eq21(&self, args: Vm::assertEq_21Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_21Call { left, right, error } = args;
+        let Vm::assertEq_21Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -261,9 +261,9 @@ where
 
     #[inline]
     pub fn assert_eq23(&self, args: Vm::assertEq_23Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_23Call { left, right, error } = args;
+        let Vm::assertEq_23Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -279,9 +279,9 @@ where
 
     #[inline]
     pub fn assert_eq25(&self, args: Vm::assertEq_25Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_25Call { left, right, error } = args;
+        let Vm::assertEq_25Call { left, right, err } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -299,11 +299,11 @@ where
 
     #[inline]
     pub fn assert_eq27(&self, args: Vm::assertEq_27Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertEq_27Call { left, right, error } = args;
+        let Vm::assertEq_27Call { left, right, err } = args;
         let left = left.iter().map(hex::encode_prefixed).collect::<Vec<_>>();
         let right = right.iter().map(hex::encode_prefixed).collect::<Vec<_>>();
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -331,10 +331,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -362,10 +362,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -381,9 +381,9 @@ where
 
     #[inline]
     pub fn assert_not_eq1(&self, args: Vm::assertNotEq_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_1Call { left, right, error } = args;
+        let Vm::assertNotEq_1Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -399,9 +399,9 @@ where
 
     #[inline]
     pub fn assert_not_eq3(&self, args: Vm::assertNotEq_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_3Call { left, right, error } = args;
+        let Vm::assertNotEq_3Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -417,9 +417,9 @@ where
 
     #[inline]
     pub fn assert_not_eq5(&self, args: Vm::assertNotEq_5Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_5Call { left, right, error } = args;
+        let Vm::assertNotEq_5Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -435,9 +435,9 @@ where
 
     #[inline]
     pub fn assert_not_eq7(&self, args: Vm::assertNotEq_7Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_7Call { left, right, error } = args;
+        let Vm::assertNotEq_7Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -453,9 +453,9 @@ where
 
     #[inline]
     pub fn assert_not_eq9(&self, args: Vm::assertNotEq_9Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_9Call { left, right, error } = args;
+        let Vm::assertNotEq_9Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -471,9 +471,9 @@ where
 
     #[inline]
     pub fn assert_not_eq11(&self, args: Vm::assertNotEq_11Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_11Call { left, right, error } = args;
+        let Vm::assertNotEq_11Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -489,9 +489,9 @@ where
 
     #[inline]
     pub fn assert_not_eq13(&self, args: Vm::assertNotEq_13Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_13Call { left, right, error } = args;
+        let Vm::assertNotEq_13Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&hex::encode_prefixed(left), &hex::encode_prefixed(right)) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -507,9 +507,9 @@ where
 
     #[inline]
     pub fn assert_not_eq15(&self, args: Vm::assertNotEq_15Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_15Call { left, right, error } = args;
+        let Vm::assertNotEq_15Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -525,9 +525,9 @@ where
 
     #[inline]
     pub fn assert_not_eq17(&self, args: Vm::assertNotEq_17Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_17Call { left, right, error } = args;
+        let Vm::assertNotEq_17Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -543,9 +543,9 @@ where
 
     #[inline]
     pub fn assert_not_eq19(&self, args: Vm::assertNotEq_19Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_19Call { left, right, error } = args;
+        let Vm::assertNotEq_19Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -561,9 +561,9 @@ where
 
     #[inline]
     pub fn assert_not_eq21(&self, args: Vm::assertNotEq_21Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_21Call { left, right, error } = args;
+        let Vm::assertNotEq_21Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -579,9 +579,9 @@ where
 
     #[inline]
     pub fn assert_not_eq23(&self, args: Vm::assertNotEq_23Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_23Call { left, right, error } = args;
+        let Vm::assertNotEq_23Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -597,9 +597,9 @@ where
 
     #[inline]
     pub fn assert_not_eq25(&self, args: Vm::assertNotEq_25Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_25Call { left, right, error } = args;
+        let Vm::assertNotEq_25Call { left, right, err } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -617,11 +617,11 @@ where
 
     #[inline]
     pub fn assert_not_eq27(&self, args: Vm::assertNotEq_27Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertNotEq_27Call { left, right, error } = args;
+        let Vm::assertNotEq_27Call { left, right, err } = args;
         let left = left.iter().map(hex::encode_prefixed).collect::<Vec<_>>();
         let right = right.iter().map(hex::encode_prefixed).collect::<Vec<_>>();
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_arrays()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_arrays()));
         }
         None
     }
@@ -649,10 +649,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -680,10 +680,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_not_eq(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -699,9 +699,9 @@ where
 
     #[inline]
     pub fn assert_gt1(&self, args: Vm::assertGt_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertGt_1Call { left, right, error } = args;
+        let Vm::assertGt_1Call { left, right, err } = args;
         if let Err(e) = assert_gt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -717,9 +717,9 @@ where
 
     #[inline]
     pub fn assert_gt3(&self, args: Vm::assertGt_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertGt_3Call { left, right, error } = args;
+        let Vm::assertGt_3Call { left, right, err } = args;
         if let Err(e) = assert_gt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -747,10 +747,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_gt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -778,10 +778,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_gt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -797,9 +797,9 @@ where
 
     #[inline]
     pub fn assert_ge1(&self, args: Vm::assertGe_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertGe_1Call { left, right, error } = args;
+        let Vm::assertGe_1Call { left, right, err } = args;
         if let Err(e) = assert_ge(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -815,9 +815,9 @@ where
 
     #[inline]
     pub fn assert_ge3(&self, args: Vm::assertGe_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertGe_3Call { left, right, error } = args;
+        let Vm::assertGe_3Call { left, right, err } = args;
         if let Err(e) = assert_ge(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -845,10 +845,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_ge(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -876,10 +876,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_ge(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -895,9 +895,9 @@ where
 
     #[inline]
     pub fn assert_lt1(&self, args: Vm::assertLt_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertLt_1Call { left, right, error } = args;
+        let Vm::assertLt_1Call { left, right, err } = args;
         if let Err(e) = assert_lt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -913,9 +913,9 @@ where
 
     #[inline]
     pub fn assert_lt3(&self, args: Vm::assertLt_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertLt_3Call { left, right, error } = args;
+        let Vm::assertLt_3Call { left, right, err } = args;
         if let Err(e) = assert_lt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -943,10 +943,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_lt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -974,10 +974,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_lt(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -993,9 +993,9 @@ where
 
     #[inline]
     pub fn assert_le1(&self, args: Vm::assertLe_1Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertLe_1Call { left, right, error } = args;
+        let Vm::assertLe_1Call { left, right, err } = args;
         if let Err(e) = assert_le(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -1011,9 +1011,9 @@ where
 
     #[inline]
     pub fn assert_le3(&self, args: Vm::assertLe_3Call, assert_msg: &mut Option<String>) -> Option<Vec<u8>> {
-        let Vm::assertLe_3Call { left, right, error } = args;
+        let Vm::assertLe_3Call { left, right, err } = args;
         if let Err(e) = assert_le(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_for_values()));
+            assert_msg.replace(format!("{}: {}", err, e.format_for_values()));
         }
         None
     }
@@ -1041,10 +1041,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_le(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -1072,10 +1072,10 @@ where
             left,
             right,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = assert_le(&left, &right) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -1103,10 +1103,10 @@ where
             left,
             right,
             maxDelta,
-            error,
+            err,
         } = args;
         if let Err(e) = uint_assert_approx_eq_abs(left, right, maxDelta) {
-            assert_msg.replace(format!("{}: {}", error, e));
+            assert_msg.replace(format!("{}: {}", err, e));
         }
         None
     }
@@ -1134,10 +1134,10 @@ where
             left,
             right,
             maxDelta,
-            error,
+            err,
         } = args;
         if let Err(e) = int_assert_approx_eq_abs(left, right, maxDelta) {
-            assert_msg.replace(format!("{}: {}", error, e));
+            assert_msg.replace(format!("{}: {}", err, e));
         }
         None
     }
@@ -1171,10 +1171,10 @@ where
             right,
             maxDelta,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = uint_assert_approx_eq_abs(left, right, maxDelta) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -1208,10 +1208,10 @@ where
             right,
             maxDelta,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = int_assert_approx_eq_abs(left, right, maxDelta) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -1243,10 +1243,10 @@ where
             left,
             right,
             maxPercentDelta,
-            error,
+            err,
         } = args;
         if let Err(e) = uint_assert_approx_eq_rel(left, right, maxPercentDelta) {
-            assert_msg.replace(format!("{}: {}", error, e));
+            assert_msg.replace(format!("{}: {}", err, e));
         }
         None
     }
@@ -1278,10 +1278,10 @@ where
             left,
             right,
             maxPercentDelta,
-            error,
+            err,
         } = args;
         if let Err(e) = int_assert_approx_eq_rel(left, right, maxPercentDelta) {
-            assert_msg.replace(format!("{}: {}", error, e));
+            assert_msg.replace(format!("{}: {}", err, e));
         }
         None
     }
@@ -1315,10 +1315,10 @@ where
             right,
             maxPercentDelta,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = uint_assert_approx_eq_rel(left, right, maxPercentDelta) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }
@@ -1352,10 +1352,10 @@ where
             right,
             maxPercentDelta,
             decimals,
-            error,
+            err,
         } = args;
         if let Err(e) = int_assert_approx_eq_rel(left, right, maxPercentDelta) {
-            assert_msg.replace(format!("{}: {}", error, e.format_with_decimals(&decimals)));
+            assert_msg.replace(format!("{}: {}", err, e.format_with_decimals(&decimals)));
         }
         None
     }

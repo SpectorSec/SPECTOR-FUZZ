@@ -43,7 +43,10 @@ use crate::{
         contract_utils::extract_sig_from_contract,
         corpus_initializer::ABIMap,
         input::{EVMInput, EVMInputTy},
-        middlewares::middleware::{add_corpus, CallMiddlewareReturn, Middleware, MiddlewareType},
+        middlewares::{
+            cheatcode::{ExpectedCallTracker, ExpectedCallType, ExpectedEmit, ExpectedRevert, Prank, ERROR_PREFIX, REVERT_PREFIX},
+            middleware::{add_corpus, CallMiddlewareReturn, Middleware, MiddlewareType},
+        },
         mutator::AccessPattern,
         onchain::{
             abi_decompiler::fetch_abi_evmole,
@@ -228,6 +231,15 @@ where
 
     /// Assert failed message for the cheatcode
     pub assert_msg: Option<String>,
+
+    /// Active vm.prank / vm.startPrank state
+    pub prank: Option<Prank>,
+    /// Expected revert set by vm.expectRevert
+    pub expected_revert: Option<ExpectedRevert>,
+    /// Expected emits set by vm.expectEmit (ordered)
+    pub expected_emits: std::collections::VecDeque<ExpectedEmit>,
+    /// Expected calls set by vm.expectCall
+    pub expected_calls: ExpectedCallTracker,
 }
 
 impl<SC> Debug for FuzzHost<SC>
@@ -298,6 +310,10 @@ where
             jumpi_trace: self.jumpi_trace,
             call_depth: self.call_depth,
             assert_msg: self.assert_msg.clone(),
+            prank: self.prank.clone(),
+            expected_revert: self.expected_revert.clone(),
+            expected_emits: self.expected_emits.clone(),
+            expected_calls: self.expected_calls.clone(),
         }
     }
 }
@@ -376,6 +392,10 @@ where
             jumpi_trace: 37,
             call_depth: 0,
             assert_msg: None,
+            prank: None,
+            expected_revert: None,
+            expected_emits: std::collections::VecDeque::new(),
+            expected_calls: ExpectedCallTracker::new(),
         }
     }
 
@@ -392,6 +412,7 @@ where
 
         loop {
             // ---- pre-step inspection (was Host::step in old API) ----
+            let pc_before = interp.bytecode.pc();
             unsafe {
                 let opcode = interp.bytecode.opcode();
                 let pc = interp.bytecode.pc();
@@ -541,6 +562,10 @@ where
             }
 
             // ---- execute the instruction ----
+            // If a middleware advanced the PC (e.g. cheatcode intercepted a CALL), skip step.
+            if interp.bytecode.pc() != pc_before {
+                continue;
+            }
             match interp.step(&table, &gas_tbl, self) {
                 Ok(()) => {
                     // instruction completed normally, loop
@@ -1004,14 +1029,34 @@ where
         }
     }
 
-    /// Apply the prank
-    pub fn apply_prank(&mut self, _contract_caller: &EVMAddress, _input: &mut CallInputs) {
-        // TODO: enable cheatcode when https://github.com/matter-labs/zksync-era/issues/4581 is resolved
+    /// Apply the prank — override msg.sender (and tx.origin if set) for the subcall.
+    pub fn apply_prank(&mut self, contract_caller: &EVMAddress, input: &mut CallInputs) {
+        if let Some(ref prank) = self.prank {
+            if self.call_depth >= prank.depth && contract_caller == &prank.old_caller {
+                if self.call_depth == prank.depth {
+                    // In revm 41, `input.caller` is both msg.sender and the transfer source.
+                    input.caller = prank.new_caller;
+                }
+                if let Some(new_origin) = prank.new_origin {
+                    self.env.tx.caller = new_origin;
+                }
+            }
+        }
     }
 
-    /// Clean up the prank
+    /// Clean up after a pranked call — restore origin and drop single-call pranks.
     pub fn clean_prank(&mut self) {
-        // TODO: enable cheatcode when https://github.com/matter-labs/zksync-era/issues/4581 is resolved
+        if let Some(ref prank) = self.prank {
+            if self.call_depth != prank.depth {
+                return;
+            }
+            if let Some(old_origin) = prank.old_origin {
+                self.env.tx.caller = old_origin;
+            }
+            if prank.single_call {
+                let _ = self.prank.take();
+            }
+        }
     }
 
     pub fn check_assert_result(&mut self) -> Option<(InstructionResult, std::ops::Range<usize>, Bytes)> {
@@ -1021,16 +1066,107 @@ where
         None
     }
 
-    fn check_expected_revert(&mut self, res: (InstructionResult, std::ops::Range<usize>, Bytes)) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
-        res
+    fn check_expected_revert(
+        &mut self,
+        res: (InstructionResult, std::ops::Range<usize>, Bytes),
+    ) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
+        let depth = match &self.expected_revert {
+            None => return res,
+            Some(er) => er.depth,
+        };
+        if self.call_depth > depth {
+            return res;
+        }
+        let (result, range, retdata) = res;
+        let expected_revert = self.expected_revert.take().unwrap();
+
+        if result.is_ok() {
+
+            return (
+                InstructionResult::Revert,
+                range,
+                "Call did not revert as expected".abi_encode().into(),
+            );
+        }
+
+        let Some(expected_reason) = expected_revert.reason else {
+            return (InstructionResult::Return, range, retdata);
+        };
+
+        // Strip ABI-encoded wrapper if present (Error(string) or CheatCodeError prefix)
+        let actual: &[u8] = retdata.as_ref();
+        let stripped: &[u8] = if actual.len() >= 4
+            && (actual[..4] == ERROR_PREFIX || actual[..4] == REVERT_PREFIX)
+        {
+            actual.get(4..).unwrap_or(actual)
+        } else {
+            actual
+        };
+
+        if !stripped.starts_with(expected_reason.as_ref()) {
+
+            return (
+                InstructionResult::Revert,
+                range,
+                "Revert reason mismatch".abi_encode().into(),
+            );
+        }
+
+        (InstructionResult::Return, range, retdata)
     }
 
-    fn check_expected_emits(&mut self, _call: &CallInputs, res: (InstructionResult, std::ops::Range<usize>, Bytes)) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
-        res
+    fn check_expected_emits(
+        &mut self,
+        call: &CallInputs,
+        res: (InstructionResult, std::ops::Range<usize>, Bytes),
+    ) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
+        let should_check = self
+            .expected_emits
+            .iter()
+            .any(|e| e.depth == self.call_depth)
+            && !call.is_static;
+        if !should_check {
+            return res;
+        }
+        let (result, range, retdata) = res;
+        if self.expected_emits.iter().any(|e| !e.found) {
+
+            return (
+                InstructionResult::Revert,
+                range,
+                "Log != expected log".abi_encode().into(),
+            );
+        }
+        self.expected_emits.retain(|e| e.depth != self.call_depth);
+        (result, range, retdata)
     }
 
-    fn check_expected_calls(&mut self, res: (InstructionResult, std::ops::Range<usize>, Bytes)) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
-        res
+    fn check_expected_calls(
+        &mut self,
+        res: (InstructionResult, std::ops::Range<usize>, Bytes),
+    ) -> (InstructionResult, std::ops::Range<usize>, Bytes) {
+        if self.call_depth > 0 {
+            return res;
+        }
+        let (result, range, retdata) = res;
+        let expected_calls = std::mem::take(&mut self.expected_calls);
+        for (_addr, calldatas) in expected_calls {
+            for (_data, (expected, actual_count)) in calldatas {
+                let failed = match expected.call_type {
+                    ExpectedCallType::Count => expected.count != actual_count,
+                    ExpectedCallType::NonCount => expected.count > actual_count,
+                };
+                if failed {
+        
+                    return (
+                        InstructionResult::Revert,
+                        range,
+                        "Expected call count mismatch".abi_encode().into(),
+                    );
+                }
+            }
+        }
+        (result, range, retdata)
     }
 
     fn check_expected(&mut self, call: &CallInputs, res: (InstructionResult, std::ops::Range<usize>, Bytes)) -> (InstructionResult, std::ops::Range<usize>, Bytes) {

@@ -16,7 +16,7 @@ where
     #[inline]
     pub fn set_env(&self, args: Vm::setEnvCall) -> Option<Vec<u8>> {
         let Vm::setEnvCall { name, value } = args;
-        env::set_var(name, value);
+        unsafe { env::set_var(name, value) };
         None
     }
 

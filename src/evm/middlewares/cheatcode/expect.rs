@@ -193,7 +193,7 @@ where
         args: Vm::expectCall_0Call,
     ) -> Option<Vec<u8>> {
         let Vm::expectCall_0Call { callee, data } = args;
-        expect_call_non_count(expected_calls, callee, data, None)
+        expect_call_non_count(expected_calls, callee, data.to_vec(), None)
     }
 
     /// Expects given number of calls to an address with the specified calldata.
@@ -204,7 +204,7 @@ where
         args: Vm::expectCall_1Call,
     ) -> Option<Vec<u8>> {
         let Vm::expectCall_1Call { callee, data, count } = args;
-        expect_call_with_count(expected_calls, callee, data, None, count)
+        expect_call_with_count(expected_calls, callee, data.to_vec(), None, count)
     }
 
     /// Expects a call to an address with the specified `msg.value` and
@@ -216,7 +216,7 @@ where
         args: Vm::expectCall_2Call,
     ) -> Option<Vec<u8>> {
         let Vm::expectCall_2Call { callee, msgValue, data } = args;
-        expect_call_non_count(expected_calls, callee, data, Some(msgValue))
+        expect_call_non_count(expected_calls, callee, data.to_vec(), Some(msgValue))
     }
 
     /// Expects given number of calls to an address with the specified
@@ -233,7 +233,7 @@ where
             data,
             count,
         } = args;
-        expect_call_with_count(expected_calls, callee, data, Some(msgValue), count)
+        expect_call_with_count(expected_calls, callee, data.to_vec(), Some(msgValue), count)
     }
 
     /// Expect a call to an address with the specified `msg.value`, gas, and
@@ -248,7 +248,7 @@ where
         let Vm::expectCall_4Call {
             callee, msgValue, data, ..
         } = args;
-        expect_call_non_count(expected_calls, callee, data, Some(msgValue))
+        expect_call_non_count(expected_calls, callee, data.to_vec(), Some(msgValue))
     }
 
     /// Expects given number of calls to an address with the specified
@@ -267,7 +267,7 @@ where
             count,
             ..
         } = args;
-        expect_call_with_count(expected_calls, callee, data, Some(msgValue), count)
+        expect_call_with_count(expected_calls, callee, data.to_vec(), Some(msgValue), count)
     }
 
     /// Expect a call to an address with the specified `msg.value` and calldata,
@@ -282,7 +282,7 @@ where
         let Vm::expectCallMinGas_0Call {
             callee, msgValue, data, ..
         } = args;
-        expect_call_non_count(expected_calls, callee, data, Some(msgValue))
+        expect_call_non_count(expected_calls, callee, data.to_vec(), Some(msgValue))
     }
 
     /// Expect given number of calls to an address with the specified
@@ -301,7 +301,7 @@ where
             count,
             ..
         } = args;
-        expect_call_with_count(expected_calls, callee, data, Some(msgValue), count)
+        expect_call_with_count(expected_calls, callee, data.to_vec(), Some(msgValue), count)
     }
 }
 

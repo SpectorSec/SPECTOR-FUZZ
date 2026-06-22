@@ -50,7 +50,7 @@ use super::{
     corpus_initializer::{EnvMetadata, INITIAL_BALANCE},
     host::FuzzHost,
     input::ConciseEVMInput,
-    // middlewares::cheatcode::{Cheatcode, CHEATCODE_ADDRESS},
+    middlewares::cheatcode::{Cheatcode, CHEATCODE_ADDRESS},
     types::EVMU256,
     vm::{EVMExecutor, EVMState},
 };
@@ -1026,15 +1026,14 @@ impl ContractLoader {
             deployer, // todo: change to foundry default address
         );
 
-        // TODO: enable cheatcode when https://github.com/matter-labs/zksync-era/issues/4581 is resolved
-        // executor.host.set_code(
-        //     CHEATCODE_ADDRESS,
-        //     Bytecode::new_raw(Bytes::from(vec![0xfd, 0x00])),
-        //     &mut state,
-        // );
-        // executor
-        //     .host
-        //     .add_middlewares(Rc::new(RefCell::new(Cheatcode::new(etherscan_api_key))));
+        executor.host.set_code(
+            CHEATCODE_ADDRESS,
+            Bytecode::new_raw(revm_primitives::Bytes::from(vec![0xfd, 0x00])),
+            &mut state,
+        );
+        executor
+            .host
+            .add_middlewares(Rc::new(RefCell::new(Cheatcode::new(etherscan_api_key))));
 
         // Initialize state
         state

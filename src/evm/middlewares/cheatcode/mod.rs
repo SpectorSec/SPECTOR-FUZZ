@@ -12,7 +12,7 @@ use alloy_sol_types::SolInterface;
 use bytes::Bytes;
 use foundry_cheatcodes::Vm::{self, VmCalls};
 use libafl::schedulers::Scheduler;
-use revm_interpreter::{opcode, InstructionResult, Interpreter};
+use revm_interpreter::{bytecode::opcode, interpreter_types::{Jumps, ReturnData}, InstructionResult, Interpreter};
 use revm_primitives::U256;
 use tracing::{debug, error, warn};
 
@@ -90,9 +90,8 @@ macro_rules! try_or_continue {
 macro_rules! cheat_call_error {
     ($interp:expr, $err:expr) => {{
         error!("[cheatcode] failed to call CHEATCODE_ADDRESS: {:?}", $err);
-        $interp.instruction_result = $err;
         let _ = $interp.stack.push(U256::ZERO);
-        $interp.instruction_pointer = unsafe { $interp.instruction_pointer.offset(1) };
+        $interp.bytecode.relative_jump(1);
         return;
     }};
 }
@@ -102,7 +101,7 @@ where
     SC: Scheduler<State = EVMFuzzState> + Clone + Debug + 'static,
 {
     unsafe fn on_step(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>, _state: &mut EVMFuzzState) {
-        let op = interp.current_opcode();
+        let op = interp.bytecode.opcode();
         match get_opcode_type(op, interp) {
             OpcodeType::CheatCall => self.cheat_call(interp, host),
             OpcodeType::RealCall => self.real_call(interp, &mut host.expected_calls),
@@ -137,7 +136,7 @@ where
 
     /// Call cheatcode address
     pub fn cheat_call(&mut self, interp: &mut Interpreter, host: &mut FuzzHost<SC>) {
-        let op = interp.current_opcode();
+        let op = interp.bytecode.opcode();
         let calldata = unsafe { pop_cheatcall_stack(interp, op) };
         if let Err(err) = calldata {
             cheat_call_error!(interp, err);
@@ -148,9 +147,9 @@ where
             cheat_call_error!(interp, err);
         }
 
-        let (caller, tx_origin) = (&interp.contract().caller, &host.env.tx.caller.clone());
+        let (caller, tx_origin) = (&interp.input.caller_address, &host.env.tx.caller.clone());
         // handle vm calls
-        let vm_call = VmCalls::abi_decode(&input, false).expect("decode cheatcode failed");
+        let vm_call = VmCalls::abi_decode(&input).expect("decode cheatcode failed");
         debug!("[cheatcode] vm.{:?}", vm_call);
         let res = match vm_call {
             // common
@@ -159,7 +158,8 @@ where
             VmCalls::roll(args) => self.roll(&mut host.env, args),
             VmCalls::fee(args) => self.fee(&mut host.env, args),
             VmCalls::difficulty(args) => self.difficulty(&mut host.env, args),
-            VmCalls::prevrandao(args) => self.prevrandao(&mut host.env, args),
+            VmCalls::prevrandao_0(args) => self.prevrandao0(&mut host.env, args),
+            VmCalls::prevrandao_1(args) => self.prevrandao1(&mut host.env, args),
             VmCalls::chainId(args) => self.chain_id(&mut host.env, args),
             VmCalls::txGasPrice(args) => self.tx_gas_price(&mut host.env, args),
             VmCalls::coinbase(args) => self.coinbase(&mut host.env, args),
@@ -358,16 +358,17 @@ where
         debug!("[cheatcode] VmCall result: {:?}", res);
 
         // set up return data
-        interp.instruction_result = InstructionResult::Continue;
-        interp.return_data_buffer = Bytes::new();
-        if let Some(return_data) = res {
-            interp.return_data_buffer = Bytes::from(return_data);
-        }
-        let target_len = min(out_len, interp.return_data_buffer.len());
-        interp.memory.set(out_offset, &interp.return_data_buffer[..target_len]);
+        let return_bytes: revm_primitives::Bytes = if let Some(return_data) = res {
+            revm_primitives::Bytes::from(return_data)
+        } else {
+            revm_primitives::Bytes::new()
+        };
+        let target_len = min(out_len, return_bytes.len());
+        interp.memory.set(out_offset, &return_bytes[..target_len]);
+        interp.return_data.set_buffer(return_bytes);
         let _ = interp.stack.push(U256::from(1));
         // step over the instruction
-        interp.instruction_pointer = unsafe { interp.instruction_pointer.offset(1) };
+        interp.bytecode.relative_jump(1);
     }
 
     /// Call real addresses
@@ -381,7 +382,7 @@ where
 
         // Grab the different calldatas expected.
         if let Some(expected_calls_for_target) = expected_calls.get_mut(&target) {
-            let op = interp.current_opcode();
+            let op = interp.bytecode.opcode();
             let callstack = peek_realcall_input_value(interp, op);
             if let Err(err) = callstack {
                 error!("[cheatcode] failed to peek call input: {:?}", err);
@@ -415,27 +416,27 @@ where
     pub fn record_accesses(&mut self, interp: &mut Interpreter) {
         if let Some(storage_accesses) = &mut self.accesses {
             debug!("[cheatcode] record_accesses");
-            match interp.current_opcode() {
+            match interp.bytecode.opcode() {
                 opcode::SLOAD => {
-                    let key = try_or_continue!(interp.stack().peek(0));
+                    let key = try_or_continue!(interp.stack.peek(0));
                     storage_accesses
                         .reads
-                        .entry(interp.contract().address)
+                        .entry(interp.input.target_address)
                         .or_default()
                         .push(key);
                 }
                 opcode::SSTORE => {
-                    let key = try_or_continue!(interp.stack().peek(0));
+                    let key = try_or_continue!(interp.stack.peek(0));
 
                     // An SSTORE does an SLOAD internally
                     storage_accesses
                         .reads
-                        .entry(interp.contract().address)
+                        .entry(interp.input.target_address)
                         .or_default()
                         .push(key);
                     storage_accesses
                         .writes
-                        .entry(interp.contract().address)
+                        .entry(interp.input.target_address)
                         .or_default()
                         .push(key);
                 }
@@ -451,22 +452,22 @@ where
         }
 
         debug!("[cheatcode] log");
-        let op = interp.current_opcode();
+        let op = interp.bytecode.opcode();
         let data = try_or_continue!(peek_log_data(interp));
         let topics = try_or_continue!(peek_log_topics(interp, op));
-        let address = &interp.contract().address;
+        let address = interp.input.target_address;
 
         // Handle expect emit
         if !expected_emits.is_empty() {
-            handle_expect_emit(expected_emits, &Address::from(address.0), &topics, &data);
+            handle_expect_emit(expected_emits, &address, &topics, &data);
         }
 
         // Stores this log if `recordLogs` has been called
         if let Some(storage_recorded_logs) = &mut self.recorded_logs {
             storage_recorded_logs.push(Vm::Log {
                 topics,
-                data: data.to_vec(),
-                emitter: Address::from(address.0),
+                data: data,
+                emitter: address,
             });
         }
     }
@@ -485,10 +486,6 @@ macro_rules! memory_resize {
         };
 
         if let Some(new_size) = new_size {
-            #[cfg(feature = "memory_limit")]
-            if new_size > ($interp.memory_limit as usize) {
-                return Err(InstructionResult::MemoryLimitOOG);
-            }
             if new_size > $interp.memory.len() {
                 $interp.memory.resize(new_size);
             }
@@ -501,12 +498,12 @@ macro_rules! memory_resize {
 unsafe fn pop_cheatcall_stack(interp: &mut Interpreter, op: u8) -> Result<(Bytes, usize, usize), InstructionResult> {
     // Pop gas, addr, val
     if op == opcode::CALL || op == opcode::CALLCODE {
-        let _ = interp.stack.pop_unsafe();
+        let _ = interp.stack.pop_unchecked();
     }
-    let _ = interp.stack.pop2_unsafe();
+    let _ = interp.stack.popn_unchecked::<2>();
 
     let (in_offset, in_len, out_offset, out_len) = {
-        let (in_offset, in_len, out_offset, out_len) = interp.stack.pop4_unsafe();
+        let [in_offset, in_len, out_offset, out_len] = interp.stack.popn_unchecked::<4>();
         (
             in_offset.as_limbs()[0] as usize,
             in_len.as_limbs()[0] as usize,
@@ -517,7 +514,7 @@ unsafe fn pop_cheatcall_stack(interp: &mut Interpreter, op: u8) -> Result<(Bytes
 
     let input = if in_len != 0 {
         memory_resize!(interp, in_offset, in_len);
-        Bytes::copy_from_slice(interp.memory.get_slice(in_offset, in_len))
+        Bytes::copy_from_slice(&*interp.memory.slice_len(in_offset, in_len))
     } else {
         Bytes::new()
     };
@@ -527,7 +524,7 @@ unsafe fn pop_cheatcall_stack(interp: &mut Interpreter, op: u8) -> Result<(Bytes
 
 // Every real call needs to peek the target address.
 fn peek_realcall_target(interp: &Interpreter) -> Result<Address, InstructionResult> {
-    let addr_bytes = interp.stack().peek(1)?;
+    let addr_bytes = interp.stack.peek(1)?;
     let addr: Address = addr_bytes.to_be_bytes::<{ U256::BYTES }>()[12..].try_into().unwrap();
     Ok(addr)
 }
@@ -538,16 +535,16 @@ fn peek_realcall_target(interp: &Interpreter) -> Result<Address, InstructionResu
 // DELEGATECALL|STATICCALL: gas, addr, in_offset, in_len, out_offset, out_len
 fn peek_realcall_input_value(interp: &mut Interpreter, op: u8) -> Result<(Bytes, U256), InstructionResult> {
     let value = if op == opcode::CALL || op == opcode::CALLCODE {
-        interp.stack().peek(2)?
+        interp.stack.peek(2)?
     } else {
         U256::ZERO
     };
 
     let (in_offset, in_len) = {
         let (in_offset, in_len) = if op == opcode::CALL || op == opcode::CALLCODE {
-            (interp.stack().peek(3)?, interp.stack().peek(4)?)
+            (interp.stack.peek(3)?, interp.stack.peek(4)?)
         } else {
-            (interp.stack().peek(2)?, interp.stack().peek(3)?)
+            (interp.stack.peek(2)?, interp.stack.peek(3)?)
         };
 
         (in_offset.as_limbs()[0] as usize, in_len.as_limbs()[0] as usize)
@@ -555,7 +552,7 @@ fn peek_realcall_input_value(interp: &mut Interpreter, op: u8) -> Result<(Bytes,
 
     let input = if in_len != 0 {
         memory_resize!(interp, in_offset, in_len);
-        Bytes::copy_from_slice(interp.memory.get_slice(in_offset, in_len))
+        Bytes::copy_from_slice(&*interp.memory.slice_len(in_offset, in_len))
     } else {
         Bytes::new()
     };
@@ -564,15 +561,15 @@ fn peek_realcall_input_value(interp: &mut Interpreter, op: u8) -> Result<(Bytes,
 }
 
 fn peek_log_data(interp: &mut Interpreter) -> Result<AlloyBytes, InstructionResult> {
-    let offset = interp.stack().peek(0)?;
-    let len = interp.stack().peek(1)?;
+    let offset = interp.stack.peek(0)?;
+    let len = interp.stack.peek(1)?;
     let (offset, len) = (offset.as_limbs()[0] as usize, len.as_limbs()[0] as usize);
     if len == 0 {
         return Ok(AlloyBytes::new());
     }
 
     memory_resize!(interp, offset, len);
-    Ok(AlloyBytes::copy_from_slice(interp.memory.get_slice(offset, len)))
+    Ok(AlloyBytes::copy_from_slice(&*interp.memory.slice_len(offset, len)))
 }
 
 fn peek_log_topics(interp: &Interpreter, op: u8) -> Result<Vec<B256>, InstructionResult> {
@@ -581,7 +578,7 @@ fn peek_log_topics(interp: &Interpreter, op: u8) -> Result<Vec<B256>, Instructio
 
     // Start from idx 2. The first two elements are the offset and len of the data.
     for i in 2..(n + 2) {
-        let topic = interp.stack().peek(i)?;
+        let topic = interp.stack.peek(i)?;
         topics.push(B256::from(topic.to_be_bytes()));
     }
 
@@ -597,7 +594,7 @@ fn get_opcode_type(op: u8, interp: &Interpreter) -> OpcodeType {
     match op {
         opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
             let target = Address::from_slice(
-                &interp.stack().peek(1).unwrap().to_be_bytes::<{ U256::BYTES }>()[12..],
+                &interp.stack.peek(1).unwrap().to_be_bytes::<{ U256::BYTES }>()[12..],
             );
 
             if target.as_slice() == CHEATCODE_ADDRESS.as_slice() {

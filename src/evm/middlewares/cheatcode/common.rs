@@ -87,12 +87,22 @@ where
         None
     }
 
-    /// Sets `block.prevrandao`.
+    /// Sets `block.prevrandao` (bytes32 variant).
     /// Not available on EVM versions before Paris. Use `difficulty` instead.
     #[inline]
-    pub fn prevrandao(&self, env: &mut Env, args: Vm::prevrandaoCall) -> Option<Vec<u8>> {
+    pub fn prevrandao0(&self, env: &mut Env, args: Vm::prevrandao_0Call) -> Option<Vec<u8>> {
         if env.cfg.spec >= SpecId::MERGE {
             env.block.prevrandao = Some(args.newPrevrandao.0.into());
+        }
+        None
+    }
+
+    /// Sets `block.prevrandao` (uint256 variant).
+    /// Not available on EVM versions before Paris. Use `difficulty` instead.
+    #[inline]
+    pub fn prevrandao1(&self, env: &mut Env, args: Vm::prevrandao_1Call) -> Option<Vec<u8>> {
+        if env.cfg.spec >= SpecId::MERGE {
+            env.block.prevrandao = Some(args.newPrevrandao.to_be_bytes::<32>().into());
         }
         None
     }
@@ -148,7 +158,7 @@ where
             target,
             newRuntimeBytecode,
         } = args;
-        let bytecode = Bytecode::new_legacy(Bytes::from(newRuntimeBytecode));
+        let bytecode = Bytecode::new_legacy(newRuntimeBytecode);
 
         // set code but don't invoke middlewares
         host.code.insert(
@@ -177,7 +187,7 @@ where
     ) -> Option<Vec<u8>> {
         let (mut mode, mut sender, mut origin) = (CallerMode::None, default_sender, default_origin);
 
-        if let Some(ref prank) = prank {
+        if let Some(prank) = prank {
             mode = if prank.single_call {
                 CallerMode::Prank
             } else {
