@@ -5,13 +5,17 @@
 /// is almost always where the vulnerability lives. This module maps that
 /// co-occurrence to a ranked list of exploit classes and the oracles that
 /// detect them — before the fuzzer sends a single transaction.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use libafl_bolts::impl_serdeany;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::evm::oracles::function::is_privileged_fn;
+use crate::evm::{
+    contract_utils::ABIConfig,
+    oracles::function::is_privileged_fn,
+    types::EVMAddress,
+};
 
 /// Protocol family inferred from ABI selector fingerprinting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -474,4 +478,225 @@ impl TopologyHints {
             .find(|h| h.selectors.contains(selector))
             .map(|h| h.confidence)
     }
+}
+
+// ── Anti-topology ─────────────────────────────────────────────────────────────
+//
+// Anti-topology is the inverse of co-occurrence: it looks for ABSENT safety
+// mechanisms that should be present given what IS there.  These checks run
+// before the fuzzer sends a single transaction and output static pre-flight
+// findings purely from the ABI selector set.
+//
+// Each rule asks: "given family X is present, is safety mechanism Y missing?"
+// Missing safety mechanisms are often bugs in themselves — not just surfaces.
+
+/// A static pre-flight finding produced before fuzzing begins.
+#[derive(Debug, Clone)]
+pub struct AntiTopologyFinding {
+    /// Short machine-readable rule identifier.
+    pub rule: &'static str,
+    /// Human-readable description of the missing safety mechanism.
+    pub detail: String,
+    /// Confidence 0-100. Rules based on hard selector absence score higher
+    /// than rules based on name heuristics.
+    pub confidence: u8,
+}
+
+/// Run all anti-topology rules against the detected families and full ABI map.
+/// Returns findings sorted descending by confidence.
+/// Call this after `TopologyReport::analyze()` — it needs the same family set
+/// plus the full `address_to_abi` map for param-signature inspection.
+pub fn check_anti_topology(
+    families: &HashSet<ProtocolFamily>,
+    address_to_abi: &HashMap<EVMAddress, Vec<ABIConfig>>,
+) -> Vec<AntiTopologyFinding> {
+    let mut findings: Vec<AntiTopologyFinding> = Vec::new();
+
+    let has = |f: &ProtocolFamily| families.contains(f);
+    let has_amm = has(&ProtocolFamily::UniswapV2) || has(&ProtocolFamily::UniswapV3);
+
+    // Flat sets for quick lookup
+    let all_selectors: HashSet<[u8; 4]> = address_to_abi
+        .values()
+        .flat_map(|abis| abis.iter().map(|a| a.function))
+        .collect();
+
+    let all_abis: Vec<&ABIConfig> = address_to_abi
+        .values()
+        .flat_map(|abis| abis.iter())
+        .collect();
+
+    let has_sel = |s: [u8; 4]| all_selectors.contains(&s);
+
+    let has_fn_keyword = |kw: &str| {
+        all_abis.iter().any(|a| a.function_name.to_lowercase().contains(kw))
+    };
+
+    // ── Rule 1: Governance without timelock ───────────────────────────────────
+    // propose()/execute() present but no queue() or delay() selector and no
+    // function name containing "timelock" or "queue".
+    // Beanstalk lost $182M to this exact configuration.
+    if has(&ProtocolFamily::Governance) {
+        let has_timelock = has_sel([0x56, 0x78, 0x13, 0x88]) // queue(uint256)
+            || has_sel([0x6a, 0x42, 0xb8, 0xf8])             // delay()
+            || has_sel([0xc0, 0x1a, 0x8c, 0x84])             // cancel(uint256)
+            || has_fn_keyword("timelock")
+            || has_fn_keyword("queue");
+
+        if !has_timelock {
+            findings.push(AntiTopologyFinding {
+                rule: "governance-no-timelock",
+                detail: "propose()/execute() present with no timelock delay — flash governance \
+                         attack surface (flash borrow → vote → execute in one tx)"
+                    .into(),
+                confidence: 90,
+            });
+        }
+    }
+
+    // ── Rule 2: AMM + Chainlink without TWAP buffering ────────────────────────
+    // Using a Chainlink oracle alongside an AMM without a TWAP window means
+    // a single swap can skew the price the oracle reports — Mango Markets pattern.
+    if has_amm && has(&ProtocolFamily::Chainlink) {
+        let has_twap = has_fn_keyword("twap")
+            || has_fn_keyword("period")
+            || has_fn_keyword("average")
+            || has_fn_keyword("window");
+
+        if !has_twap {
+            findings.push(AntiTopologyFinding {
+                rule: "spot-price-no-twap",
+                detail: "Chainlink oracle + AMM swap with no TWAP window — single swap can \
+                         manipulate the price fed to the oracle"
+                    .into(),
+                confidence: 85,
+            });
+        }
+    }
+
+    // ── Rule 3: ERC-4626 vault without slippage protection ───────────────────
+    // Standard-compliant vaults add minShares/minAssets/deadline params to
+    // deposit/withdraw/redeem.  Absent these, a flash-donate inflates the
+    // share price and the user receives fewer shares than expected — vault
+    // inflation attack.
+    if has(&ProtocolFamily::ERC4626) {
+        let vault_entry_abis: Vec<&&ABIConfig> = all_abis
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.function,
+                    [0x6e, 0x55, 0x3f, 0x65]   // deposit
+                    | [0xb4, 0x60, 0xaf, 0x94]  // withdraw
+                    | [0xba, 0x08, 0x76, 0x52]  // redeem
+                )
+            })
+            .collect();
+
+        if !vault_entry_abis.is_empty() {
+            let has_slippage = vault_entry_abis.iter().any(|a| {
+                let sig = a.abi.to_lowercase();
+                sig.contains("min") || sig.contains("deadline") || sig.contains("max")
+            });
+
+            if !has_slippage {
+                findings.push(AntiTopologyFinding {
+                    rule: "vault-no-slippage",
+                    detail: "ERC-4626 deposit/withdraw/redeem has no minShares/minAssets/deadline \
+                             parameter — vault inflation attack surface"
+                        .into(),
+                    confidence: 82,
+                });
+            }
+        }
+    }
+
+    // ── Rule 4: Flash loan callback without initiator validation ─────────────
+    // executeOperation() that doesn't carry an `initiator` address parameter
+    // cannot verify the flash loan was requested by this contract — the callback
+    // can be invoked by anyone with an arbitrary payload.
+    if has(&ProtocolFamily::FlashLoan) {
+        let exec_op_abis: Vec<&&ABIConfig> = all_abis
+            .iter()
+            .filter(|a| a.function == [0x92, 0x0f, 0x5c, 0x84])
+            .collect();
+
+        for abi in &exec_op_abis {
+            if !abi.abi.contains("initiator") && !abi.abi.contains("sender") {
+                findings.push(AntiTopologyFinding {
+                    rule: "flash-callback-no-initiator",
+                    detail: format!(
+                        "executeOperation() ABI `{}` has no initiator/sender param — \
+                         caller validation may be absent, callback callable by anyone",
+                        abi.abi
+                    ),
+                    confidence: 72,
+                });
+                break;
+            }
+        }
+    }
+
+    // ── Rule 5: ERC-20 transfer without fee accounting ────────────────────────
+    // Protocol uses ERC-20 transfer/transferFrom but has no fee-on-transfer
+    // awareness (no pre/post balance check pattern detectable from names).
+    // Fee-on-transfer tokens cause accounting errors when the received amount
+    // is less than the transfer amount.
+    if has(&ProtocolFamily::ERC20) && !has(&ProtocolFamily::Rebasing) {
+        let has_balance_check = has_fn_keyword("before")
+            || has_fn_keyword("after")
+            || has_fn_keyword("received")
+            || has_fn_keyword("balance_before");
+
+        // only flag if there's also a vault or lending protocol — those are the
+        // contexts where fee-on-transfer accounting errors cause real fund loss
+        let has_value_protocol =
+            has(&ProtocolFamily::ERC4626) || has(&ProtocolFamily::Lending) || has(&ProtocolFamily::Staking);
+
+        if !has_balance_check && has_value_protocol {
+            findings.push(AntiTopologyFinding {
+                rule: "no-fee-on-transfer-guard",
+                detail: "ERC-20 + vault/lending/staking with no pre/post balance check pattern — \
+                         fee-on-transfer tokens cause accounting desync"
+                    .into(),
+                confidence: 68,
+            });
+        }
+    }
+
+    // ── Rule 6: Privileged functions without any delay mechanism ─────────────
+    // Admin functions callable immediately with no timelock, no multisig
+    // pattern, and no role-based delay — single key compromise drains protocol.
+    if has(&ProtocolFamily::Privileged) {
+        let has_delay = has_sel([0x6a, 0x42, 0xb8, 0xf8]) // delay()
+            || has_fn_keyword("timelock")
+            || has_fn_keyword("multisig")
+            || has_fn_keyword("gnosis")
+            || has_fn_keyword("delay")
+            || has_fn_keyword("schedule");
+
+        if !has_delay {
+            findings.push(AntiTopologyFinding {
+                rule: "privileged-no-delay",
+                detail: "privileged admin functions callable immediately — no timelock, \
+                         multisig, or delay mechanism detected"
+                    .into(),
+                confidence: 75,
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    findings
+}
+
+/// Log anti-topology findings at WARN level with a clear pre-flight prefix.
+pub fn log_anti_topology(findings: &[AntiTopologyFinding]) {
+    if findings.is_empty() {
+        return;
+    }
+    warn!("=== ANTI-TOPOLOGY PRE-FLIGHT ===");
+    for f in findings {
+        warn!("  [{:3}%] [{}] {}", f.confidence, f.rule, f.detail);
+    }
+    warn!("================================");
 }

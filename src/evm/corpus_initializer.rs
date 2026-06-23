@@ -576,6 +576,15 @@ where
             if !families.is_empty() {
                 let report = TopologyReport::analyze(families);
                 report.log();
+
+                // Anti-topology: flag missing safety mechanisms as pre-flight findings.
+                // Runs on the same family set — no extra cost.
+                {
+                    use crate::evm::topology::{check_anti_topology, log_anti_topology};
+                    let anti = check_anti_topology(&report.families, &artifacts.address_to_abi);
+                    log_anti_topology(&anti);
+                }
+
                 artifacts.topology = Some(report);
             }
         }
