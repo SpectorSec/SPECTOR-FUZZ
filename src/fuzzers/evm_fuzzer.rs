@@ -448,6 +448,24 @@ pub fn evm_fuzzer(
         oracles.push(Rc::new(RefCell::new(rebasing_oracle)));
     }
 
+    // Auto-detected from ABI fingerprinting — no config flag needed.
+    // ERC-4626: activated whenever convertToAssets(uint256) is found in any contract ABI.
+    if !artifacts.erc4626_vaults.is_empty() {
+        use crate::evm::oracles::erc4626::ERC4626Oracle;
+        let erc4626_oracle = ERC4626Oracle::new(
+            artifacts.erc4626_vaults.clone(),
+            artifacts.address_to_name.clone(),
+        );
+        oracles.push(Rc::new(RefCell::new(erc4626_oracle)));
+        info!("ERC-4626 share-price oracle auto-activated for {} vault(s)", artifacts.erc4626_vaults.len());
+    }
+
+    // EIP-712: corpus seeds already injected in corpus_initializer.
+    // Log detection for visibility.
+    if !artifacts.eip712_contracts.is_empty() {
+        info!("EIP-712 domain separator detected in {} contract(s) — zero-sig seeds injected", artifacts.eip712_contracts.len());
+    }
+
     // if let Some(path) = config.state_comp_oracle {
     //     let mut file = File::open(path.clone()).expect("Failed to open state comp
     // oracle file");     let mut buf = String::new();

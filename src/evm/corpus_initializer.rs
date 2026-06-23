@@ -86,6 +86,10 @@ pub struct EVMInitializationArtifacts {
     pub initial_state: EVMStagedVMState,
     pub initial_env: Env,
     pub build_artifacts: HashMap<EVMAddress, BuildJobResult>,
+    /// ERC-4626 vaults detected from ABI fingerprinting (convertToAssets selector).
+    pub erc4626_vaults: Vec<EVMAddress>,
+    /// Contracts with EIP-712 domain separator detected from ABI.
+    pub eip712_contracts: Vec<EVMAddress>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -319,6 +323,8 @@ where
                 Some(ref setup_data) => setup_data.env.clone(),
                 None => Default::default(),
             },
+            erc4626_vaults: Vec::new(),
+            eip712_contracts: Vec::new(),
         };
 
         self.state.metadata_map_mut().insert(EnvMetadata {
@@ -449,6 +455,72 @@ where
                 }
 
                 self.add_abi(&abi, contract.deployed_address, &mut artifacts);
+            }
+
+            // ABI fingerprinting: auto-detect token standards and register
+            // the appropriate oracles without any user configuration.
+            let selectors: Vec<[u8; 4]> = contract.abi.iter().map(|a| a.function).collect();
+
+            // ERC-4626: convertToAssets(uint256) = 0x07a2d13a
+            if selectors.iter().any(|s| s == &[0x07, 0xa2, 0xd1, 0x3a]) {
+                artifacts.erc4626_vaults.push(contract.deployed_address);
+            }
+
+            // EIP-712: DOMAIN_SEPARATOR() = 0x3644e515
+            if selectors.iter().any(|s| s == &[0x36, 0x44, 0xe5, 0x15]) {
+                artifacts.eip712_contracts.push(contract.deployed_address);
+                // Inject zero-sig seeds for any function in this contract that
+                // accepts (v, r, s) — identified by having >=3 params where
+                // the ABI string contains "bytes32" twice and "uint8" once.
+                for abi in &contract.abi {
+                    let sig = &abi.abi;
+                    let has_vrs = sig.matches("bytes32").count() >= 2 && sig.contains("uint8");
+                    // skip permit — already handled by its own seed block
+                    if abi.function == [0xd5, 0x05, 0xac, 0xcf] { continue; }
+                    if !has_vrs { continue; }
+
+                    let callers: Vec<EVMAddress> = self.state.callers_pool.clone();
+                    for caller in &callers {
+                        for v_byte in [0u8, 27u8, 28u8] {
+                            // Build a 4 + N*32 calldata with selector + all-zero params
+                            // except v which gets the boundary value.
+                            // We don't know the exact ABI layout so we send a
+                            // 7-slot payload (224 bytes) — covers most sig functions.
+                            let mut calldata = vec![
+                                abi.function[0], abi.function[1],
+                                abi.function[2], abi.function[3],
+                            ];
+                            // 6 slots of zeros
+                            calldata.extend_from_slice(&[0u8; 192]);
+                            // Overwrite slot 4 last byte with v_byte (covers common v positions)
+                            let v_pos = 4 + 3 * 32 + 31; // 4th slot, last byte
+                            if v_pos < calldata.len() {
+                                calldata[v_pos] = v_byte;
+                            }
+
+                            let eip712_seed = EVMInput {
+                                caller: *caller,
+                                contract: contract.deployed_address,
+                                data: None,
+                                sstate: StagedVMState::new_uninitialized(),
+                                sstate_idx: 0,
+                                txn_value: None,
+                                step: false,
+                                env: artifacts.initial_env.clone(),
+                                access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+                                liquidation_percent: 0,
+                                input_type: EVMInputTy::ABI,
+                                direct_data: Bytes::from(calldata),
+                                randomness: vec![0],
+                                repeat: 1,
+                                swap_data: HashMap::new(),
+                            };
+                            add_input_to_corpus!(
+                                self.state, &mut self.scheduler, eip712_seed, &artifacts
+                            );
+                        }
+                    }
+                }
             }
         }
 
