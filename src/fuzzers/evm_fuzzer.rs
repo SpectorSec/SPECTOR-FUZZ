@@ -557,6 +557,192 @@ pub fn evm_fuzzer(
         ))));
     }
 
+    // Topology dispatch: translate ranked exploit classes into oracle activation.
+    // Only fires for oracles not already activated by CLI flags.
+    // Confidence threshold: 70% — below that the signal is too weak to act on.
+    //
+    // Note: InvariantOracle is Echidna-specific (needs invariant_* named functions).
+    // For invariant-leak exploit classes we use ReentrancyOracle + ArbitraryCallOracle
+    // which observe the execution trace and catch the state violation at runtime.
+    if let Some(ref topo) = artifacts.topology {
+        use crate::evm::topology::ExploitClass;
+        use crate::evm::oracles::rebasing::RebasingOracle;
+
+        // Track which oracle types topology has already auto-activated
+        // so we don't push duplicates.
+        let mut topo_reentrancy = config.reentrancy_oracle;
+        let mut topo_nft = config.nft_oracle;
+        let mut topo_rebasing = config.rebasing_oracle;
+        let mut topo_approval = config.approval_oracle;
+        let mut topo_arbitrary = config.arbitrary_external_call;
+        let mut topo_fee = config.fee_on_transfer_oracle;
+
+        for (class, confidence) in &topo.ranked {
+            if *confidence < 70 {
+                break; // sorted descending — everything below is also low confidence
+            }
+            match class {
+                ExploitClass::PriceGatedVault => {
+                    // FreshnessOracle + ERC4626Oracle already auto-activated from
+                    // artifacts.oracle_contracts / artifacts.erc4626_vaults.
+                    // Reentrancy catches flash-loan re-entry during vault operations.
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] PriceGatedVault → ReentrancyOracle auto-activated");
+                    }
+                }
+                ExploitClass::FlashDepositDrain => {
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] FlashDepositDrain → ReentrancyOracle auto-activated");
+                    }
+                }
+                ExploitClass::FlashBorrowLeverage => {
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] FlashBorrowLeverage → ReentrancyOracle auto-activated");
+                    }
+                    if !topo_arbitrary {
+                        oracles.push(Rc::new(RefCell::new(ArbitraryCallOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        oracles.push(Rc::new(RefCell::new(ArbitraryERC20TransferOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_arbitrary = true;
+                        info!("[topology {confidence}%] FlashBorrowLeverage → ArbitraryCallOracle auto-activated");
+                    }
+                }
+                ExploitClass::FlashGovernance => {
+                    // FunctionOracle auto-activated from artifacts.privileged_functions.
+                    // Arbitrary call catches the unvalidated execute() target.
+                    if !topo_arbitrary {
+                        oracles.push(Rc::new(RefCell::new(ArbitraryCallOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        oracles.push(Rc::new(RefCell::new(ArbitraryERC20TransferOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_arbitrary = true;
+                        info!("[topology {confidence}%] FlashGovernance → ArbitraryCallOracle auto-activated");
+                    }
+                }
+                ExploitClass::OraclePriceManip => {
+                    // FreshnessOracle auto-activated from artifacts.oracle_contracts.
+                    // Reentrancy catches price-update callbacks used to skew oracle reads.
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] OraclePriceManip → ReentrancyOracle auto-activated");
+                    }
+                }
+                ExploitClass::NFTReentrancy => {
+                    if !topo_nft {
+                        oracles.push(Rc::new(RefCell::new(NFTOwnershipOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_nft = true;
+                        info!("[topology {confidence}%] NFTReentrancy → NFTOracle auto-activated");
+                    }
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] NFTReentrancy → ReentrancyOracle auto-activated");
+                    }
+                }
+                ExploitClass::RewardAccumulator => {
+                    // Rebasing oracle catches reward token balance desync.
+                    if !topo_rebasing {
+                        let known: std::collections::HashSet<EVMAddress> =
+                            artifacts.address_to_name.keys().cloned().collect();
+                        oracles.push(Rc::new(RefCell::new(RebasingOracle::new(
+                            known,
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_rebasing = true;
+                        info!("[topology {confidence}%] RewardAccumulator → RebasingOracle auto-activated");
+                    }
+                }
+                ExploitClass::SignatureReplay => {
+                    if !topo_approval {
+                        let known: std::collections::HashSet<EVMAddress> =
+                            artifacts.address_to_name.keys().cloned().collect();
+                        oracles.push(Rc::new(RefCell::new(SuspiciousApprovalOracle::new(
+                            known,
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_approval = true;
+                        info!("[topology {confidence}%] SignatureReplay → ApprovalOracle auto-activated");
+                    }
+                }
+                ExploitClass::ArbitraryCallDrain | ExploitClass::UnprotectedCallback => {
+                    if !topo_arbitrary {
+                        oracles.push(Rc::new(RefCell::new(ArbitraryCallOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        oracles.push(Rc::new(RefCell::new(ArbitraryERC20TransferOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_arbitrary = true;
+                        info!("[topology {confidence}%] {:?} → ArbitraryCallOracle auto-activated", class);
+                    }
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] {:?} → ReentrancyOracle auto-activated", class);
+                    }
+                }
+                ExploitClass::AMMInvariant => {
+                    // K-invariant bypasses often use swap callbacks — reentrancy covers it.
+                    if !topo_reentrancy {
+                        oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_reentrancy = true;
+                        info!("[topology {confidence}%] AMMInvariant → ReentrancyOracle auto-activated");
+                    }
+                }
+                ExploitClass::DeflationaryToken => {
+                    if !topo_fee {
+                        oracles.push(Rc::new(RefCell::new(FeeOnTransferOracle::new(
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_fee = true;
+                        info!("[topology {confidence}%] DeflationaryToken → FeeOnTransferOracle auto-activated");
+                    }
+                    if !topo_rebasing {
+                        let known: std::collections::HashSet<EVMAddress> =
+                            artifacts.address_to_name.keys().cloned().collect();
+                        oracles.push(Rc::new(RefCell::new(RebasingOracle::new(
+                            known,
+                            artifacts.address_to_name.clone(),
+                        ))));
+                        topo_rebasing = true;
+                        info!("[topology {confidence}%] DeflationaryToken → RebasingOracle auto-activated");
+                    }
+                }
+                ExploitClass::PermissionEscalation => {
+                    // FunctionOracle already auto-activated from artifacts.privileged_functions.
+                }
+            }
+        }
+    }
+
     if let Some(m) = onchain_middleware.clone() {
         m.borrow_mut().add_abi(artifacts.address_to_abi.clone());
     }
