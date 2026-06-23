@@ -466,6 +466,51 @@ pub fn evm_fuzzer(
         info!("EIP-712 domain separator detected in {} contract(s) — zero-sig seeds injected", artifacts.eip712_contracts.len());
     }
 
+    // Freshness oracle: auto-activated when Chainlink-style oracle contracts
+    // are detected in the ABI (latestRoundData / latestAnswer / getRoundData).
+    // Monitors updatedAt field post-execution; flags stale data accepted without
+    // a freshness check — Ghost #3 from the DeFi ghost taxonomy.
+    if !artifacts.oracle_contracts.is_empty() {
+        use crate::evm::oracles::freshness::FreshnessOracle;
+        let freshness_oracle = FreshnessOracle::new(
+            artifacts.oracle_contracts.clone(),
+            artifacts.address_to_name.clone(),
+            3600, // 1-hour default staleness threshold (Chainlink heartbeat)
+        );
+        oracles.push(Rc::new(RefCell::new(freshness_oracle)));
+        info!(
+            "Freshness oracle auto-activated: {} oracle contract(s) monitored (max staleness: 3600s)",
+            artifacts.oracle_contracts.len()
+        );
+    }
+
+    // Permission-leak oracle: auto-activated when privileged functions are
+    // detected in the ABI. All attacker callers are treated as unauthorized;
+    // the deployer (address_to_name key that is not in callers_pool) is implicitly
+    // allowed by populating the allowed set with only non-attacker addresses.
+    if !artifacts.privileged_functions.is_empty() {
+        use crate::evm::oracles::function::FunctionOracle;
+        let attackers: std::collections::HashSet<EVMAddress> =
+            state.callers_pool.iter().cloned().collect();
+        let mut fn_oracle = FunctionOracle::new(artifacts.address_to_name.clone());
+        for (contract, selector, fn_name) in &artifacts.privileged_functions {
+            // Allow only non-attacker callers (i.e., the deployer).
+            // Any address in callers_pool is a fuzzer-controlled attacker.
+            let deployers: std::collections::HashSet<EVMAddress> = artifacts
+                .address_to_name
+                .keys()
+                .filter(|a| !attackers.contains(*a))
+                .cloned()
+                .collect();
+            fn_oracle.add_rule(*contract, *selector, fn_name.clone(), deployers);
+        }
+        info!(
+            "Permission-leak oracle auto-activated: {} privileged function(s) monitored",
+            artifacts.privileged_functions.len()
+        );
+        oracles.push(Rc::new(RefCell::new(fn_oracle)));
+    }
+
     // if let Some(path) = config.state_comp_oracle {
     //     let mut file = File::open(path.clone()).expect("Failed to open state comp
     // oracle file");     let mut buf = String::new();

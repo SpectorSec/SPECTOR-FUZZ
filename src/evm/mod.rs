@@ -13,6 +13,7 @@ pub mod input;
 pub mod middlewares;
 pub mod minimizer;
 pub mod mutator;
+pub mod liquidation;
 pub mod onchain;
 pub mod oracle;
 pub mod oracles;
@@ -399,6 +400,7 @@ enum OracleType {
     Approval,
     CrossChain,
     Rebasing,
+    Function,
 }
 
 impl OracleType {
@@ -419,6 +421,7 @@ impl OracleType {
             OracleType::Approval => "approval",
             OracleType::CrossChain => "crosschain",
             OracleType::Rebasing => "rebasing",
+            OracleType::Function => "function",
         }
     }
 
@@ -439,6 +442,7 @@ impl OracleType {
             "approval" => OracleType::Approval,
             "crosschain" => OracleType::CrossChain,
             "rebasing" => OracleType::Rebasing,
+            "function" => OracleType::Function,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -469,6 +473,7 @@ impl OracleType {
                     OracleType::Approval,
                     OracleType::CrossChain,
                     OracleType::Rebasing,
+                    OracleType::Function,
                 ];
             }
             if detector == "high_confidence" {
@@ -480,6 +485,7 @@ impl OracleType {
                     OracleType::TypedBug,
                     OracleType::SelfDestruct,
                     OracleType::Invariant,
+                    OracleType::Function,
                 ];
             }
 

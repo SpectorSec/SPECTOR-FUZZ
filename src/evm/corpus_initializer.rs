@@ -90,6 +90,12 @@ pub struct EVMInitializationArtifacts {
     pub erc4626_vaults: Vec<EVMAddress>,
     /// Contracts with EIP-712 domain separator detected from ABI.
     pub eip712_contracts: Vec<EVMAddress>,
+    /// Privileged functions detected from ABI: (contract, selector, fn_name).
+    /// Populated by scanning function names for privileged keywords.
+    pub privileged_functions: Vec<(EVMAddress, [u8; 4], String)>,
+    /// Contracts that expose a Chainlink-style oracle interface (latestRoundData).
+    /// Used to activate the FreshnessOracle.
+    pub oracle_contracts: Vec<EVMAddress>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -325,6 +331,8 @@ where
             },
             erc4626_vaults: Vec::new(),
             eip712_contracts: Vec::new(),
+            privileged_functions: Vec::new(),
+            oracle_contracts: Vec::new(),
         };
 
         self.state.metadata_map_mut().insert(EnvMetadata {
@@ -520,6 +528,29 @@ where
                             );
                         }
                     }
+                }
+            }
+
+            // Oracle interface detection: contracts exposing latestRoundData() /
+            // latestAnswer() / getRoundData() are Chainlink-style oracle contracts.
+            // FreshnessOracle will monitor their updatedAt field.
+            let has_oracle_iface = contract.abi.iter().any(|a| {
+                crate::evm::oracles::freshness::is_oracle_interface(&a.function)
+            });
+            if has_oracle_iface {
+                artifacts.oracle_contracts.push(contract.deployed_address);
+            }
+
+            // Permission leak detection: flag functions with privileged names.
+            // The FunctionOracle will block all non-deployer callers from
+            // reaching these without reverting.
+            for abi in &contract.abi {
+                if crate::evm::oracles::function::is_privileged_fn(&abi.function_name) {
+                    artifacts.privileged_functions.push((
+                        contract.deployed_address,
+                        abi.function,
+                        abi.function_name.clone(),
+                    ));
                 }
             }
         }
@@ -768,6 +799,199 @@ where
                         swap_data: HashMap::new(),
                     };
                     add_input_to_corpus!(self.state, &mut self.scheduler, cc_seed, artifacts);
+                }
+            }
+        }
+
+        // Oracle staleness seeds: warp block.timestamp past heartbeat thresholds.
+        //
+        // When latestRoundData (or compatible) is detected, inject seeds for every
+        // ABI function with block.timestamp advanced past the common Chainlink
+        // heartbeat boundaries (1h, 4h, 24h, 7d). If the consuming protocol
+        // reads the oracle price without checking updatedAt, these seeds make it
+        // consume stale data — FreshnessOracle then flags the violation.
+        if crate::evm::oracles::freshness::is_oracle_interface(&abi.function) {
+            let callers: Vec<EVMAddress> = self.state.callers_pool.clone();
+            // Staleness deltas in seconds: 1h (Chainlink fast heartbeat),
+            // 4h (medium), 24h (slow feeds), 7d (worst case stale).
+            let deltas: &[u64] = &[3_600, 14_400, 86_400, 604_800];
+            for caller in &callers {
+                for &delta in deltas {
+                    let mut warped_env = artifacts.initial_env.clone();
+                    warped_env.block.timestamp = artifacts.initial_env.block.timestamp
+                        + EVMU256::from(delta);
+                    // Seed: call the oracle itself with warped time. The fuzzer
+                    // will then combine this snapshot with downstream protocol calls.
+                    let warp_seed = EVMInput {
+                        caller: *caller,
+                        contract: deployed_address,
+                        data: None,
+                        sstate: StagedVMState::new_uninitialized(),
+                        sstate_idx: 0,
+                        txn_value: None,
+                        step: false,
+                        env: warped_env,
+                        access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+                        liquidation_percent: 0,
+                        input_type: EVMInputTy::ABI,
+                        direct_data: Bytes::from(abi.function.to_vec()),
+                        randomness: vec![0],
+                        repeat: 1,
+                        swap_data: HashMap::new(),
+                    };
+                    add_input_to_corpus!(self.state, &mut self.scheduler, warp_seed, artifacts);
+                }
+            }
+        }
+
+        // Callback surface seeds — hook reentry.
+        //
+        // Every token-standard callback is a free execution window: the protocol
+        // calls safeTransferFrom / send / executeOperation and the callee gets
+        // control while the protocol is mid-state. By seeding `to = attacker`
+        // we route the callback to an attacker-controlled address. The call_leak
+        // mechanism + snapshot architecture then explore what the attacker can do
+        // inside that window (cross-function reentry, oracle manipulation, etc.).
+        //
+        // Surfaces covered:
+        //   ERC-721  safeTransferFrom(from, to, id)           0x42842e0e
+        //   ERC-721  safeTransferFrom(from, to, id, data)     0xb88d4fde
+        //   ERC-1155 safeTransferFrom(from, to, id, amt, data)0xf242432a
+        //   ERC-1155 safeBatchTransferFrom(from,to,ids,amts,d)0x2eb2c2d6
+        //   Aave V3  executeOperation(assets,amts,prems,ini,d)0x1a02b5e8  (flashloan callback)
+        //   ERC-777  send(to, amount, data)                   0x9bd9bbc6
+        const CALLBACK_SELECTORS: &[([u8; 4], &str)] = &[
+            ([0x42, 0x84, 0x2e, 0x0e], "safeTransferFrom(address,address,uint256)"),
+            ([0xb8, 0x8d, 0x4f, 0xde], "safeTransferFrom(address,address,uint256,bytes)"),
+            ([0xf2, 0x42, 0x43, 0x2a], "safeTransferFrom(address,address,uint256,uint256,bytes)"),
+            ([0x2e, 0xb2, 0xc2, 0xd6], "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)"),
+            ([0x1a, 0x02, 0xb5, 0xe8], "executeOperation(address[],uint256[],uint256[],address,bytes)"),
+            ([0x9b, 0xd9, 0xbb, 0xc6], "send(address,uint256,bytes)"),
+        ];
+
+        // Find which surface this ABI entry matches.
+        let matched = CALLBACK_SELECTORS.iter().find(|(sel, _)| abi.function == *sel);
+        if let Some(([s0, s1, s2, s3], _sig)) = matched {
+            let sel = [*s0, *s1, *s2, *s3];
+            let callers: Vec<EVMAddress> = self.state.callers_pool.clone();
+            let protocol_addrs: Vec<EVMAddress> = artifacts.address_to_name.keys().cloned().collect();
+            // Boundary token IDs / amounts: 0, 1, type(uint128).max
+            let token_ids: &[[u8; 32]] = &[
+                [0u8; 32],
+                { let mut b = [0u8; 32]; b[31] = 1; b },
+                { let mut b = [0u8; 32]; b[16..].fill(0xff); b },
+            ];
+
+            for attacker in &callers {
+                for from in &protocol_addrs {
+                    for token_id in token_ids {
+                        let mut calldata = vec![sel[0], sel[1], sel[2], sel[3]];
+
+                        match sel {
+                            // safeTransferFrom(address from, address to, uint256 id)
+                            [0x42, 0x84, 0x2e, 0x0e] => {
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(from.as_slice());
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                calldata.extend_from_slice(token_id);
+                            }
+                            // safeTransferFrom(address from, address to, uint256 id, bytes data)
+                            [0xb8, 0x8d, 0x4f, 0xde] => {
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(from.as_slice());
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                calldata.extend_from_slice(token_id);
+                                // bytes data: offset = 0x80, length = 0
+                                calldata.extend_from_slice(&[0u8; 31]);
+                                calldata.push(0x80);
+                                calldata.extend_from_slice(&[0u8; 32]); // length = 0
+                            }
+                            // safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes data)
+                            [0xf2, 0x42, 0x43, 0x2a] => {
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(from.as_slice());
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                calldata.extend_from_slice(token_id); // id
+                                calldata.extend_from_slice(token_id); // amount
+                                // bytes data: offset = 0xa0, length = 0
+                                calldata.extend_from_slice(&[0u8; 31]);
+                                calldata.push(0xa0);
+                                calldata.extend_from_slice(&[0u8; 32]);
+                            }
+                            // safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)
+                            [0x2e, 0xb2, 0xc2, 0xd6] => {
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(from.as_slice());
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                // ids[]: offset=0xa0, amounts[]: offset=0xe0, data: offset=0x120
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0xa0);
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0xe0);
+                                calldata.extend_from_slice(&[0u8; 30]); calldata.extend_from_slice(&[0x01, 0x20]);
+                                // ids[]: length=1, value=token_id
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(1);
+                                calldata.extend_from_slice(token_id);
+                                // amounts[]: length=1, value=1
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(1);
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(1);
+                                // data: length=0
+                                calldata.extend_from_slice(&[0u8; 32]);
+                            }
+                            // executeOperation(address[] assets, uint256[] amounts, uint256[] premiums, address initiator, bytes params)
+                            // Seed: attacker as initiator, empty arrays — probes if protocol accepts
+                            // flashloan callbacks from untrusted callers without reverting.
+                            [0x1a, 0x02, 0xb5, 0xe8] => {
+                                // assets[]: offset=0xa0, amounts[]: offset=0xc0, premiums[]: offset=0xe0
+                                // initiator: attacker, params: offset=0x120
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0xa0);
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0xc0);
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0xe0);
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                calldata.extend_from_slice(&[0u8; 30]); calldata.extend_from_slice(&[0x01, 0x00]);
+                                // arrays length=0
+                                calldata.extend_from_slice(&[0u8; 32]);
+                                calldata.extend_from_slice(&[0u8; 32]);
+                                calldata.extend_from_slice(&[0u8; 32]);
+                                // params: length=0
+                                calldata.extend_from_slice(&[0u8; 32]);
+                            }
+                            // send(address to, uint256 amount, bytes data) — ERC-777
+                            [0x9b, 0xd9, 0xbb, 0xc6] => {
+                                calldata.extend_from_slice(&[0u8; 12]);
+                                calldata.extend_from_slice(attacker.as_slice());
+                                calldata.extend_from_slice(token_id); // amount
+                                // bytes data: offset=0x60, length=0
+                                calldata.extend_from_slice(&[0u8; 31]); calldata.push(0x60);
+                                calldata.extend_from_slice(&[0u8; 32]);
+                            }
+                            _ => {}
+                        }
+
+                        if calldata.len() > 4 {
+                            let hook_seed = EVMInput {
+                                caller: *attacker,
+                                contract: deployed_address,
+                                data: None,
+                                sstate: StagedVMState::new_uninitialized(),
+                                sstate_idx: 0,
+                                txn_value: None,
+                                step: false,
+                                env: artifacts.initial_env.clone(),
+                                access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+                                liquidation_percent: 0,
+                                input_type: EVMInputTy::ABI,
+                                direct_data: Bytes::from(calldata),
+                                randomness: vec![0],
+                                repeat: 1,
+                                swap_data: HashMap::new(),
+                            };
+                            add_input_to_corpus!(self.state, &mut self.scheduler, hook_seed, artifacts);
+                        }
+                    }
                 }
             }
         }

@@ -1,1 +1,187 @@
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
+use bytes::Bytes;
+use revm_interpreter::bytecode::Bytecode;
+
+use crate::{
+    evm::{
+        input::{ConciseEVMInput, EVMInput},
+        oracle::EVMBugResult,
+        oracles::FUNCTION_BUG_IDX,
+        types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
+        vm::EVMState,
+    },
+    input::VMInputT,
+    oracle::{Oracle, OracleCtx},
+    state::HasExecutionResult,
+};
+
+/// Detects unauthorized access to privileged functions.
+///
+/// For each (contract, selector) rule, records which callers are allowed.
+/// If an execution calls that function with a disallowed caller and does NOT
+/// revert, it's a permission leak — primitive 4 of the Six Primitives.
+///
+/// Auto-populated by the corpus initializer by scanning ABI function names
+/// for privileged keywords (withdraw, mint, pause, setOwner, etc.).
+/// Can also be populated from explicit CLI rules for custom harnesses.
+pub struct FunctionOracle {
+    /// (contract, selector) → set of allowed caller addresses.
+    /// Empty allowed set means ALL callers are blocked except deployer.
+    rules: HashMap<(EVMAddress, [u8; 4]), HashSet<EVMAddress>>,
+    /// Human-readable function name for each (contract, selector) pair.
+    names: HashMap<(EVMAddress, [u8; 4]), String>,
+    pub address_to_name: HashMap<EVMAddress, String>,
+}
+
+impl FunctionOracle {
+    pub fn new(address_to_name: HashMap<EVMAddress, String>) -> Self {
+        Self {
+            rules: HashMap::new(),
+            names: HashMap::new(),
+            address_to_name,
+        }
+    }
+
+    /// Register a privileged function. Only `allowed_callers` may call it
+    /// without reverting; all others fire the oracle.
+    pub fn add_rule(
+        &mut self,
+        contract: EVMAddress,
+        selector: [u8; 4],
+        fn_name: String,
+        allowed_callers: HashSet<EVMAddress>,
+    ) {
+        self.rules.insert((contract, selector), allowed_callers);
+        self.names.insert((contract, selector), fn_name);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
+
+/// Lowercase function name substrings that indicate a privileged operation.
+/// Matched against the ABI `function_name` field during corpus initialization.
+pub const PRIVILEGED_KEYWORDS: &[&str] = &[
+    "withdraw",
+    "drain",
+    "mint",
+    "burn",
+    "pause",
+    "unpause",
+    "setowner",
+    "transferownership",
+    "renounceownership",
+    "upgrade",
+    "initialize",
+    "setrole",
+    "grantrole",
+    "revokerole",
+    "emergencywithdraw",
+    "rescue",
+    "sweep",
+];
+
+/// Returns true if `fn_name` contains any privileged keyword (case-insensitive).
+pub fn is_privileged_fn(fn_name: &str) -> bool {
+    let lower = fn_name.to_lowercase();
+    PRIVILEGED_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+impl
+    Oracle<
+        EVMState,
+        EVMAddress,
+        Bytecode,
+        Bytes,
+        EVMAddress,
+        EVMU256,
+        Vec<u8>,
+        EVMInput,
+        EVMFuzzState,
+        ConciseEVMInput,
+        EVMQueueExecutor,
+    > for FunctionOracle
+{
+    fn transition(&self, _ctx: &mut EVMOracleCtx<'_>, _stage: u64) -> u64 {
+        0
+    }
+
+    fn oracle(
+        &self,
+        ctx: &mut OracleCtx<
+            EVMState,
+            EVMAddress,
+            Bytecode,
+            Bytes,
+            EVMAddress,
+            EVMU256,
+            Vec<u8>,
+            EVMInput,
+            EVMFuzzState,
+            ConciseEVMInput,
+            EVMQueueExecutor,
+        >,
+        _stage: u64,
+    ) -> Vec<u64> {
+        if self.rules.is_empty() {
+            return vec![];
+        }
+
+        let result = ctx.fuzz_state.get_execution_result();
+        // Only flag successful calls — a revert is the access control working.
+        if result.reverted {
+            return vec![];
+        }
+
+        let caller   = ctx.input.get_caller();
+        let contract = ctx.input.get_contract();
+        let data     = ctx.input.get_direct_data();
+
+        if data.len() < 4 {
+            return vec![];
+        }
+        let selector: [u8; 4] = data[..4].try_into().unwrap();
+
+        let key = (contract, selector);
+        let allowed = match self.rules.get(&key) {
+            Some(a) => a,
+            None => return vec![],
+        };
+
+        // If the caller is explicitly allowed, no violation.
+        if allowed.contains(&caller) {
+            return vec![];
+        }
+
+        let fn_name = self.names.get(&key).map(|s| s.as_str()).unwrap_or("unknown");
+        let contract_name = self
+            .address_to_name
+            .get(&contract)
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        caller.hash(&mut hasher);
+        let bug_idx = (hasher.finish() << 8) + FUNCTION_BUG_IDX;
+
+        EVMBugResult::new(
+            "Unauthorized Function Access".to_string(),
+            bug_idx,
+            format!(
+                "{}.{}() reached by unauthorized caller {:?} without reverting \
+                 (permission leak)",
+                contract_name, fn_name, caller,
+            ),
+            ConciseEVMInput::from_input(ctx.input, ctx.fuzz_state.get_execution_result()),
+            None,
+            Some(contract_name.to_string()),
+        )
+        .push_to_output();
+
+        vec![bug_idx]
+    }
+}

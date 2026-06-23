@@ -180,6 +180,10 @@ where
             VmCalls::stopPrank(_) => self.stop_prank(host),
             VmCalls::label(args) => self.label(args),
             VmCalls::getLabel(args) => self.get_label(args),
+            VmCalls::computeCreateAddress(args) => self.compute_create_address(args),
+            VmCalls::computeCreate2Address_0(args) => self.compute_create2_address0(args),
+            VmCalls::computeCreate2Address_1(args) => self.compute_create2_address1(args),
+            VmCalls::getNonce_0(args) => self.get_nonce0(args),
             VmCalls::createSelectFork_0(args) => self.create_select_fork0(host, args),
             VmCalls::createSelectFork_1(args) => self.create_select_fork1(host, args),
             VmCalls::createSelectFork_2(args) => self.create_select_fork2(host, args),
@@ -419,6 +423,10 @@ where
             VmCalls::stopPrank(_) => self.stop_prank(host),
             VmCalls::label(args) => self.label(args),
             VmCalls::getLabel(args) => self.get_label(args),
+            VmCalls::computeCreateAddress(args) => self.compute_create_address(args),
+            VmCalls::computeCreate2Address_0(args) => self.compute_create2_address0(args),
+            VmCalls::computeCreate2Address_1(args) => self.compute_create2_address1(args),
+            VmCalls::getNonce_0(args) => self.get_nonce0(args),
 
             // fork
             VmCalls::createSelectFork_0(args) => self.create_select_fork0(host, args),

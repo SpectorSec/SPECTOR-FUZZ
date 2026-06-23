@@ -356,6 +356,49 @@ where
         let result = self.labels.get(&account).cloned()?;
         Some(result.abi_encode())
     }
+
+    /// Computes the address a contract would be deployed at with the CREATE
+    /// opcode given the deployer address and current nonce.
+    /// Pure computation: keccak256(rlp([deployer, nonce]))[12..]
+    #[inline]
+    pub fn compute_create_address(&self, args: Vm::computeCreateAddressCall) -> Option<Vec<u8>> {
+        let Vm::computeCreateAddressCall { deployer, nonce } = args;
+        let nonce_u64: u64 = nonce.saturating_to();
+        let created: Address = deployer.create(nonce_u64);
+        Some(created.abi_encode())
+    }
+
+    /// Computes the address a contract would be deployed at with CREATE2
+    /// given a deployer, salt, and initcode hash.
+    #[inline]
+    pub fn compute_create2_address0(&self, args: Vm::computeCreate2Address_0Call) -> Option<Vec<u8>> {
+        let Vm::computeCreate2Address_0Call { salt, initCodeHash, deployer } = args;
+        let created: Address = deployer.create2(salt, initCodeHash);
+        Some(created.abi_encode())
+    }
+
+    /// Computes the CREATE2 address using the default CREATE2 deployer
+    /// (0x4e59b44847b379578588920cA78FbF26c0B4956C).
+    #[inline]
+    pub fn compute_create2_address1(&self, args: Vm::computeCreate2Address_1Call) -> Option<Vec<u8>> {
+        let Vm::computeCreate2Address_1Call { salt, initCodeHash } = args;
+        // Standard CREATE2 factory address (Nick's method).
+        let factory = Address::from([
+            0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88,
+            0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
+        ]);
+        let created: Address = factory.create2(salt, initCodeHash);
+        Some(created.abi_encode())
+    }
+
+    /// Returns the nonce of an account.
+    /// In the fork state, nonces are not separately tracked; new attacker
+    /// addresses always start at 0, which matches every real exploit PoC.
+    #[inline]
+    pub fn get_nonce0(&self, args: Vm::getNonce_0Call) -> Option<Vec<u8>> {
+        let Vm::getNonce_0Call { account: _ } = args;
+        Some(0u64.abi_encode())
+    }
 }
 
 impl Prank {

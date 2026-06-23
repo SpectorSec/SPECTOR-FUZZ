@@ -26,6 +26,7 @@ use super::ChainConfig;
 use crate::{
     cache::{Cache, FileSystemCache},
     evm::{
+        liquidation::{LiquidationRoute, LiquidationRouter},
         tokens::TokenContext,
         types::{EVMAddress, EVMU256},
     },
@@ -1253,11 +1254,128 @@ impl OnChainConfig {
 }
 
 impl OnChainConfig {
+    /// Discover a liquidation route for `token` using only on-chain RPC calls —
+    /// no external pairs server needed. Returns a populated PairData if a liquid
+    /// route is found, or None for illiquid tokens.
+    fn get_pair_from_fork(&mut self, token_addr: EVMAddress) -> Option<PairData> {
+        let weth_str = self.get_weth();
+        let weth = EVMAddress::from_str(&weth_str).ok()?;
+        let router = LiquidationRouter::default().with_chain(
+            weth,
+            self.v2_factory_for_chain(),
+            self.v2_router_for_chain(),
+        );
+        // Closure: wraps eth_call so the router can probe on-chain state.
+        let mut rpc_call = |addr: EVMAddress, data: Bytes| -> Vec<u8> {
+            self.eth_call(addr, data).to_vec()
+        };
+        let route = router.discover_route(token_addr, &mut rpc_call);
+        let token_str = format!("{:?}", token_addr).to_lowercase();
+        match route {
+            LiquidationRoute::UniV2 { pair, .. } => {
+                let pair_str = format!("{:?}", pair).to_lowercase();
+                Some(PairData {
+                    src: "lp".to_string(),
+                    in_: 0,
+                    pair: pair_str.clone(),
+                    in_token: token_str.clone(),
+                    next: weth_str.clone(),
+                    interface: "uniswapv2".to_string(),
+                    src_exact: "uniswapv2".to_string(),
+                    initial_reserves_0: EVMU256::ZERO,
+                    initial_reserves_1: EVMU256::ZERO,
+                    decimals_0: 18,
+                    decimals_1: 18,
+                    token0: token_str,
+                    token1: weth_str,
+                })
+            }
+            LiquidationRoute::UniV3 { pool, fee } => {
+                let pool_str = format!("{:?}", pool).to_lowercase();
+                Some(PairData {
+                    src: "lp".to_string(),
+                    in_: 0,
+                    pair: pool_str.clone(),
+                    in_token: token_str.clone(),
+                    next: weth_str.clone(),
+                    interface: "uniswapv3".to_string(),
+                    src_exact: format!("uniswapv3:{}", fee),
+                    initial_reserves_0: EVMU256::ZERO,
+                    initial_reserves_1: EVMU256::ZERO,
+                    decimals_0: 18,
+                    decimals_1: 18,
+                    token0: token_str,
+                    token1: weth_str,
+                })
+            }
+            LiquidationRoute::Vault { underlying, .. } => {
+                // Recurse: discover the exit route for the underlying asset.
+                self.get_pair_from_fork(underlying)
+            }
+            LiquidationRoute::Curve { pool, i, j } => {
+                let pool_str = format!("{:?}", pool).to_lowercase();
+                Some(PairData {
+                    src: "lp".to_string(),
+                    in_: i as i32,
+                    pair: pool_str,
+                    in_token: token_str.clone(),
+                    next: weth_str.clone(),
+                    interface: "curve".to_string(),
+                    src_exact: format!("curve:{}:{}", i, j),
+                    initial_reserves_0: EVMU256::ZERO,
+                    initial_reserves_1: EVMU256::ZERO,
+                    decimals_0: 18,
+                    decimals_1: 18,
+                    token0: token_str,
+                    token1: weth_str,
+                })
+            }
+            LiquidationRoute::Illiquid => None,
+        }
+    }
+
+    /// Chain-specific V2 factory override. Defaults to Uniswap V2 mainnet.
+    fn v2_factory_for_chain(&self) -> EVMAddress {
+        let addr = match self.chain_name.as_str() {
+            "bsc"      => "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+            "polygon"  => "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32",
+            "arbitrum" => "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9",
+            "optimism" => "0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf",
+            _          => "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+        };
+        EVMAddress::from_str(addr).unwrap()
+    }
+
+    /// Chain-specific V2 router override.
+    fn v2_router_for_chain(&self) -> EVMAddress {
+        let addr = match self.chain_name.as_str() {
+            "bsc"      => "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+            "polygon"  => "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff",
+            "arbitrum" => "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
+            "optimism" => "0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2",
+            _          => "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+        };
+        EVMAddress::from_str(addr).unwrap()
+    }
+
     pub fn get_pair(&mut self, token: &str, network: &str, is_pegged: bool, weth: String) -> Vec<PairData> {
         let token: String = token.to_lowercase();
         if self.pair_cache.contains_key(&EVMAddress::from_str(&token).unwrap()) {
             return self.pair_cache[&EVMAddress::from_str(&token).unwrap()].clone();
         }
+
+        // ── Autonomous fork-native route discovery ───────────────────────────
+        // Try to discover the pair directly from the chain state (RPC) before
+        // falling back to the external pairs server.
+        if let Ok(token_addr) = EVMAddress::from_str(&token) {
+            if let Some(pair) = self.get_pair_from_fork(token_addr) {
+                let pairs = vec![pair];
+                self.pair_cache.insert(token_addr, pairs.clone());
+                info!("fork-native: found pair for {token}");
+                return pairs;
+            }
+        }
+
         let base_url = env::var("ITYFUZZ_PAIRS_URL")
             .unwrap_or_else(|_| "https://pairs-all.infra.fuzz.land".to_string());
         let url = if is_pegged {
