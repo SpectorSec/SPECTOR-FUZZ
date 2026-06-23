@@ -221,212 +221,140 @@ impl TopologyReport {
     }
 }
 
-/// Classify a single ABI selector + function name into a `ProtocolFamily`.
-/// Returns `None` if the selector doesn't match any known family.
+/// Classify a single ABI entry into a `ProtocolFamily`.
+///
+/// Name-first: function names are the canonical identifier for protocol
+/// families. Selectors are deterministic for standard interfaces so the
+/// two approaches agree — but name matching works for custom implementations
+/// that don't use a standard function signature verbatim.
+///
+/// Delegates to existing detection functions where they already exist
+/// (`is_oracle_interface`, `is_privileged_fn`) so classification logic
+/// stays in one place.
 pub fn classify_selector(selector: &[u8; 4], fn_name: &str) -> Option<ProtocolFamily> {
-    match selector {
-        // ERC-20
-        [0xa9, 0x05, 0x9c, 0xbb] // transfer(address,uint256)
-        | [0x23, 0xb8, 0x72, 0xdd] // transferFrom(address,address,uint256)
-        | [0x09, 0x5e, 0xa7, 0xb3] // approve(address,uint256)
-        | [0x70, 0xa0, 0x82, 0x31] // balanceOf(address)
-        | [0x18, 0x16, 0x0d, 0xdd] // totalSupply()
-        => Some(ProtocolFamily::ERC20),
-
-        // ERC-721
-        [0x42, 0x84, 0x2e, 0x0e] // safeTransferFrom(address,address,uint256)
-        | [0xb8, 0x8d, 0x4f, 0xde] // safeTransferFrom(address,address,uint256,bytes)
-        | [0x63, 0x52, 0x21, 0x1e] // ownerOf(uint256)
-        | [0x6f, 0x4f, 0x28, 0x78] // isApprovedForAll
-        => Some(ProtocolFamily::ERC721),
-
-        // ERC-1155
-        [0xf2, 0x42, 0x43, 0x2a] // safeTransferFrom(address,address,uint256,uint256,bytes)
-        | [0x2e, 0xb2, 0xc2, 0xd6] // safeBatchTransferFrom
-        | [0x00, 0xfd, 0xd5, 0x8e] // balanceOf(address,uint256)
-        => Some(ProtocolFamily::ERC1155),
-
-        // ERC-4626 vault
-        [0x07, 0xa2, 0xd1, 0x3a] // convertToAssets(uint256)
-        | [0xef, 0x8b, 0x30, 0xf7] // convertToShares(uint256)
-        | [0x6e, 0x55, 0x3f, 0x65] // deposit(uint256,address)
-        | [0xb4, 0x60, 0xaf, 0x94] // withdraw(uint256,address,address)
-        | [0xba, 0x08, 0x76, 0x52] // redeem(uint256,address,address)
-        | [0x94, 0xbf, 0x80, 0x4d] // previewDeposit
-        | [0x0a, 0x28, 0xa4, 0x77] // previewWithdraw
-        | [0x4c, 0xde, 0xf3, 0x26] // previewRedeem
-        => Some(ProtocolFamily::ERC4626),
-
-        // Chainlink oracle interface
-        [0xfe, 0xaf, 0x96, 0x8c] // latestRoundData()
-        | [0x50, 0xd2, 0x5b, 0xcd] // latestAnswer()
-        | [0x9a, 0x6f, 0xc8, 0xf5] // getRoundData(uint80)
-        | [0xb5, 0xab, 0x58, 0xdc] // latestRound()
-        => Some(ProtocolFamily::Chainlink),
-
-        // Uniswap V2 AMM
-        [0x09, 0x02, 0xf1, 0xac] // getReserves()
-        | [0x02, 0x2c, 0x0d, 0x9f] // swap(uint256,uint256,address,bytes)
-        | [0xe8, 0xe3, 0x37, 0x00] // addLiquidity
-        | [0xba, 0xa2, 0xab, 0xde] // removeLiquidity
-        | [0x7f, 0xf3, 0x6a, 0xb5] // swapExactETHForTokens
-        => Some(ProtocolFamily::UniswapV2),
-
-        // Uniswap V3 AMM
-        [0x41, 0x28, 0x48, 0x01] // exactInputSingle
-        | [0xb8, 0x58, 0x18, 0x3f] // exactInput
-        | [0xdb, 0x3e, 0x21, 0x98] // exactOutputSingle
-        | [0x09, 0x49, 0x7b, 0xf3] // slot0()
-        => Some(ProtocolFamily::UniswapV3),
-
-        // Lending protocol
-        [0xc5, 0xeb, 0xea, 0xec] // borrow(uint256)
-        | [0x0e, 0x75, 0x27, 0x02] // repay(uint256)
-        | [0xf5, 0x14, 0x1a, 0x51] // liquidationCall / liquidate
-        | [0x69, 0x32, 0x8d, 0xec] // deposit (Aave v2)
-        | [0x8e, 0x19, 0x99, 0xd9] // withdraw (Aave v2)
-        => Some(ProtocolFamily::Lending),
-
-        // Flash loan entry points
-        [0xab, 0x9c, 0x4b, 0x5d] // flashLoan(address,address,uint256,bytes) Aave v2
-        | [0x5c, 0xfe, 0x9d, 0xe1] // flashLoan(address[],uint256[],uint256[],bytes) Balancer
-        | [0x92, 0x0f, 0x5c, 0x84] // executeOperation (Aave callback)
-        | [0x23, 0xe3, 0x0c, 0x8b] // uniswapV2Call
-        | [0xfa, 0x46, 0x18, 0x43] // pancakeCall
-        => Some(ProtocolFamily::FlashLoan),
-
-        // Callback receivers — execution windows mid-protocol-state
-        [0x15, 0x0b, 0x7a, 0x02] // onERC721Received
-        | [0xf2, 0x3a, 0x6e, 0x61] // onERC1155Received
-        | [0xbc, 0x19, 0x7c, 0x81] // onERC1155BatchReceived
-        | [0x0e, 0x83, 0x13, 0x52] // tokensReceived (ERC-777)
-        => Some(ProtocolFamily::Callback),
-
-        // Governance
-        [0xda, 0x35, 0xc6, 0x64] // propose(...)
-        | [0x56, 0x78, 0x13, 0x88] // queue(uint256)
-        | [0xfe, 0x0d, 0x94, 0xc1] // execute(uint256)
-        | [0xc2, 0x6a, 0x23, 0x7d] // castVote(uint256,uint8)
-        => Some(ProtocolFamily::Governance),
-
-        // Staking / rewards
-        [0xa6, 0x94, 0xfc, 0x3a] // stake(uint256)
-        | [0x2e, 0x1a, 0x7d, 0x4d] // withdraw(uint256) — also used in staking
-        | [0x3d, 0x18, 0xb9, 0x12] // getReward()
-        | [0x3c, 0x6b, 0x16, 0xab] // notifyRewardAmount(uint256)
-        => Some(ProtocolFamily::Staking),
-
-        // EIP-712 domain separator
-        [0x36, 0x44, 0xe5, 0x15] // DOMAIN_SEPARATOR()
-        => Some(ProtocolFamily::EIP712),
-
-        // Rebasing / sync
-        [0x1c, 0x40, 0xe7, 0xab] // rebase(uint256,uint256)
-        | [0xff, 0xf6, 0xca, 0xe9] // sync()
-        => Some(ProtocolFamily::Rebasing),
-
-        _ => {
-            if is_privileged_fn(fn_name) {
-                Some(ProtocolFamily::Privileged)
-            } else {
-                None
-            }
-        }
+    // Chainlink: existing detection function owns these selectors
+    if crate::evm::oracles::freshness::is_oracle_interface(selector) {
+        return Some(ProtocolFamily::Chainlink);
     }
+
+    let n = fn_name.to_lowercase();
+
+    // ERC-4626 vault — names unique enough to not require sig disambiguation
+    if matches!(
+        n.as_str(),
+        "convertoassets" | "converttoshares" | "totalassets" | "asset"
+            | "previewdeposit" | "previewmint" | "previewwithdraw" | "previewredeem"
+            | "maxdeposit" | "maxmint" | "maxwithdraw" | "maxredeem" | "redeem"
+    ) {
+        return Some(ProtocolFamily::ERC4626);
+    }
+    // deposit: ERC-4626 sig has 2 params (uint256,address); staking has 1 (uint256)
+    if n == "deposit" && fn_name.contains("address") {
+        return Some(ProtocolFamily::ERC4626);
+    }
+
+    // ERC-721
+    if matches!(n.as_str(), "ownerof" | "tokenuri" | "getapproved") {
+        return Some(ProtocolFamily::ERC721);
+    }
+
+    // ERC-1155
+    if matches!(n.as_str(), "safebatchtransferfrom" | "balanceofbatch") {
+        return Some(ProtocolFamily::ERC1155);
+    }
+
+    // ERC-20 (transfer/approve/balanceOf appear in many standards; ERC-20 is
+    // the base case — more specific standards are caught above first)
+    if matches!(n.as_str(), "transfer" | "transferfrom" | "approve" | "allowance" | "totalsupply" | "balanceof") {
+        return Some(ProtocolFamily::ERC20);
+    }
+
+    // Uniswap V2 AMM
+    if matches!(n.as_str(), "getreserves" | "token0" | "token1" | "swap" | "addliquidity" | "removeliquidity") {
+        return Some(ProtocolFamily::UniswapV2);
+    }
+
+    // Uniswap V3 AMM — function names are distinctive enough
+    if matches!(n.as_str(), "exactinputsingle" | "exactinput" | "exactoutputsingle" | "exactoutput" | "slot0") {
+        return Some(ProtocolFamily::UniswapV3);
+    }
+
+    // Lending
+    if matches!(n.as_str(), "borrow" | "repay" | "liquidate" | "liquidationcall") {
+        return Some(ProtocolFamily::Lending);
+    }
+
+    // Flash loan entry points + callbacks
+    if matches!(n.as_str(), "flashloan" | "executeoperation" | "uniswapv2call" | "pancakecall") {
+        return Some(ProtocolFamily::FlashLoan);
+    }
+
+    // Callback receivers (execution windows mid-protocol-state)
+    if matches!(n.as_str(), "onerc721received" | "onerc1155received" | "onerc1155batchreceived" | "tokensreceived") {
+        return Some(ProtocolFamily::Callback);
+    }
+
+    // Governance
+    if matches!(n.as_str(), "propose" | "castvote" | "queue") {
+        return Some(ProtocolFamily::Governance);
+    }
+
+    // Staking / rewards
+    if matches!(n.as_str(), "stake" | "unstake" | "getreward" | "notifyrewardamount" | "earned") {
+        return Some(ProtocolFamily::Staking);
+    }
+
+    // EIP-712
+    if n == "domain_separator" || n == "domainseparator" {
+        return Some(ProtocolFamily::EIP712);
+    }
+
+    // Rebasing
+    if matches!(n.as_str(), "rebase" | "sync") {
+        return Some(ProtocolFamily::Rebasing);
+    }
+
+    // Privileged: existing detection function owns this classification
+    if is_privileged_fn(fn_name) {
+        return Some(ProtocolFamily::Privileged);
+    }
+
+    None
 }
 
 impl ExploitClass {
-    /// Selectors that should appear in mutation sequences for this exploit class.
-    /// Used by the topology-weighted scheduler to concentrate fuzzing energy.
-    pub fn target_selectors(&self) -> &'static [[u8; 4]] {
+    /// Protocol families whose detected selectors should be prioritized
+    /// for this exploit class. The scheduler collects the actual selectors
+    /// the ABI loader classified into these families and boosts corpus entries
+    /// that call them — no hardcoded bytes needed.
+    pub fn target_families(&self) -> &'static [ProtocolFamily] {
         match self {
-            // vault + oracle interleave — deposit/redeem must cross latestRoundData boundary
-            ExploitClass::PriceGatedVault => &[
-                [0x6e, 0x55, 0x3f, 0x65], // deposit
-                [0xb4, 0x60, 0xaf, 0x94], // withdraw
-                [0xba, 0x08, 0x76, 0x52], // redeem
-                [0xfe, 0xaf, 0x96, 0x8c], // latestRoundData
-                [0x07, 0xa2, 0xd1, 0x3a], // convertToAssets
-            ],
-            // flash → deposit → redeem sequence
-            ExploitClass::FlashDepositDrain => &[
-                [0xab, 0x9c, 0x4b, 0x5d], // flashLoan (Aave)
-                [0x6e, 0x55, 0x3f, 0x65], // deposit
-                [0xba, 0x08, 0x76, 0x52], // redeem
-                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
-            ],
-            // flash → borrow → drain sequence
-            ExploitClass::FlashBorrowLeverage => &[
-                [0xab, 0x9c, 0x4b, 0x5d], // flashLoan
-                [0xc5, 0xeb, 0xea, 0xec], // borrow
-                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
-                [0x0e, 0x75, 0x27, 0x02], // repay
-            ],
-            // propose → warp → vote → execute sequence
-            ExploitClass::FlashGovernance => &[
-                [0xda, 0x35, 0xc6, 0x64], // propose
-                [0xfe, 0x0d, 0x94, 0xc1], // execute
-                [0xc2, 0x6a, 0x23, 0x7d], // castVote
-                [0xa9, 0x05, 0x9c, 0xbb], // transfer (governance token flash)
-            ],
-            // swap skews reserves → oracle reads distorted price
-            ExploitClass::OraclePriceManip => &[
-                [0x02, 0x2c, 0x0d, 0x9f], // swap (UniV2)
-                [0xfe, 0xaf, 0x96, 0x8c], // latestRoundData
-                [0x09, 0x02, 0xf1, 0xac], // getReserves
-                [0x41, 0x28, 0x48, 0x01], // exactInputSingle (UniV3)
-            ],
-            // safeTransferFrom triggers onERC721Received callback
-            ExploitClass::NFTReentrancy => &[
-                [0x42, 0x84, 0x2e, 0x0e], // safeTransferFrom(addr,addr,uint256)
-                [0xb8, 0x8d, 0x4f, 0xde], // safeTransferFrom(addr,addr,uint256,bytes)
-                [0x15, 0x0b, 0x7a, 0x02], // onERC721Received
-            ],
-            // stake → notify → getReward — reward math boundary
-            ExploitClass::RewardAccumulator => &[
-                [0xa6, 0x94, 0xfc, 0x3a], // stake
-                [0x3d, 0x18, 0xb9, 0x12], // getReward
-                [0x3c, 0x6b, 0x16, 0xab], // notifyRewardAmount
-                [0x2e, 0x1a, 0x7d, 0x4d], // withdraw (staking)
-            ],
-            // permit with boundary v values + transferFrom
-            ExploitClass::SignatureReplay => &[
-                [0xd5, 0x05, 0xac, 0xcf], // permit
-                [0x36, 0x44, 0xe5, 0x15], // DOMAIN_SEPARATOR
-                [0x23, 0xb8, 0x72, 0xdd], // transferFrom
-            ],
-            // privileged fn called from attacker context
-            ExploitClass::PermissionEscalation => &[
-                // selectors vary per contract — handled by FunctionOracle at runtime
-                // bias toward transfer/mint as the economic outcome
-                [0xa9, 0x05, 0x9c, 0xbb], // transfer
-                [0x40, 0xc1, 0x0f, 0x19], // mint
-            ],
-            // callback with attacker-controlled call target
-            ExploitClass::ArbitraryCallDrain => &[
-                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
-                [0x23, 0xe3, 0x0c, 0x8b], // uniswapV2Call
-                [0xa9, 0x05, 0x9c, 0xbb], // transfer
-            ],
-            // swap → sync — K-invariant pressure
-            ExploitClass::AMMInvariant => &[
-                [0x02, 0x2c, 0x0d, 0x9f], // swap
-                [0x09, 0x02, 0xf1, 0xac], // getReserves
-                [0xff, 0xf6, 0xca, 0xe9], // sync
-            ],
-            // transfer into protocol that doesn't account for fee deduction
-            ExploitClass::DeflationaryToken => &[
-                [0xa9, 0x05, 0x9c, 0xbb], // transfer
-                [0xff, 0xf6, 0xca, 0xe9], // sync
-                [0x1c, 0x40, 0xe7, 0xab], // rebase
-            ],
-            // unvalidated callback entry point
-            ExploitClass::UnprotectedCallback => &[
-                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
-                [0x15, 0x0b, 0x7a, 0x02], // onERC721Received
-                [0xf2, 0x3a, 0x6e, 0x61], // onERC1155Received
-                [0x0e, 0x83, 0x13, 0x52], // tokensReceived (ERC-777)
-            ],
+            ExploitClass::PriceGatedVault =>
+                &[ProtocolFamily::ERC4626, ProtocolFamily::Chainlink, ProtocolFamily::FlashLoan],
+            ExploitClass::FlashDepositDrain =>
+                &[ProtocolFamily::ERC4626, ProtocolFamily::FlashLoan, ProtocolFamily::Callback],
+            ExploitClass::FlashBorrowLeverage =>
+                &[ProtocolFamily::Lending, ProtocolFamily::FlashLoan, ProtocolFamily::Callback],
+            ExploitClass::FlashGovernance =>
+                &[ProtocolFamily::Governance, ProtocolFamily::FlashLoan, ProtocolFamily::ERC20],
+            ExploitClass::OraclePriceManip =>
+                &[ProtocolFamily::UniswapV2, ProtocolFamily::UniswapV3, ProtocolFamily::Chainlink],
+            ExploitClass::NFTReentrancy =>
+                &[ProtocolFamily::ERC721, ProtocolFamily::Callback],
+            ExploitClass::RewardAccumulator =>
+                &[ProtocolFamily::Staking, ProtocolFamily::ERC4626, ProtocolFamily::Lending],
+            ExploitClass::SignatureReplay =>
+                &[ProtocolFamily::EIP712, ProtocolFamily::ERC20],
+            ExploitClass::PermissionEscalation =>
+                &[ProtocolFamily::Privileged, ProtocolFamily::ERC20],
+            ExploitClass::ArbitraryCallDrain =>
+                &[ProtocolFamily::Callback, ProtocolFamily::FlashLoan, ProtocolFamily::ERC20],
+            ExploitClass::AMMInvariant =>
+                &[ProtocolFamily::UniswapV2, ProtocolFamily::UniswapV3, ProtocolFamily::Rebasing],
+            ExploitClass::DeflationaryToken =>
+                &[ProtocolFamily::Rebasing, ProtocolFamily::ERC20],
+            ExploitClass::UnprotectedCallback =>
+                &[ProtocolFamily::Callback, ProtocolFamily::FlashLoan],
         }
     }
 }
@@ -457,16 +385,46 @@ pub struct HintSet {
 impl_serdeany!(TopologyHints);
 
 impl TopologyHints {
-    pub fn from_report(report: &TopologyReport) -> Self {
+    /// Build hint sets from the topology report using selectors the ABI loader
+    /// actually found — no hardcoded bytes. Each exploit class declares which
+    /// protocol families matter; we collect the real selectors that were
+    /// classified into those families during corpus initialization.
+    pub fn from_report_and_abi(
+        report: &TopologyReport,
+        address_to_abi: &HashMap<EVMAddress, Vec<ABIConfig>>,
+    ) -> Self {
+        // Build family → selectors from already-loaded ABIs using the same
+        // classify_selector logic that produced the topology report.
+        let mut family_selectors: HashMap<ProtocolFamily, Vec<[u8; 4]>> = HashMap::new();
+        for abis in address_to_abi.values() {
+            for abi in abis {
+                if let Some(family) = classify_selector(&abi.function, &abi.function_name) {
+                    family_selectors
+                        .entry(family)
+                        .or_default()
+                        .push(abi.function);
+                }
+            }
+        }
+
         let sets = report
             .ranked
             .iter()
             .filter(|(_, confidence)| *confidence >= 70)
-            .map(|(class, confidence)| HintSet {
-                confidence: *confidence,
-                selectors: class.target_selectors().to_vec(),
+            .filter_map(|(class, confidence)| {
+                let selectors: Vec<[u8; 4]> = class
+                    .target_families()
+                    .iter()
+                    .flat_map(|f| family_selectors.get(f).cloned().unwrap_or_default())
+                    .collect();
+                if selectors.is_empty() {
+                    None // no point boosting if the target has none of these selectors
+                } else {
+                    Some(HintSet { confidence: *confidence, selectors })
+                }
             })
             .collect();
+
         TopologyHints { sets }
     }
 

@@ -229,7 +229,7 @@ pub fn evm_fuzzer(
     // can boost mutation energy toward topology-predicted exploit sequences.
     if let Some(ref report) = artifacts.topology {
         use crate::evm::topology::TopologyHints;
-        state.add_metadata(TopologyHints::from_report(report));
+        state.add_metadata(TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi));
     }
 
     let mut instance_map = ABIAddressToInstanceMap::new();
