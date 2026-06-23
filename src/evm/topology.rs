@@ -7,6 +7,8 @@
 /// detect them — before the fuzzer sends a single transaction.
 use std::collections::HashSet;
 
+use libafl_bolts::impl_serdeany;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::evm::oracles::function::is_privileged_fn;
@@ -326,5 +328,150 @@ pub fn classify_selector(selector: &[u8; 4], fn_name: &str) -> Option<ProtocolFa
                 None
             }
         }
+    }
+}
+
+impl ExploitClass {
+    /// Selectors that should appear in mutation sequences for this exploit class.
+    /// Used by the topology-weighted scheduler to concentrate fuzzing energy.
+    pub fn target_selectors(&self) -> &'static [[u8; 4]] {
+        match self {
+            // vault + oracle interleave — deposit/redeem must cross latestRoundData boundary
+            ExploitClass::PriceGatedVault => &[
+                [0x6e, 0x55, 0x3f, 0x65], // deposit
+                [0xb4, 0x60, 0xaf, 0x94], // withdraw
+                [0xba, 0x08, 0x76, 0x52], // redeem
+                [0xfe, 0xaf, 0x96, 0x8c], // latestRoundData
+                [0x07, 0xa2, 0xd1, 0x3a], // convertToAssets
+            ],
+            // flash → deposit → redeem sequence
+            ExploitClass::FlashDepositDrain => &[
+                [0xab, 0x9c, 0x4b, 0x5d], // flashLoan (Aave)
+                [0x6e, 0x55, 0x3f, 0x65], // deposit
+                [0xba, 0x08, 0x76, 0x52], // redeem
+                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
+            ],
+            // flash → borrow → drain sequence
+            ExploitClass::FlashBorrowLeverage => &[
+                [0xab, 0x9c, 0x4b, 0x5d], // flashLoan
+                [0xc5, 0xeb, 0xea, 0xec], // borrow
+                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
+                [0x0e, 0x75, 0x27, 0x02], // repay
+            ],
+            // propose → warp → vote → execute sequence
+            ExploitClass::FlashGovernance => &[
+                [0xda, 0x35, 0xc6, 0x64], // propose
+                [0xfe, 0x0d, 0x94, 0xc1], // execute
+                [0xc2, 0x6a, 0x23, 0x7d], // castVote
+                [0xa9, 0x05, 0x9c, 0xbb], // transfer (governance token flash)
+            ],
+            // swap skews reserves → oracle reads distorted price
+            ExploitClass::OraclePriceManip => &[
+                [0x02, 0x2c, 0x0d, 0x9f], // swap (UniV2)
+                [0xfe, 0xaf, 0x96, 0x8c], // latestRoundData
+                [0x09, 0x02, 0xf1, 0xac], // getReserves
+                [0x41, 0x28, 0x48, 0x01], // exactInputSingle (UniV3)
+            ],
+            // safeTransferFrom triggers onERC721Received callback
+            ExploitClass::NFTReentrancy => &[
+                [0x42, 0x84, 0x2e, 0x0e], // safeTransferFrom(addr,addr,uint256)
+                [0xb8, 0x8d, 0x4f, 0xde], // safeTransferFrom(addr,addr,uint256,bytes)
+                [0x15, 0x0b, 0x7a, 0x02], // onERC721Received
+            ],
+            // stake → notify → getReward — reward math boundary
+            ExploitClass::RewardAccumulator => &[
+                [0xa6, 0x94, 0xfc, 0x3a], // stake
+                [0x3d, 0x18, 0xb9, 0x12], // getReward
+                [0x3c, 0x6b, 0x16, 0xab], // notifyRewardAmount
+                [0x2e, 0x1a, 0x7d, 0x4d], // withdraw (staking)
+            ],
+            // permit with boundary v values + transferFrom
+            ExploitClass::SignatureReplay => &[
+                [0xd5, 0x05, 0xac, 0xcf], // permit
+                [0x36, 0x44, 0xe5, 0x15], // DOMAIN_SEPARATOR
+                [0x23, 0xb8, 0x72, 0xdd], // transferFrom
+            ],
+            // privileged fn called from attacker context
+            ExploitClass::PermissionEscalation => &[
+                // selectors vary per contract — handled by FunctionOracle at runtime
+                // bias toward transfer/mint as the economic outcome
+                [0xa9, 0x05, 0x9c, 0xbb], // transfer
+                [0x40, 0xc1, 0x0f, 0x19], // mint
+            ],
+            // callback with attacker-controlled call target
+            ExploitClass::ArbitraryCallDrain => &[
+                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
+                [0x23, 0xe3, 0x0c, 0x8b], // uniswapV2Call
+                [0xa9, 0x05, 0x9c, 0xbb], // transfer
+            ],
+            // swap → sync — K-invariant pressure
+            ExploitClass::AMMInvariant => &[
+                [0x02, 0x2c, 0x0d, 0x9f], // swap
+                [0x09, 0x02, 0xf1, 0xac], // getReserves
+                [0xff, 0xf6, 0xca, 0xe9], // sync
+            ],
+            // transfer into protocol that doesn't account for fee deduction
+            ExploitClass::DeflationaryToken => &[
+                [0xa9, 0x05, 0x9c, 0xbb], // transfer
+                [0xff, 0xf6, 0xca, 0xe9], // sync
+                [0x1c, 0x40, 0xe7, 0xab], // rebase
+            ],
+            // unvalidated callback entry point
+            ExploitClass::UnprotectedCallback => &[
+                [0x92, 0x0f, 0x5c, 0x84], // executeOperation
+                [0x15, 0x0b, 0x7a, 0x02], // onERC721Received
+                [0xf2, 0x3a, 0x6e, 0x61], // onERC1155Received
+                [0x0e, 0x83, 0x13, 0x52], // tokensReceived (ERC-777)
+            ],
+        }
+    }
+}
+
+/// Serializable topology hints stored as state metadata.
+/// Produced from `TopologyReport` and consumed by `CorpusPowerABITestcaseScore`
+/// to boost mutation energy toward topology-predicted exploit sequences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    any(not(feature = "serdeany_autoreg"), miri),
+    allow(clippy::unsafe_derive_deserialize)
+)]
+pub struct TopologyHints {
+    /// Hint sets sorted descending by confidence.
+    /// Each entry: (flat selector list, confidence 0-100).
+    /// Flat because `[u8; 4]` doesn't impl Serialize cleanly as nested vec.
+    pub sets: Vec<HintSet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HintSet {
+    pub confidence: u8,
+    /// 4-byte selectors that should appear together in exploit sequences.
+    /// Stored as Vec<[u8; 4]> — each inner array is one selector.
+    pub selectors: Vec<[u8; 4]>,
+}
+
+impl_serdeany!(TopologyHints);
+
+impl TopologyHints {
+    pub fn from_report(report: &TopologyReport) -> Self {
+        let sets = report
+            .ranked
+            .iter()
+            .filter(|(_, confidence)| *confidence >= 70)
+            .map(|(class, confidence)| HintSet {
+                confidence: *confidence,
+                selectors: class.target_selectors().to_vec(),
+            })
+            .collect();
+        TopologyHints { sets }
+    }
+
+    /// Returns the highest confidence hint set that contains `selector`,
+    /// or `None` if no hint set matches.
+    pub fn lookup(&self, selector: &[u8; 4]) -> Option<u8> {
+        self.sets
+            .iter()
+            .find(|h| h.selectors.contains(selector))
+            .map(|h| h.confidence)
     }
 }

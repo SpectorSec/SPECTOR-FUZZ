@@ -225,6 +225,13 @@ pub fn evm_fuzzer(
 
     let mut artifacts = corpus_initializer.initialize(&mut config.contract_loader.clone());
 
+    // Store topology hints in state metadata so CorpusPowerABITestcaseScore
+    // can boost mutation energy toward topology-predicted exploit sequences.
+    if let Some(ref report) = artifacts.topology {
+        use crate::evm::topology::TopologyHints;
+        state.add_metadata(TopologyHints::from_report(report));
+    }
+
     let mut instance_map = ABIAddressToInstanceMap::new();
     artifacts.address_to_abi_object.iter().for_each(|(addr, abi)| {
         instance_map.map.insert(*addr, abi.clone());
