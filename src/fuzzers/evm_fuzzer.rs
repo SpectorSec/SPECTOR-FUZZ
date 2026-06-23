@@ -25,7 +25,7 @@ use crate::{
         contract_utils::FIX_DEPLOYER,
         corpus_initializer::EVMCorpusInitializer,
         cov_stage::CoverageStage,
-        feedbacks::Sha3WrappedFeedback,
+        feedbacks::{Sha3WrappedFeedback, TokenBalanceFeedback},
         host::{
             FuzzHost,
             ACTIVE_MATCH_EXT_CALL,
@@ -343,7 +343,16 @@ pub fn evm_fuzzer(
 
     #[cfg(feature = "deployer_is_attacker")]
     state.add_caller(&deployer);
-    let infant_feedback = CmpFeedback::new(cmps, infant_scheduler.clone(), evm_executor_ref.clone());
+    let cmp_feedback = CmpFeedback::new(cmps, infant_scheduler.clone(), evm_executor_ref.clone());
+
+    // Build attacker set for TokenBalanceFeedback from callers_pool.
+    let attackers: std::collections::HashSet<EVMAddress> =
+        state.callers_pool.iter().cloned().collect();
+    let balance_feedback = TokenBalanceFeedback::new(attackers, infant_scheduler.clone());
+
+    // Combine: any new coverage ceiling OR any new fund-extraction ceiling
+    // makes the state interesting and gets added to infant corpus.
+    let infant_feedback = libafl::feedbacks::EagerOrFeedback::new(cmp_feedback, balance_feedback);
     let infant_result_feedback = DataflowFeedback::new(reads, writes);
 
     let mut oracles = config.oracle;

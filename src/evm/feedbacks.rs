@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::{HashMap, HashSet},
     fmt::{Debug, Formatter},
     ops::Deref,
     rc::Rc,
@@ -21,7 +22,14 @@ use crate::{
     evm::{input::ConciseEVMInput, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
     generic_vm::vm_state::VMStateT,
     input::VMInputT,
+    r#const::INFANT_STATE_INITIAL_VOTES,
+    scheduler::HasVote,
+    state::{HasExecutionResult, HasInfantStateState, InfantStateState},
+    evm::{types::EVMAddress, vm::EVMState},
 };
+
+use revm_primitives::ruint::Uint;
+type EVMU256 = Uint<256, 4>;
 
 /// A wrapper around a feedback that also performs sha3 taint analysis
 /// when the feedback is interesting.
@@ -147,5 +155,117 @@ where
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         todo!()
+    }
+}
+
+/// TokenBalanceFeedback — the fund-loss gradient signal.
+///
+/// Tracks the maximum ERC-20 value extracted to any attacker address in a
+/// single execution, per token. When a new maximum is reached the state is
+/// marked interesting and the infant-state scheduler votes heavily for that VM
+/// snapshot, causing the fuzzer to keep climbing until extraction plateaus.
+///
+/// This is NOT a bug detector — that's OracleFeedback. This is the gravity
+/// that pulls every oracle waypoint (reentrancy, invariant, approval) toward
+/// maximum fund extraction. The fuzzer stops when best_inflow stops growing.
+/// That ceiling is the bounty number.
+pub struct TokenBalanceFeedback<SC> {
+    /// Attacker-controlled addresses whose inflows we track.
+    attackers: HashSet<EVMAddress>,
+    /// Per-token maximum total attacker inflow seen in a single execution.
+    /// Monotonically increasing — a new max means a new interesting state.
+    best_inflow: HashMap<EVMAddress, EVMU256>,
+    scheduler: SC,
+}
+
+impl<SC> TokenBalanceFeedback<SC> {
+    pub fn new(attackers: HashSet<EVMAddress>, scheduler: SC) -> Self {
+        Self {
+            attackers,
+            best_inflow: HashMap::new(),
+            scheduler,
+        }
+    }
+}
+
+impl<SC> Debug for TokenBalanceFeedback<SC> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBalanceFeedback")
+            .field("tokens_tracked", &self.best_inflow.len())
+            .finish()
+    }
+}
+
+impl<SC> Named for TokenBalanceFeedback<SC> {
+    fn name(&self) -> &str {
+        "TokenBalanceFeedback"
+    }
+}
+
+impl<SC> Feedback<EVMFuzzState> for TokenBalanceFeedback<SC>
+where
+    SC: Scheduler<State = InfantStateState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>>
+        + HasVote<InfantStateState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>>,
+{
+    fn init_state(&mut self, _state: &mut EVMFuzzState) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_interesting<EMI, OT>(
+        &mut self,
+        state: &mut EVMFuzzState,
+        _manager: &mut EMI,
+        input: &EVMInput,
+        _observers: &OT,
+        _exit_kind: &ExitKind,
+    ) -> Result<bool, Error>
+    where
+        EMI: EventFirer<State = EVMFuzzState>,
+        OT: ObserversTuple<EVMFuzzState>,
+    {
+        let result = state.get_execution_result();
+        if result.reverted {
+            return Ok(false);
+        }
+
+        let transfers = result.new_state.state.erc20_transfers.clone();
+        if transfers.is_empty() {
+            return Ok(false);
+        }
+
+        // Sum total inflow to attacker addresses per token in this execution.
+        let mut inflow_by_token: HashMap<EVMAddress, EVMU256> = HashMap::new();
+        for (token, _from, to, value) in &transfers {
+            if self.attackers.contains(to) && *value > EVMU256::ZERO {
+                *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;
+            }
+        }
+
+        if inflow_by_token.is_empty() {
+            return Ok(false);
+        }
+
+        // Check if any token hit a new extraction ceiling.
+        let mut new_ceiling = false;
+        for (token, inflow) in &inflow_by_token {
+            let best = self.best_inflow.entry(*token).or_insert(EVMU256::ZERO);
+            if inflow > best {
+                *best = *inflow;
+                new_ceiling = true;
+            }
+        }
+
+        if new_ceiling {
+            // Vote aggressively for this VM snapshot so the fuzzer prioritizes
+            // exploring further from this state. 5x base votes — profitable
+            // states deserve far more attention than coverage-only states.
+            self.scheduler.vote(
+                state.get_infant_state_state(),
+                input.get_state_idx(),
+                INFANT_STATE_INITIAL_VOTES * 5,
+            );
+        }
+
+        Ok(new_ceiling)
     }
 }
