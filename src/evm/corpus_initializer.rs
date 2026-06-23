@@ -96,6 +96,9 @@ pub struct EVMInitializationArtifacts {
     /// Contracts that expose a Chainlink-style oracle interface (latestRoundData).
     /// Used to activate the FreshnessOracle.
     pub oracle_contracts: Vec<EVMAddress>,
+    /// Topology intelligence report — ranked exploit classes derived from
+    /// protocol family co-occurrence across all target contracts.
+    pub topology: Option<crate::evm::topology::TopologyReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -333,6 +336,7 @@ where
             eip712_contracts: Vec::new(),
             privileged_functions: Vec::new(),
             oracle_contracts: Vec::new(),
+            topology: None,
         };
 
         self.state.metadata_map_mut().insert(EnvMetadata {
@@ -552,6 +556,27 @@ where
                         abi.function_name.clone(),
                     ));
                 }
+            }
+        }
+
+        // Topology intelligence: collect all protocol families detected across
+        // every target contract and derive ranked exploit classes from co-occurrence.
+        {
+            use std::collections::HashSet as FamilySet;
+            use crate::evm::topology::{classify_selector, TopologyReport};
+
+            let mut families = FamilySet::new();
+            for (_, abis) in &artifacts.address_to_abi {
+                for abi in abis {
+                    if let Some(family) = classify_selector(&abi.function, &abi.function_name) {
+                        families.insert(family);
+                    }
+                }
+            }
+            if !families.is_empty() {
+                let report = TopologyReport::analyze(families);
+                report.log();
+                artifacts.topology = Some(report);
             }
         }
 
