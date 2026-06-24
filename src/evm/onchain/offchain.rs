@@ -281,6 +281,10 @@ impl ChainConfig for OffChainConfig {
         self.balance_cache.get(&(address, token)).cloned().unwrap_or_default()
     }
 
+    fn get_contract_slot(&mut self, _address: EVMAddress, _slot: EVMU256) -> EVMU256 {
+        EVMU256::ZERO
+    }
+
     fn get_weth(&self) -> String {
         PRESET_WETH.to_string()
     }

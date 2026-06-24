@@ -21,6 +21,7 @@ pub mod oracles;
 pub mod presets;
 pub mod producers;
 pub mod scheduler;
+pub mod slot_detector;
 pub mod solution;
 pub mod srcmap;
 pub mod tokens;
@@ -523,23 +524,35 @@ pub fn evm_main(mut args: EvmArgs) {
     let is_onchain = args.chain_type.is_some() || args.onchain_url.is_some();
 
     let mut onchain = if is_onchain {
-        match args.chain_type {
-            Some(chain_str) => {
-                let chain = Chain::from_str(&chain_str).expect("Invalid chain type");
-                let block_number = args.onchain_block_number.unwrap_or(0);
+        let block_number = args.onchain_block_number.unwrap_or(0);
+        let chain_type = args.chain_type.as_ref().map(|s| s.as_str());
+        let custom_url = args.onchain_url.as_ref().map(|s| s.as_str());
+        match (chain_type, custom_url) {
+            // Custom URL overrides chain default even when -c is specified.
+            (_, Some(url)) => Some(OnChainConfig::new_raw(
+                url.to_string(),
+                args.onchain_chain_id.unwrap_or_else(|| {
+                    chain_type
+                        .and_then(|c| Chain::from_str(c).ok())
+                        .unwrap_or(Chain::ETH)
+                        .get_chain_id()
+                }),
+                block_number,
+                args.onchain_explorer_url.clone().unwrap_or_else(|| {
+                    chain_type
+                        .and_then(|c| Chain::from_str(c).ok())
+                        .unwrap_or(Chain::ETH)
+                        .get_chain_etherscan_base()
+                }),
+                args.onchain_chain_name.clone().unwrap_or_else(|| {
+                    chain_type.unwrap_or("eth").to_string()
+                }),
+            )),
+            (Some(chain_str), None) => {
+                let chain = Chain::from_str(chain_str).expect("Invalid chain type");
                 Some(OnChainConfig::new(chain, block_number))
             }
-            None => Some(OnChainConfig::new_raw(
-                args.onchain_url
-                    .expect("You need to either specify chain type or chain rpc"),
-                args.onchain_chain_id
-                    .expect("You need to either specify chain type or chain id"),
-                args.onchain_block_number.unwrap_or(0),
-                args.onchain_explorer_url
-                    .expect("You need to either specify chain type or block explorer url"),
-                args.onchain_chain_name
-                    .expect("You need to either specify chain type or chain name"),
-            )),
+            (None, None) => unreachable!(), // is_onchain guarantees at least one is set
         }
     } else {
         None
@@ -763,7 +776,7 @@ pub fn evm_main(mut args: EvmArgs) {
 
     contract_loader.force_abi(force_abis);
 
-    let config = Config {
+    let mut config = Config {
         contract_loader,
         only_fuzz: if !args.only_fuzz.is_empty() {
             args.only_fuzz
@@ -849,6 +862,18 @@ pub fn evm_main(mut args: EvmArgs) {
     let abis_json = format!("{}/abis.json", args.work_dir.clone().as_str());
 
     utils::try_write_file(&abis_json, &json_str, true).unwrap();
+
+    // Pre-detect ERC-20 balance storage slots for all known contracts.
+    // This ensures seed_erc20_balances writes to the correct slot even for
+    // non-OpenZeppelin tokens (e.g., DAI's DS-Token uses slot 8).
+    if let Some(ref mut oc) = config.onchain {
+        use onchain::ChainConfig;
+        use slot_detector::detect_balance_slot;
+        for contract_info in &config.contract_loader.contracts {
+            detect_balance_slot(contract_info.deployed_address, oc as &mut dyn ChainConfig);
+        }
+    }
+
     evm_fuzzer(config, &mut state)
 }
 

@@ -1,0 +1,147 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crypto::{digest::Digest, sha3::Sha3};
+use lazy_static::lazy_static;
+
+use super::onchain::ChainConfig;
+use super::types::{EVMAddress, EVMU256};
+use tracing::info;
+
+/// Cache: token address → detected balance mapping slot number.
+/// Populated once on first access, reused across all callers.
+lazy_static! {
+    static ref BALANCE_SLOT_CACHE: Mutex<HashMap<EVMAddress, u64>> = Mutex::new(HashMap::new());
+}
+
+/// Well-known addresses that hold diverse tokens and have non-zero balances.
+/// Using a variety of protocols ensures coverage for most tokens.
+const WHALES: &[EVMAddress] = &[
+    // MakerDAO Pause Proxy (holds DAI, MKR, USDC, etc.)
+    evm_addr("0xBE8E3e3618f7474F8cB1d074A26afFef007E46FB"),
+    // Aave Collector (AAVE, stkAAVE)
+    evm_addr("0x464C71f6c2F760DdA6093dCB91C24c39e5d6e18c"),
+    // Binance 14 (majority of BEP-20/ERC-20)
+    evm_addr("0x28C6c06298d514Db089934071355E5743bf21d60"),
+    // Bitfinex multisig
+    evm_addr("0x742d35Cc6634C0532925a3b844Bc454e4438f44e"),
+    // Ethereum Foundation (holds diverse tokens)
+    evm_addr("0xde0B295669a9FD93d5F28D9Ec85E40f4cb697BAe"),
+    // Uniswap V3: Universal Router
+    evm_addr("0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"),
+    // Compound Timelock (COMP, cTokens)
+    evm_addr("0x6d903f6003cca6255D85CcA4D3B5E5146dC33925"),
+    // Curve Treasury
+    evm_addr("0x99aE10F7D7f41e5aE8cE3ebacC7e5A51bE2B8e1B"),
+    // Arbitrum Bridge (holds various ETH L2 tokens)
+    evm_addr("0xCEe284F754E854890e311e3280b767F80797180d"),
+    // Gnosis Safe (accumulates fee tokens)
+    evm_addr("0x0D0707963952f2fBA59dD06f2b425ace40b492Fe"),
+];
+
+/// Helper to parse a hex address at compile time.
+const fn evm_addr(s: &str) -> EVMAddress {
+    let bytes = s.as_bytes();
+    assert!(bytes.len() == 42 && bytes[0] == b'0' && bytes[1] == b'x');
+    let mut addr = [0u8; 20];
+    let mut i = 0;
+    while i < 20 {
+        let hi = hex_val(bytes[2 + i * 2]);
+        let lo = hex_val(bytes[2 + i * 2 + 1]);
+        addr[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    EVMAddress::new(addr)
+}
+
+const fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Compute the storage slot for a Solidity mapping at `base_slot`:
+/// `slot = keccak256(abi.encode(key, base_slot))`
+/// which is `keccak256(leftPad(key, 32) ++ leftPad(base_slot, 32))`.
+pub fn compute_mapping_storage_slot(key: EVMAddress, base_slot: EVMU256) -> EVMU256 {
+    let mut input = [0u8; 64];
+    // key occupies the last 20 bytes of the first 32-byte word
+    input[12..32].copy_from_slice(key.as_slice());
+    // base_slot occupies the second 32-byte word
+    let slot_bytes = base_slot.to_be_bytes::<32>();
+    input[32..64].copy_from_slice(&slot_bytes);
+
+    let mut hasher = Sha3::keccak256();
+    hasher.input(&input);
+    let mut out = [0u8; 32];
+    hasher.result(&mut out);
+    EVMU256::from_be_bytes(out)
+}
+
+/// Read the cached balance slot for a token (returns None if not yet detected).
+pub fn get_cached_balance_slot(token: &EVMAddress) -> Option<u64> {
+    BALANCE_SLOT_CACHE.lock().unwrap().get(token).copied()
+}
+
+/// Detect which storage slot a token uses for its balance mapping
+/// by cross-referencing known whale addresses against on-chain storage.
+///
+/// Algorithm:
+/// 1. Find a whale with a non-zero balance of `token`
+/// 2. Scan slots 0..20 for that whale's storage
+/// 3. Where `stored_value == expected_balance`, we found the slot
+///
+/// Results are cached globally so each token is detected once per session.
+pub fn detect_balance_slot(token: EVMAddress, chain: &mut dyn ChainConfig) -> u64 {
+    // Check cache first
+    if let Some(slot) = BALANCE_SLOT_CACHE.lock().unwrap().get(&token) {
+        return *slot;
+    }
+
+    // Find a whale with a non-zero balance
+    let mut candidate = None;
+    for &whale in WHALES {
+        let balance = chain.get_token_balance(token, whale);
+        if balance > EVMU256::ZERO {
+            candidate = Some((whale, balance));
+            break;
+        }
+    }
+
+    let (whale, expected_balance) = match candidate {
+        Some(v) => v,
+        None => {
+            info!(
+                "slot_detector: no whale found for token {:?}, defaulting to slot 0",
+                token
+            );
+            return 0;
+        }
+    };
+
+    // Scan slots 0..20 to find the balance mapping
+    for slot_num in 0..=20 {
+        let slot_key = EVMU256::from(slot_num);
+        let raw = compute_mapping_storage_slot(whale, slot_key);
+        let stored = chain.get_contract_slot(token, raw);
+        if stored == expected_balance {
+            info!(
+                "slot_detector: token {:?} balance slot = {slot_num} (matched whale {whale:?})",
+                token,
+            );
+            BALANCE_SLOT_CACHE.lock().unwrap().insert(token, slot_num);
+            return slot_num;
+        }
+    }
+
+    // Fallback to slot 0
+    info!(
+        "slot_detector: balance slot not found for token {:?}, defaulting to slot 0",
+        token
+    );
+    BALANCE_SLOT_CACHE.lock().unwrap().insert(token, 0);
+    0
+}

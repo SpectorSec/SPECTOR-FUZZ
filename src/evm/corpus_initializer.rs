@@ -25,7 +25,7 @@ use crate::evm::types::Env;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
-use super::{scheduler::ABIScheduler, srcmap::SOURCE_MAP_PROVIDER};
+use super::{scheduler::ABIScheduler, slot_detector, srcmap::SOURCE_MAP_PROVIDER};
 /// Utilities to initialize the corpus
 /// Add all potential calls with default args to the corpus
 use crate::evm::abi::{get_abi_type_boxed, BoxedABI};
@@ -129,28 +129,16 @@ impl ABIMap {
     }
 }
 
-/// Pre-seed ERC-20 token balances for all fuzzer callers by writing directly
-/// to the standard balance mapping slot (slot 0). This ensures the fuzzer can
-/// interact with the token immediately without needing a successful borrow swap.
+/// Pre-seed ERC-20 token balances for all fuzzer callers. Uses the
+/// pre-detected balance slot (from slot_detector) or falls back to 0.
 pub fn seed_erc20_balances(evmstate: &mut EVMState, token: EVMAddress, callers: &[EVMAddress]) {
-    use crypto::{digest::Digest, sha3::Sha3};
+    let base_slot = slot_detector::get_cached_balance_slot(&token).unwrap_or(0);
 
     // 1M tokens with 18 decimals — enough for any DeFi interaction
     let amount = EVMU256::from(1_000_000_000_000_000_000_000_000u128);
 
     for caller in callers {
-        // Standard ERC-20 balance slot (mapping at position 0):
-        // slot = keccak256(abi.encode(uint256(uint160(user)), uint256(0)))
-        //       = keccak256(leftPad(user, 32) ++ leftPad(0, 32))
-        let mut input = [0u8; 64];
-        input[12..32].copy_from_slice(caller.as_slice());
-
-        let mut hasher = Sha3::keccak256();
-        hasher.input(&input);
-        let mut out = [0u8; 32];
-        hasher.result(&mut out);
-        let slot = EVMU256::from_be_bytes(out);
-
+        let slot = slot_detector::compute_mapping_storage_slot(*caller, EVMU256::from(base_slot));
         evmstate.sstore(token, slot, amount);
     }
 }

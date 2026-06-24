@@ -58,6 +58,7 @@ pub trait ChainConfig {
     fn get_contract_code_analyzed(&mut self, address: EVMAddress, force_cache: bool) -> Bytecode;
     fn get_v3_fee(&mut self, address: EVMAddress) -> u32;
     fn get_token_balance(&mut self, token: EVMAddress, address: EVMAddress) -> EVMU256;
+    fn get_contract_slot(&mut self, address: EVMAddress, slot: EVMU256) -> EVMU256;
     fn get_weth(&self) -> String;
     fn get_pegged_token(&self) -> HashMap<String, String>;
 }

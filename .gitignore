@@ -8,3 +8,4 @@ corpus
 .idea
 .vscode
 *.code-workspace
+/findings

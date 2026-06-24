@@ -407,6 +407,10 @@ impl ChainConfig for OnChainConfig {
         self.get_token_balance(token, address)
     }
 
+    fn get_contract_slot(&mut self, address: EVMAddress, slot: EVMU256) -> EVMU256 {
+        self.get_contract_slot(address, slot, false)
+    }
+
     fn get_weth(&self) -> String {
         let pegged_token = self.get_pegged_token();
 
