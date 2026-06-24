@@ -1032,6 +1032,33 @@ where
             return (ret, input.return_memory_offset.clone(), output);
         }
 
+        // Check if the target address is a caller (attacker) address
+        if state.has_caller(&input.target_address) {
+            let mut ret = vec![0u8; 32];
+            match hash.as_slice() {
+                [0x15, 0x0b, 0x7a, 0x02] => { // onERC721Received
+                    ret[0..4].copy_from_slice(&[0x15, 0x0b, 0x7a, 0x02]);
+                    return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::from(ret));
+                }
+                [0xf2, 0x42, 0x43, 0x2a] => { // onERC1155Received
+                    ret[0..4].copy_from_slice(&[0xf2, 0x42, 0x43, 0x2a]);
+                    return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::from(ret));
+                }
+                [0xbc, 0x19, 0x7c, 0x81] => { // onERC1155BatchReceived
+                    ret[0..4].copy_from_slice(&[0xbc, 0x19, 0x7c, 0x81]);
+                    return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::from(ret));
+                }
+                [0x1a, 0x02, 0xb5, 0xe8] => { // executeOperation (Aave flashloan)
+                    ret[31] = 1;
+                    return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::from(ret));
+                }
+                _ => {
+                    // For other functions on caller/attacker addresses, return success with empty bytes
+                    return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::new());
+                }
+            }
+        }
+
         // transfer txn and fallback provided
         if hash == [0x00, 0x00, 0x00, 0x00] {
             return (InstructionResult::Return, input.return_memory_offset.clone(), Bytes::new());
