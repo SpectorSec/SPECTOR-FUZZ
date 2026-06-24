@@ -21,7 +21,7 @@ use crate::{
 
 pub struct IERC20OracleFlashloan {
     pub balance_of: Vec<u8>,
-    pub known_tokens: HashMap<EVMAddress, TokenContext>,
+    pub known_tokens: RefCell<HashMap<EVMAddress, TokenContext>>,
     pub known_pair_reserve_slot: HashMap<EVMAddress, EVMU256>,
     pub erc20_producer: Rc<RefCell<ERC20Producer>>,
 }
@@ -30,7 +30,7 @@ impl IERC20OracleFlashloan {
     pub fn new(erc20_producer: Rc<RefCell<ERC20Producer>>) -> Self {
         Self {
             balance_of: hex::decode("70a08231").unwrap(),
-            known_tokens: HashMap::new(),
+            known_tokens: RefCell::new(HashMap::new()),
             known_pair_reserve_slot: HashMap::new(),
             erc20_producer,
         }
@@ -41,7 +41,7 @@ impl IERC20OracleFlashloan {
         unsafe {
             CAN_LIQUIDATE |= can_liquidate;
         }
-        self.known_tokens.insert(token, token_ctx);
+        self.known_tokens.borrow_mut().insert(token, token_ctx);
     }
 
     pub fn register_pair_reserve_slot(&mut self, pair: EVMAddress, slot: EVMU256) {
@@ -91,13 +91,28 @@ impl
             let mut liquidations_earned = Vec::new();
 
             for ((caller, token), new_balance) in self.erc20_producer.deref().borrow().balances.iter() {
-                // println!("token: {:?}, user: {:?}, new_balance: {:?}", token, caller,
-                // new_balance);
-                if *new_balance > EVMU256::ZERO &&
-                    let Some(token_info) = self.known_tokens.get(token)
-                {
-                    let liq_amount = *new_balance * liquidation_percent / EVMU256::from(10);
-                    liquidations_earned.push((*caller, token_info, liq_amount));
+                if *new_balance > EVMU256::ZERO {
+                    let mut has_token = self.known_tokens.borrow().contains_key(token);
+                    if !has_token {
+                        let flashloan_mid_opt = ctx.executor.deref().borrow().host.flashloan_middleware.clone();
+                        if let Some(flashloan_mid) = flashloan_mid_opt {
+                            let mut mid = flashloan_mid.borrow_mut();
+                            if let Some(token_ctx) = mid.get_token_context(*token) {
+                                let can_liquidate = !token_ctx.swaps.is_empty();
+                                unsafe {
+                                    CAN_LIQUIDATE |= can_liquidate;
+                                }
+                                self.known_tokens.borrow_mut().insert(*token, token_ctx);
+                                has_token = true;
+                            }
+                        }
+                    }
+                    if has_token {
+                        let known_tokens = self.known_tokens.borrow();
+                        let token_info = known_tokens.get(token).unwrap();
+                        let liq_amount = *new_balance * liquidation_percent / EVMU256::from(10);
+                        liquidations_earned.push((*caller, token_info.clone(), liq_amount));
+                    }
                 }
             }
 

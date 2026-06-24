@@ -133,7 +133,7 @@ impl Flashloan {
         }
     }
 
-    fn get_token_context(&mut self, addr: EVMAddress) -> Option<TokenContext> {
+    pub fn get_token_context(&mut self, addr: EVMAddress) -> Option<TokenContext> {
         self.chain_cfg.as_mut().map(|config| fetch_uniswap_path(config, addr))
     }
 

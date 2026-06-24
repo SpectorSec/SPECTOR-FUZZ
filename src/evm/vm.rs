@@ -62,6 +62,7 @@ macro_rules! get_token_ctx {
             .deref()
             .borrow()
             .known_tokens
+            .borrow()
             .get(&$token)
             .expect(format!("unknown token : {:?}", $token).as_str())
     };
@@ -1023,6 +1024,7 @@ where
                     let flashloan_oracle = flashloan_mid.flashloan_oracle.deref().borrow();
                     flashloan_oracle
                         .known_tokens
+                        .borrow()
                         .get(&token)
                         .unwrap_or_else(|| panic!("unknown token : {:?}", token))
                         .clone()

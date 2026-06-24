@@ -934,10 +934,14 @@ impl EVMInput {
         }
         add_mutator!(gas_price);
         add_mutator!(basefee);
-        add_mutator!(timestamp);
+        if ap.timestamp || state.rand_mut().below(100) < 20 {
+            mutators.push(&EVMInput::timestamp as &dyn Fn(&mut EVMInput, &mut S) -> MutationResult);
+        }
         add_mutator!(coinbase);
         add_mutator!(gas_limit);
-        add_mutator!(number);
+        if ap.number || state.rand_mut().below(100) < 20 {
+            mutators.push(&EVMInput::number as &dyn Fn(&mut EVMInput, &mut S) -> MutationResult);
+        }
         // add_mutator!(chain_id);
         add_mutator!(prevrandao);
 
