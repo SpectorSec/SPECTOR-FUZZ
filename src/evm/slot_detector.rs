@@ -98,6 +98,21 @@ pub fn compute_mapping_storage_slot(key: EVMAddress, base_slot: EVMU256) -> EVMU
     EVMU256::from_be_bytes(out)
 }
 
+pub fn compute_vyper_mapping_storage_slot(key: EVMAddress, base_slot: EVMU256) -> EVMU256 {
+    let mut input = [0u8; 64];
+    // base_slot occupies the first 32-byte word
+    let slot_bytes = base_slot.to_be_bytes::<32>();
+    input[0..32].copy_from_slice(&slot_bytes);
+    // key occupies the last 20 bytes of the second 32-byte word
+    input[44..64].copy_from_slice(key.as_slice());
+
+    let mut hasher = Sha3::keccak256();
+    hasher.input(&input);
+    let mut out = [0u8; 32];
+    hasher.result(&mut out);
+    EVMU256::from_be_bytes(out)
+}
+
 /// Read the cached balance slot for a token (returns None if not yet detected).
 pub fn get_cached_balance_slot(token: &EVMAddress) -> Option<u64> {
     BALANCE_SLOT_CACHE.lock().unwrap().get(token).copied()
@@ -150,7 +165,44 @@ pub fn detect_balance_slot(token: EVMAddress, chain: &mut dyn ChainConfig) -> u6
         return 0;
     }
 
-    // For each candidate slot, check if ≥2 whales agree.
+    // Try Access List Slot Detection first
+    for &(whale, _) in &candidates {
+        let mut call_data = vec![0x70, 0xa0, 0x82, 0x31]; // balanceOf(address) selector
+        let mut pad_address = [0u8; 32];
+        pad_address[12..32].copy_from_slice(whale.as_slice());
+        call_data.extend_from_slice(&pad_address);
+
+        let accessed_slots = chain.get_access_list(whale, token, call_data);
+        if !accessed_slots.is_empty() {
+            for slot_num in 0..=50 {
+                let slot_key = EVMU256::from(slot_num);
+                
+                // Solidity mapping check
+                let solidity_slot = compute_mapping_storage_slot(whale, slot_key);
+                if accessed_slots.contains(&solidity_slot) {
+                    info!(
+                        "slot_detector: token {:?} balance slot = {slot_num} (detected via Solidity access list)",
+                        token
+                    );
+                    BALANCE_SLOT_CACHE.lock().unwrap().insert(token, slot_num);
+                    return slot_num;
+                }
+
+                // Vyper mapping check
+                let vyper_slot = compute_vyper_mapping_storage_slot(whale, slot_key);
+                if accessed_slots.contains(&vyper_slot) {
+                    info!(
+                        "slot_detector: token {:?} balance slot = {slot_num} (detected via Vyper access list)",
+                        token
+                    );
+                    BALANCE_SLOT_CACHE.lock().unwrap().insert(token, slot_num);
+                    return slot_num;
+                }
+            }
+        }
+    }
+
+    // Fallback: For each candidate slot, check if ≥2 whales agree.
     // This avoids false positives from coincidental single-whale matches.
     for slot_num in 0..=20 {
         let slot_key = EVMU256::from(slot_num);
@@ -164,7 +216,7 @@ pub fn detect_balance_slot(token: EVMAddress, chain: &mut dyn ChainConfig) -> u6
         }
         if matches >= 2 {
             info!(
-                "slot_detector: token {:?} balance slot = {slot_num} (matched {}/{} whales)",
+                "slot_detector: token {:?} balance slot = {slot_num} (matched {}/{} whales via brute-force fallback)",
                 token, matches, candidates.len()
             );
             BALANCE_SLOT_CACHE.lock().unwrap().insert(token, slot_num);
@@ -180,3 +232,32 @@ pub fn detect_balance_slot(token: EVMAddress, chain: &mut dyn ChainConfig) -> u6
     BALANCE_SLOT_CACHE.lock().unwrap().insert(token, 0);
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evm::onchain::endpoints::OnChainConfig;
+    use crate::evm::onchain::ChainConfig;
+    use crate::evm::types::EVMAddress;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_access_list_slot_detection() {
+        // Initialize OnChainConfig with a public RPC to verify.
+        let rpc_url = "https://eth-mainnet.g.alchemy.com/v2/ZudLM8AAn0OCfiE5JvhAL".to_string();
+        let mut config = OnChainConfig::new_raw(
+            rpc_url,
+            1,
+            17000000, // fork at block 17,000,000
+            "".to_string(),
+            "eth".to_string(),
+        );
+
+        // LINK token address (Not in KNOWN_SLOTS, expected slot = 1)
+        let link = EVMAddress::from_str("0x514910771AF9Ca656af840dff83E8264ECF986CA").unwrap();
+        
+        let detected = detect_balance_slot(link, &mut config as &mut dyn ChainConfig);
+        assert_eq!(detected, 1);
+    }
+}
+

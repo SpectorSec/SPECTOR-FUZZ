@@ -1,6 +1,17 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in this repository.
+## Core Project Goal & Constraints
+*   **Primary Objective**: Economic exploit detection (specifically **theft or direct loss of funds** rather than simple code correctness/reverts). We want to find high-value vulnerabilities that pay bounties.
+*   **Workflow**: Pin a local Anvil fork from a public/free remote RPC node -> Run setup scripts on Anvil to deploy target contracts/state -> Point fuzzer at local Anvil (`http://127.0.0.1:8545`) using local compilation artifacts (`-t "out/*"`) to load ABIs.
+*   **RPC Quota Constraint**: Strict low-volume RPC usage. No redundant queries. The fuzzer must load ABIs locally and rely on its **persistent local disk cache** (`cache/`) to intercept storage slot/bytecode queries so restarting Anvil doesn't hit the remote RPC.
+*   **Profit Validation**: Use the **Whale-Consensus Slot Detector** (`slot_detector.rs`) to pre-fund caller balances and the **Autonomous Liquidation Router** to verify if drained assets can be swapped to WETH/USDC locally.
+*   **Configured API Keys & Fallbacks**:
+    *   Etherscan: `F2Y8KBJ66MHHPJ2IGT94IIUW4SD7KJKXBQ` (for ABIs)
+    *   Primary Alchemy RPC: `https://eth-mainnet.g.alchemy.com/v2/ZudLM8AAn0OCfiE5JvhAL`
+    *   Fallback Ankr RPC: `https://rpc.ankr.com/eth/4dc6bca2aff8bcb62f9989a3e104be5cd6ac025c004b3f7ef51696e7a678a54c`
+
+
+## Guidance for Claude Code when working in this repository.
 
 ## What this is
 

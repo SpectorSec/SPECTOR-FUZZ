@@ -535,6 +535,50 @@ impl ChainConfig for OnChainConfig {
             }
         }
     }
+
+    fn get_access_list(
+        &mut self,
+        caller: EVMAddress,
+        target: EVMAddress,
+        call_data: Vec<u8>,
+    ) -> Vec<EVMU256> {
+        let params = serde_json::json!([
+            {
+                "from": format!("{:?}", caller),
+                "to": format!("{:?}", target),
+                "data": format!("0x{}", hex::encode(call_data))
+            },
+            self.block_number
+        ]);
+
+        let resp = self._request("eth_createAccessList".to_string(), params.to_string());
+        let mut slots = Vec::new();
+        if let Some(res) = resp {
+            if let Some(access_list) = res["accessList"].as_array() {
+                for entry in access_list {
+                    if let Some(addr_str) = entry["address"].as_str() {
+                        if let Ok(addr) = EVMAddress::from_str(addr_str) {
+                            if addr == target {
+                                if let Some(keys) = entry["storageKeys"].as_array() {
+                                    for key in keys {
+                                        if let Some(key_str) = key.as_str() {
+                                            if let Ok(slot_val) = EVMU256::from_str_radix(
+                                                key_str.trim_start_matches("0x"),
+                                                16,
+                                            ) {
+                                                slots.push(slot_val);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        slots
+    }
 }
 
 impl OnChainConfig {

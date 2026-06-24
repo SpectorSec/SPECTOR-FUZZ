@@ -61,6 +61,12 @@ pub trait ChainConfig {
     fn get_contract_slot(&mut self, address: EVMAddress, slot: EVMU256) -> EVMU256;
     fn get_weth(&self) -> String;
     fn get_pegged_token(&self) -> HashMap<String, String>;
+    fn get_access_list(
+        &mut self,
+        caller: EVMAddress,
+        target: EVMAddress,
+        call_data: Vec<u8>,
+    ) -> Vec<EVMU256>;
 }
 
 #[derive(Clone)]

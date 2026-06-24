@@ -292,6 +292,15 @@ impl ChainConfig for OffChainConfig {
     fn get_pegged_token(&self) -> HashMap<String, String> {
         HashMap::from_iter([("WETH".to_string(), PRESET_WETH.to_string())])
     }
+
+    fn get_access_list(
+        &mut self,
+        _caller: EVMAddress,
+        _target: EVMAddress,
+        _call_data: Vec<u8>,
+    ) -> Vec<EVMU256> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
