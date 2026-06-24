@@ -351,6 +351,11 @@ pub struct OnChainConfig {
     storage_dump_cache: HashMap<EVMAddress, Option<Arc<HashMap<EVMU256, EVMU256>>>>,
     uniswap_path_cache: HashMap<EVMAddress, TokenContext>,
     rpc_cache: FileSystemCache,
+    /// Address of the UltimateForkLiquidationEngine deployed on the fork.
+    /// None if the fork doesn't support anvil_setCode (e.g., a live archive node).
+    pub liqsim_addr: Option<EVMAddress>,
+    /// Address of the UniversalAcquisitionEngine deployed on the fork.
+    pub acqengine_addr: Option<EVMAddress>,
 }
 
 impl Debug for OnChainConfig {
@@ -562,6 +567,8 @@ impl OnChainConfig {
             etherscan_base,
             chain_name,
             rpc_cache: FileSystemCache::new("./cache"),
+            liqsim_addr: None,
+            acqengine_addr: None,
             ..Default::default()
         };
         if block_number == 0 {
@@ -1254,10 +1261,197 @@ impl OnChainConfig {
 }
 
 impl OnChainConfig {
+    /// Deploy UltimateForkLiquidationEngine + UniversalAcquisitionEngine onto the
+    /// fork via eth_sendTransaction from anvil's default funded account.
+    /// One-time call during corpus init. Silently skips on non-Anvil endpoints.
+    pub fn deploy_liquidation_simulator(&mut self) {
+        use crate::evm::liquidation::{
+            LIQENGINE_INIT_BYTECODE, ACQENGINE_INIT_BYTECODE,
+        };
+
+        // Anvil's first test account — always funded with 10_000 ETH.
+        let deployer = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+        let weth       = self.get_weth();
+        let v2_factory = format!("{:?}", self.v2_factory_for_chain());
+        let v2_router  = format!("{:?}", self.v2_router_for_chain());
+        let v3_factory = match self.chain_name.as_str() {
+            "bsc" => "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865".to_string(),
+            _     => crate::evm::liquidation::UNISWAP_V3_FACTORY_ETH.to_string(),
+        };
+        let v3_router = match self.chain_name.as_str() {
+            "bsc" => "0x1b81D678ffb9C0263b24A97847620C99d213eB14".to_string(),
+            _     => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".to_string(),
+        };
+        let aave_pool = match self.chain_name.as_str() {
+            "eth"   => "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2".to_string(),
+            "polygon" | "matic" => "0x794a61358D6845594F94dc1DB02A252b5b4814aD".to_string(),
+            "arb"   => "0x794a61358D6845594F94dc1DB02A252b5b4814aD".to_string(),
+            _       => format!("{:0>40}", "0"),
+        };
+        let lido   = match self.chain_name.as_str() {
+            "eth" => "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84".to_string(),
+            _     => format!("{:0>40}", "0"),
+        };
+        let wsteth = match self.chain_name.as_str() {
+            "eth" => "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0".to_string(),
+            _     => format!("{:0>40}", "0"),
+        };
+
+        fn enc_addr(s: &str) -> String {
+            format!("{:0>64}", s.trim_start_matches("0x"))
+        }
+
+        // ── Deploy UltimateForkLiquidationEngine (6 constructor args) ────────────
+        let liq_args = format!(
+            "{}{}{}{}{}{}",
+            enc_addr(&weth), enc_addr(&v2_factory), enc_addr(&v2_router),
+            enc_addr(&v3_factory), enc_addr(&v3_router), enc_addr(&aave_pool)
+        );
+        let liq_init = format!("0x{}{}", LIQENGINE_INIT_BYTECODE, liq_args);
+        if let Some(addr) = self.deploy_via_send_tx(&liq_init, deployer, "LiqEngine") {
+            info!("LiqEngine deployed at {:?}", addr);
+            self.liqsim_addr = Some(addr);
+        }
+
+        // ── Deploy UniversalAcquisitionEngine (8 constructor args) ───────────────
+        let acq_args = format!(
+            "{}{}{}{}{}{}{}{}",
+            enc_addr(&weth), enc_addr(&v2_factory), enc_addr(&v2_router),
+            enc_addr(&v3_factory), enc_addr(&v3_router), enc_addr(&aave_pool),
+            enc_addr(&lido), enc_addr(&wsteth)
+        );
+        let acq_init = format!("0x{}{}", ACQENGINE_INIT_BYTECODE, acq_args);
+        if let Some(addr) = self.deploy_via_send_tx(&acq_init, deployer, "AcqEngine") {
+            info!("AcqEngine deployed at {:?}", addr);
+            self.acqengine_addr = Some(addr);
+        }
+    }
+
+    /// Deploy a contract via eth_sendTransaction on the fork and return its address.
+    /// Uses anvil's built-in account management (no private key needed).
+    fn deploy_via_send_tx(&mut self, init_data: &str, from: &str, label: &str) -> Option<EVMAddress> {
+        let tx_params = format!(
+            r#"{{"from":"{}","data":"{}","gas":"0xF42400"}}"#,
+            from, init_data
+        );
+        let tx_hash = self._request("eth_sendTransaction".to_string(), format!("[{}]", tx_params))?
+            .as_str()?.to_string();
+
+        // Poll for receipt — anvil may need a moment to mine even with automine.
+        let receipt_params = format!(r#"["{}"]"#, tx_hash);
+        let _ = receipt_params; // silence unused
+        let contract_addr = loop {
+            if let Some(Value::Object(obj)) = self._request(
+                "eth_getTransactionReceipt".to_string(), format!(r#"["{}"]"#, tx_hash)
+            ) {
+                if let Some(addr) = obj.get("contractAddress").and_then(|v| v.as_str()) {
+                    if !addr.is_empty() && addr != "0x" {
+                        break addr.to_string();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+
+        EVMAddress::from_str(&contract_addr).ok()
+    }
+
+    /// Call acquire(token, recipient) on the AcquisitionEngine with `eth_wei` ETH.
+    /// Useful for seeding fuzzer phantom callers with tokens they need to interact
+    /// with the target protocol (solves the "can't do business" precondition problem).
+    pub fn acquire_token_for_fuzzer(&mut self, token: EVMAddress, recipient: EVMAddress, eth_wei: EVMU256) -> Option<EVMU256> {
+        use crate::evm::liquidation::ACQENGINE_ACQUIRE_SEL;
+        let engine = self.acqengine_addr?;
+
+        // acquire(address token, address recipient) payable → uint256
+        let mut calldata = ACQENGINE_ACQUIRE_SEL.to_vec();
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(token.as_slice());
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(recipient.as_slice());
+
+        let engine_hex = format!("{:?}", engine);
+        let data_hex   = format!("0x{}", hex::encode(&calldata));
+        let value_hex  = format!("0x{:x}", eth_wei);
+        let params = format!(
+            r#"[{{"to":"{}", "data":"{}", "value":"{}", "gas":"0x7A1200"}}, "latest"]"#,
+            engine_hex, data_hex, value_hex
+        );
+
+        let result = self._request("eth_call".to_string(), params)?;
+        let hex_str = result.as_str()?.trim_start_matches("0x");
+        if hex_str.len() < 64 { return None; }
+
+        let bytes = hex::decode(hex_str).ok()?;
+        Some(EVMU256::try_from_be_slice(&bytes[..32]).unwrap_or(EVMU256::ZERO))
+    }
+
+    /// Call discoverRoute(token) on the deployed simulator.
+    /// Returns (routeType, routeAddr): routeType 0=none,1=4626,2=curve,3=univ2,4=univ3
+    pub fn liqsim_discover_route(&mut self, token: EVMAddress) -> Option<(u8, EVMAddress)> {
+        use crate::evm::liquidation::LIQSIM_DISCOVER_ROUTE_SEL;
+        let sim = self.liqsim_addr?;
+
+        let mut calldata = LIQSIM_DISCOVER_ROUTE_SEL.to_vec();
+        calldata.extend_from_slice(&[0u8; 12]); // left-pad address to 32 bytes
+        calldata.extend_from_slice(token.as_slice());
+
+        let sim_hex = format!("{:?}", sim);
+        let data_hex = format!("0x{}", hex::encode(&calldata));
+        let params = format!(r#"[{{"to":"{}", "data":"{}"}}, "latest"]"#, sim_hex, data_hex);
+
+        let result = self._request("eth_call".to_string(), params)?;
+        let hex_str = result.as_str()?.trim_start_matches("0x");
+        if hex_str.len() < 128 { return None; }
+
+        let bytes = hex::decode(hex_str).ok()?;
+        if bytes.len() < 64 { return None; }
+
+        let route_type = bytes[31]; // uint8 right-aligned in first 32 bytes
+        if route_type == 0 { return None; }
+
+        let route_addr = EVMAddress::from_slice(&bytes[44..64]); // address in second 32 bytes
+        Some((route_type, route_addr))
+    }
+
     /// Discover a liquidation route for `token` using only on-chain RPC calls —
     /// no external pairs server needed. Returns a populated PairData if a liquid
     /// route is found, or None for illiquid tokens.
     fn get_pair_from_fork(&mut self, token_addr: EVMAddress) -> Option<PairData> {
+        // ── Try the deployed Solidity simulator first (handles fee-on-transfer,
+        //    ERC-4626, Curve, UniV2, UniV3 autonomously via on-chain registries).
+        if self.liqsim_addr.is_some() {
+            if let Some((_route_type, route_addr)) = self.liqsim_discover_route(token_addr) {
+                let token_str = format!("{:?}", token_addr).to_lowercase();
+                let weth_str = self.get_weth();
+                // Simulator confirmed a route exists — surface it so the rest of the
+                // pipeline (add_reserve_info, flashloan) can use it.
+                let chain_suffix = self.chain_name.as_str();
+                let (interface, src_exact) = match _route_type {
+                    3 => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
+                    4 => ("uniswapv3", format!("uniswapv3_{}", chain_suffix)),
+                    _ => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
+                };
+                return Some(PairData {
+                    src: "lp".to_string(),
+                    in_: 0,
+                    pair: format!("{:?}", route_addr).to_lowercase(),
+                    in_token: token_str.clone(),
+                    next: weth_str.clone(),
+                    interface: interface.to_string(),
+                    src_exact,
+                    initial_reserves_0: EVMU256::ZERO,
+                    initial_reserves_1: EVMU256::ZERO,
+                    decimals_0: 18,
+                    decimals_1: 18,
+                    token0: token_str,
+                    token1: weth_str,
+                });
+            }
+        }
+
+        // ── Fallback: Rust LiquidationRouter (works on non-Anvil endpoints too) ──
         let weth_str = self.get_weth();
         let weth = EVMAddress::from_str(&weth_str).ok()?;
         let router = LiquidationRouter::default().with_chain(

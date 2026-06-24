@@ -129,6 +129,32 @@ impl ABIMap {
     }
 }
 
+/// Pre-seed ERC-20 token balances for all fuzzer callers by writing directly
+/// to the standard balance mapping slot (slot 0). This ensures the fuzzer can
+/// interact with the token immediately without needing a successful borrow swap.
+pub fn seed_erc20_balances(evmstate: &mut EVMState, token: EVMAddress, callers: &[EVMAddress]) {
+    use crypto::{digest::Digest, sha3::Sha3};
+
+    // 1M tokens with 18 decimals — enough for any DeFi interaction
+    let amount = EVMU256::from(1_000_000_000_000_000_000_000_000u128);
+
+    for caller in callers {
+        // Standard ERC-20 balance slot (mapping at position 0):
+        // slot = keccak256(abi.encode(uint256(uint160(user)), uint256(0)))
+        //       = keccak256(leftPad(user, 32) ++ leftPad(0, 32))
+        let mut input = [0u8; 64];
+        input[12..32].copy_from_slice(caller.as_slice());
+
+        let mut hasher = Sha3::keccak256();
+        hasher.input(&input);
+        let mut out = [0u8; 32];
+        hasher.result(&mut out);
+        let slot = EVMU256::from_be_bytes(out);
+
+        evmstate.sstore(token, slot, amount);
+    }
+}
+
 #[macro_export]
 macro_rules! handle_contract_insertion {
     ($state: expr, $host: expr, $deployed_address: expr, $impl_address: expr, $abi: expr) => {
@@ -143,6 +169,13 @@ macro_rules! handle_contract_insertion {
             // scheduler should be mutable but host cannot be borrowed as mutable
             let scheduler = $host.scheduler.clone();
             register_borrow_txn(scheduler, $state, $deployed_address);
+            // Pre-seed ERC-20 balances so the fuzzer can interact with this
+            // token immediately without needing the borrow swap to succeed.
+            $crate::evm::corpus_initializer::seed_erc20_balances(
+                &mut $host.evmstate,
+                $deployed_address,
+                &$state.callers_pool,
+            );
         }
         if is_pair {
             let mut mid = $host.flashloan_middleware.as_ref().unwrap().deref().borrow_mut();

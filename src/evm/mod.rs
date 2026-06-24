@@ -548,6 +548,12 @@ pub fn evm_main(mut args: EvmArgs) {
     solution::init_cli_args(target, work_dir, &onchain);
     let _onchain_clone = onchain.clone();
 
+    // Deploy the UniversalLiquidationSimulator onto the fork so the pair
+    // discovery path can use it for ERC-4626, Curve, and fee-on-transfer tokens.
+    if let Some(ref mut oc) = onchain {
+        oc.deploy_liquidation_simulator();
+    }
+
     let etherscan_api_key = match args.onchain_etherscan_api_key {
         Some(v) => v,
         None => std::env::var("ETHERSCAN_API_KEY").unwrap_or_default(),

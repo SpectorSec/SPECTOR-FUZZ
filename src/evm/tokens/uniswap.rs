@@ -211,9 +211,9 @@ fn get_all_hops(
     hops
 }
 
-fn get_pegged_next_hop(chain: &mut Box<dyn ChainConfig>, token: &str) -> PairData {
+fn get_pegged_next_hop(chain: &mut Box<dyn ChainConfig>, token: &str) -> Option<PairData> {
     if token == chain.get_weth() {
-        return PairData {
+        return Some(PairData {
             src: "pegged_weth".to_string(),
             in_: 0,
             next: "".to_string(),
@@ -227,22 +227,19 @@ fn get_pegged_next_hop(chain: &mut Box<dyn ChainConfig>, token: &str) -> PairDat
             in_token: token.to_string(),
             interface: "weth".to_string(),
             token1: "".to_string(),
-        };
+        });
     }
 
     let pairs = get_pair(chain, token, true);
     debug!(%token, ?pairs, "get_pair (pegged)");
-    let mut peg_info = pairs
-        .first()
-        .expect("Unexpected RPC error, consider setting env <ETH_RPC_URL> ")
-        .clone();
+    let mut peg_info = pairs.into_iter().next()?;
 
     add_reserve_info(chain, &mut peg_info);
 
-    PairData {
+    Some(PairData {
         src: "pegged".to_string(),
-        ..peg_info.clone()
-    }
+        ..peg_info
+    })
 }
 
 /// returns whether the pair is significant
@@ -322,9 +319,11 @@ fn dfs(
     routes: &mut Vec<Vec<PairData>>,
 ) {
     if pegged_tokens.values().any(|v| v == token) {
-        let mut new_path = path.clone();
-        new_path.push(get_pegged_next_hop(chain, token));
-        routes.push(new_path);
+        if let Some(hop) = get_pegged_next_hop(chain, token) {
+            let mut new_path = path.clone();
+            new_path.push(hop);
+            routes.push(new_path);
+        }
         return;
     }
     visited.insert(token.to_string());
@@ -346,8 +345,9 @@ fn find_path_subgraph(chain: &mut Box<dyn ChainConfig>, token: &str) -> Info {
     let weth = chain.get_weth();
 
     if pegged_tokens.values().any(|v| v == token) {
-        let hop = get_pegged_next_hop(chain, token);
-        return with_info(vec![vec![hop]], token, &weth);
+        if let Some(hop) = get_pegged_next_hop(chain, token) {
+            return with_info(vec![vec![hop]], token, &weth);
+        }
     }
 
     let mut known: HashSet<String> = HashSet::new();
@@ -383,7 +383,7 @@ mod tests {
     fn test_get_pegged_next_hop() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(BSC, 22055611));
         let token = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
-        let v = get_pegged_next_hop(&mut config, token);
+        let v = get_pegged_next_hop(&mut config, token).expect("should find pegged hop for WBNB");
         assert!(v.src == "pegged_weth");
     }
 
