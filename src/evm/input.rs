@@ -48,6 +48,13 @@ pub enum EVMInputTy {
 
 const CALL_VALUE_MAX_BYTES: usize = 23; // 309M ether
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct NestedAction {
+    pub target: EVMAddress,
+    pub calldata: Bytes,
+    pub value: EVMU256,
+}
+
 /// EVM Input Trait
 pub trait EVMInputT {
     /// Set the contract and ABI
@@ -95,6 +102,9 @@ pub trait EVMInputT {
     fn get_repeat(&self) -> usize;
 
     fn get_swap_data(&self) -> HashMap<String, SwapInfo>;
+
+    fn get_nested_actions(&self) -> Vec<NestedAction>;
+    fn get_nested_actions_mut(&mut self) -> &mut Vec<NestedAction>;
 }
 
 /// EVM Input
@@ -148,6 +158,8 @@ pub struct EVMInput {
     /// Swap data
     #[serde(skip_deserializing)]
     pub swap_data: HashMap<String, SwapInfo>,
+
+    pub nested_actions: Vec<NestedAction>,
 }
 
 /// EVM Input Minimum for Deserializing
@@ -198,6 +210,8 @@ pub struct ConciseEVMInput {
     /// Swap data
     #[serde(skip_deserializing)]
     pub swap_data: HashMap<String, SwapInfo>,
+
+    pub nested_actions: Vec<NestedAction>,
 }
 
 /// EVM Input Minimum for Deserializing with human readable ABI
@@ -282,13 +296,14 @@ impl ConciseEVMInput {
             liquidation_percent: input.get_liquidation_percent(),
             randomness: input.get_randomness(),
             repeat: input.get_repeat(),
-            layer: input.get_state().get_post_execution_len(),
+            layer: execution_result.new_state.state.get_post_execution_len(),
             call_leak: match execution_result.additional_info {
                 Some(ref info) => info[0] as u32,
                 None => u32::MAX,
             },
             return_data,
             swap_data,
+            nested_actions: input.get_nested_actions(),
         }
     }
 
@@ -317,6 +332,7 @@ impl ConciseEVMInput {
             call_leak,
             return_data: None,
             swap_data: input.get_swap_data(),
+            nested_actions: input.get_nested_actions(),
         }
     }
 
@@ -344,6 +360,7 @@ impl ConciseEVMInput {
                 randomness: self.randomness.clone(),
                 repeat: self.repeat,
                 swap_data: self.swap_data.clone(),
+                nested_actions: self.nested_actions.clone(),
             },
             self.call_leak,
         )
@@ -692,6 +709,14 @@ impl EVMInputT for EVMInput {
 
     fn get_swap_data(&self) -> HashMap<String, SwapInfo> {
         self.swap_data.clone()
+    }
+
+    fn get_nested_actions(&self) -> Vec<NestedAction> {
+        self.nested_actions.clone()
+    }
+
+    fn get_nested_actions_mut(&mut self) -> &mut Vec<NestedAction> {
+        &mut self.nested_actions
     }
 }
 

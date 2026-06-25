@@ -709,6 +709,7 @@ mod tests {
             randomness: vec![],
             repeat: 1,
             swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
         };
 
         let res = evm_executor.execute(&input, &mut state);

@@ -492,6 +492,7 @@ impl OnChain {
                     randomness: vec![0],
                     repeat: 1,
                     swap_data: HashMap::new(),
+                    nested_actions: Vec::new(),
                 };
                 add_corpus(host, state, &input);
             });

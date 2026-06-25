@@ -103,6 +103,7 @@ where
                 randomness: vec![0],
                 repeat: 1,
                 swap_data: HashMap::new(),
+                nested_actions: Vec::new(),
             }
         }
         .as_any()

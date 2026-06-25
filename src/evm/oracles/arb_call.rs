@@ -20,7 +20,7 @@ use crate::{
         vm::EVMState,
     },
     oracle::{Oracle, OracleCtx},
-    state::HasExecutionResult,
+    state::{HasExecutionResult, HasCaller},
 };
 
 pub struct ArbitraryCallOracle {
@@ -79,6 +79,9 @@ impl
         if !ctx.post_state.arbitrary_calls.is_empty() {
             let mut res = vec![];
             for (caller, target, pc) in ctx.post_state.arbitrary_calls.iter() {
+                if ctx.fuzz_state.has_caller(target) {
+                    continue;
+                }
                 if !ctx.fuzz_state.has_metadata::<ArbitraryCallMetadata>() {
                     ctx.fuzz_state.metadata_map_mut().insert(ArbitraryCallMetadata {
                         known_calls: HashMap::new(),

@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
-use crate::evm::input::EVMInputT;
+use crate::evm::input::{EVMInputT, NestedAction};
 use crate::{
     evm::{
         abi::ABIAddressToInstanceMap,
@@ -220,7 +220,7 @@ where
 impl<VS, Loc, Addr, I, S, SC, CI> Mutator<I, S> for FuzzMutator<VS, Loc, Addr, SC, CI>
 where
     I: VMInputT<VS, Loc, Addr, CI> + Input + EVMInputT,
-    S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<Addr> + HasMetadata + HasPresets,
+    S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<Addr> + HasCaller<EVMAddress> + HasMetadata + HasPresets,
     SC: Scheduler<State = InfantStateState<Loc, Addr, VS, CI>>,
     VS: Default + VMStateT + EVMStateT,
     Addr: PartialEq + Debug + Serialize + DeserializeOwned + Clone,
@@ -284,6 +284,46 @@ where
                     if Self::ensures_constraint(input, state, &new_state.state, new_state.state.get_constraints()) {
                         mutated = true;
                         input.set_staged_state(new_state, idx);
+                    }
+                }
+            }
+
+            // Mutate nested actions (with 15% probability)
+            if state.rand_mut().below(100) < 15 {
+                let keys = {
+                    let abis = state.metadata_map().get::<ABIAddressToInstanceMap>();
+                    abis.map(|m| m.map.keys().cloned().collect::<Vec<EVMAddress>>())
+                };
+
+                if let Some(keys) = keys {
+                    if !keys.is_empty() {
+                        let target_idx = state.rand_mut().below(keys.len() as u64) as usize;
+                        let target_addr = keys[target_idx];
+
+                        let abi_len = {
+                            let abis = state.metadata_map().get::<ABIAddressToInstanceMap>().unwrap();
+                            abis.map.get(&target_addr).map(|v| v.len()).unwrap_or(0)
+                        };
+
+                        if abi_len > 0 {
+                            let abi_idx = state.rand_mut().below(abi_len as u64) as usize;
+                            let chosen_abi = {
+                                let abis = state.metadata_map().get::<ABIAddressToInstanceMap>().unwrap();
+                                abis.map.get(&target_addr).unwrap()[abi_idx].clone()
+                            };
+
+                            let mut abi = chosen_abi;
+                            abi.mutate_with_vm_slots(state, None);
+                            let calldata = abi.get_bytes();
+                            let actions = input.get_nested_actions_mut();
+                            actions.clear();
+                            actions.push(NestedAction {
+                                target: target_addr,
+                                calldata: bytes::Bytes::from(calldata),
+                                value: EVMU256::ZERO,
+                            });
+                            mutated = true;
+                        }
                     }
                 }
             }

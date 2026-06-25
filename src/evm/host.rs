@@ -228,6 +228,7 @@ where
     relations_hash: HashSet<u64>,
     /// Randomness from inputs
     pub randomness: Vec<u8>,
+    pub nested_actions: Vec<crate::evm::input::NestedAction>,
     /// workdir
     pub work_dir: String,
     /// custom SpecId
@@ -321,6 +322,7 @@ where
             relations_hash: self.relations_hash.clone(),
             current_typed_bug: self.current_typed_bug.clone(),
             randomness: vec![],
+            nested_actions: self.nested_actions.clone(),
             work_dir: self.work_dir.clone(),
             spec_id: self.spec_id,
             precompiles: Precompiles::default(),
@@ -403,6 +405,7 @@ where
             relations_hash: HashSet::new(),
             current_typed_bug: Default::default(),
             randomness: vec![],
+            nested_actions: vec![],
             work_dir: workdir,
             spec_id: SpecId::PRAGUE,
             precompiles: Default::default(),
@@ -880,7 +883,8 @@ where
         };
 
         if input.scheme == CallScheme::StaticCall &&
-            (state.has_caller(&input.target_address) || is_target_address_unbounded)
+            ((state.has_caller(&input.target_address) && !self.code.contains_key(&input.target_address))
+                || is_target_address_unbounded)
         {
             record_func_hash!();
             push_interp!();
@@ -890,7 +894,9 @@ where
 
         if input.scheme == CallScheme::Call {
             // if calling sender, then definitely control leak
-            if state.has_caller(&input.target_address) || is_target_address_unbounded {
+            if (state.has_caller(&input.target_address) && !self.code.contains_key(&input.target_address))
+                || is_target_address_unbounded
+            {
                 record_func_hash!();
                 push_interp!();
                 unsafe { CONTROL_LEAK_DETECTED = true; }
@@ -1007,6 +1013,34 @@ where
 
         let code_address = input.bytecode_address;
         if let Some(code) = self.code.get(&code_address).cloned() {
+            if !self.nested_actions.is_empty() {
+                let action = self.nested_actions.remove(0);
+
+                // Write target address to slot 0 (right-aligned, 20 bytes)
+                let mut target_bytes = [0u8; 32];
+                target_bytes[12..32].copy_from_slice(action.target.as_slice());
+                let target_value = EVMU256::from_be_bytes(target_bytes);
+                self.evmstate.sstore(input.target_address, EVMU256::ZERO, target_value);
+
+                // Write calldata length to slot 9999 (0x270f)
+                let len = action.calldata.len();
+                let len_value = EVMU256::from(len);
+                self.evmstate.sstore(input.target_address, EVMU256::from(9999u64), len_value);
+
+                // Write calldata data to slots 10000+ (0x2710+)
+                let slot_base = EVMU256::from(10000u64);
+                for (i, chunk) in action.calldata.chunks(32).enumerate() {
+                    let mut chunk_bytes = [0u8; 32];
+                    chunk_bytes[..chunk.len()].copy_from_slice(chunk);
+                    let chunk_value = EVMU256::from_be_bytes(chunk_bytes);
+                    self.evmstate.sstore(
+                        input.target_address,
+                        slot_base + EVMU256::from(i as u64),
+                        chunk_value,
+                    );
+                }
+            }
+
             let interp_input = InputsImpl {
                 target_address: input.target_address,
                 bytecode_address: Some(code_address),
@@ -1029,6 +1063,14 @@ where
             );
             let ret = self.run_inspect(&mut sub_interp, state);
             let output = sub_interp.return_data.buffer().clone().0;
+            println!(
+                "[ityfuzz debug] CALL from {:?} to {:?} with input {} returned {:?}, output: {}",
+                input.caller,
+                input.target_address,
+                hex::encode(&input_bytes),
+                ret,
+                hex::encode(&output)
+            );
             return (ret, input.return_memory_offset.clone(), output);
         }
 
@@ -1488,6 +1530,7 @@ where
                             randomness: vec![0],
                             repeat: 1,
                             swap_data: HashMap::new(),
+                            nested_actions: Vec::new(),
                         };
                         add_corpus(self, state, &input);
                     });

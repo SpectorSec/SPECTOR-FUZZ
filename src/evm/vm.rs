@@ -702,6 +702,7 @@ where
     ) -> ExecutionResult<EVMAddress, EVMAddress, VS, Vec<u8>, CI> {
         // Get necessary info from input
         let mut vm_state = unsafe { input.get_state().as_any().downcast_ref::<EVMState>().unwrap().clone() };
+        self.host.nested_actions = input.get_nested_actions();
 
         // check balance
         #[cfg(feature = "real_balance")]
@@ -987,6 +988,7 @@ where
             IN_DEPLOY = false;
         }
         if r != InstructionResult::Return {
+            println!("DEPLOY FAILED: {:?}", r);
             error!("deploy failed: {:?}", r);
             return None;
         }
@@ -1196,9 +1198,9 @@ mod tests {
     use crate::{
         evm::{
             host::{FuzzHost, JMP_MAP},
-            input::{ConciseEVMInput, EVMInput, EVMInputTy},
+            input::{ConciseEVMInput, EVMInput, EVMInputTy, NestedAction},
             mutator::AccessPattern,
-            types::{generate_random_address, EVMFuzzState, EVMU256},
+            types::{fixed_address, generate_random_address, EVMFuzzState, EVMU256},
             vm::{EVMExecutor, EVMState},
         },
         generic_vm::vm_executor::{GenericVM, MAP_SIZE},
@@ -1264,6 +1266,7 @@ mod tests {
             randomness: vec![],
             repeat: 1,
             swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
         };
 
         let mut state = FuzzState::new(0);
@@ -1302,6 +1305,7 @@ mod tests {
             randomness: vec![],
             repeat: 1,
             swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
         };
 
         let execution_result_5 = evm_executor.execute(&input_5, &mut state);
@@ -1317,6 +1321,110 @@ mod tests {
             }
         }
         assert!(cov_changed);
+        assert!(cov_changed);
         assert!(execution_result_5.reverted);
     }
-}
+
+    #[test]
+    fn test_attacker_contract_callbacks() {
+        let mut state: EVMFuzzState = FuzzState::new(0);
+        let path = Path::new("work_dir");
+        if !path.exists() {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut evm_executor: EVMExecutor<EVMState, ConciseEVMInput, StdScheduler<EVMFuzzState>> = EVMExecutor::new(
+            FuzzHost::new(StdScheduler::new(), "work_dir".to_string()),
+            generate_random_address(&mut state),
+        );
+        tuple_list!();
+
+        // 1. Deploy CallbackTest contract
+        let callback_test_bytecode = hex::decode("6101b680600c6000396000f3608060405234801561000f575f80fd5b506004361061003f575f3560e01c80633f09775e14610043578063507976da14610063578063b4d401d714610076575b5f80fd5b5f5461004f9060ff1681565b604051901515815260200160405180910390f35b6100745f805460ff19166001179055565b005b604080515f6024820181905260448201819052606482018190526080608483015260a48083018290528351808403909101815260c490920183526020820180516001600160e01b0316630a85bd0160e11b9081179091529251610074939233916100e09190610169565b5f604051808303815f865af19150503d805f8114610119576040519150601f19603f3d011682016040523d82523d5f602084013e61011e565b606091505b50509050806101655760405162461bcd60e51b815260206004820152600f60248201526e10d85b1b189858dac819985a5b1959608a1b604482015260640160405180910390fd5b5050565b5f82518060208501845e5f92019182525091905056fea2646970667358221220391c3dc473772be67d9285292f5d55e3b4cf18c62d4efd5e85836e678a51511264736f6c634300081a0033").unwrap();
+        
+        let callback_test_addr = evm_executor
+            .deploy(
+                Bytecode::new_raw(revm_primitives::Bytes::from(callback_test_bytecode)),
+                None,
+                generate_random_address(&mut state),
+                &mut FuzzState::new(0),
+            )
+            .unwrap();
+
+        // 2. Set code and balance on the attacker address
+        let attacker_addr = fixed_address("e1A425f1AC34A8a441566f93c82dD730639c8510");
+        let attacker_bytecode_hex = "608060405260043610610073575f3560e01c8063bc197c811161004d578063bc197c8114610126578063f23a6e6114610145578063fa461e3314610164578063fadc6f3d146101835761007a565b8063150b7a02146100845780638da5cb5b146100c1578063920f5c84146100f75761007a565b3661007a57005b6100826101a6565b005b34801561008f575f80fd5b506100a361009e3660046104e2565b61026c565b6040516001600160e01b031990911681526020015b60405180910390f35b3480156100cc575f80fd5b505f546100df906001600160a01b031681565b6040516001600160a01b0390911681526020016100b8565b348015610102575f80fd5b5061011661011136600461058b565b610287565b60405190151581526020016100b8565b348015610131575f80fd5b506100a3610140366004610668565b610392565b348015610150575f80fd5b506100a361015f366004610724565b6103b0565b34801561016f575f80fd5b5061008261017e366004610796565b6103cc565b34801561018e575f80fd5b506101976103da565b6040516100b8939291906107e4565b5f806101b06103da565b5090925090506001600160a01b03821615610268575f826001600160a01b0316826040516101de919061082f565b5f604051808303815f865af19150503d805f8114610217576040519150601f19603f3d011682016040523d82523d5f602084013e61021c565b606091505b50509050806102665760405162461bcd60e51b815260206004820152601260248201527114dd1859d9590818d85b1b0819985a5b195960721b604482015260640160405180910390fd5b505b5050565b5f6102756101a6565b50630a85bd0160e11b95945050505050565b5f6102906101a6565b5f5b89811015610381578a8a828181106102ac576102ac610845565b90506020020160208101906102c19190610859565b6001600160a01b031663095ea7b3338989858181106102e2576102e2610845565b905060200201358c8c868181106102fb576102fb610845565b9050602002013561030c9190610879565b6040516001600160e01b031960e085901b1681526001600160a01b03909216600483015260248201526044016020604051808303815f875af1158015610354573d5f803e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610378919061089e565b50600101610292565b5060019a9950505050505050505050565b5f61039b6101a6565b5063bc197c8160e01b98975050505050505050565b5f6103b96101a6565b5063f23a6e6160e01b9695505050505050565b6103d46101a6565b50505050565b5f805461270f54909160609180820361040757505060408051602081019091525f80825293909250839150565b806001600160401b0381111561041f5761041f6108bd565b6040519080825280601f01601f191660200182016040528015610449576020820181803683370190505b5092505f5b8181101561047757602080820461271001548583018201526104709082610879565b905061044e565b5092939192505f919050565b80356001600160a01b0381168114610499575f80fd5b919050565b5f8083601f8401126104ae575f80fd5b5081356001600160401b038111156104c4575f80fd5b6020830191508360208285010111156104db575f80fd5b9250929050565b5f805f805f608086880312156104f6575f80fd5b6104ff86610483565b945061050d60208701610483565b93506040860135925060608601356001600160401b0381111561052e575f80fd5b61053a8882890161049e565b969995985093965092949392505050565b5f8083601f84011261055b575f80fd5b5081356001600160401b03811115610571575f80fd5b6020830191508360208260051b85010111156104db575f80fd5b5f805f805f805f805f60a08a8c0312156105a3575f80fd5b89356001600160401b038111156105b8575f80fd5b6105c48c828d0161054b565b909a5098505060208a01356001600160401b038111156105e2575f80fd5b6105ee8c828d0161054b565b90985096505060408a01356001600160401b0381111561060c575f80fd5b6106188c828d0161054b565b909650945061062b905060608b01610483565b925060808a01356001600160401b03811115610645575f80fd5b6106518c828d0161049e565b915080935050809150509295985092959850929598565b5f805f805f805f8060a0898b03121561067f575f80fd5b61068889610483565b975061069660208a01610483565b965060408901356001600160401b038111156106b0575f80fd5b6106bc8b828c0161054b565b90975095505060608901356001600160401b038111156106da575f80fd5b6106e68b828c0161054b565b90955093505060808901356001600160401b03811115610704575f80fd5b6107108b828c0161049e565b999c989b5096995094979396929594505050565b5f805f805f8060a08789031215610739575f80fd5b61074287610483565b955061075060208801610483565b9450604087013593506060870135925060808701356001600160401b03811115610778575f80fd5b61078489828a0161049e565b979a9699509497509295939492505050565b5f805f80606085870312156107a9575f80fd5b843593506020850135925060408501356001600160401b038111156107cc575f80fd5b6107d88782880161049e565b95989497509550505050565b60018060a01b0384168152606060208201525f83518060608401528060208601608085015e5f608082850101526080601f19601f830116840101915050826040830152949350505050565b5f82518060208501845e5f920191825250919050565b634e487b7160e01b5f52603260045260245ffd5b5f60208284031215610869575f80fd5b61087282610483565b9392505050565b8082018082111561089857634e487b7160e01b5f52601160045260245ffd5b92915050565b5f602082840312156108ae575f80fd5b81518015158114610872575f80fd5b634e487b7160e01b5f52604160045260245ffdfea26469706673582212204aed32947684c442253e6dcea8ce62e068df49e6268b7e16d0abaf30ea8eeed864736f6c634300081a0033";
+        let attacker_bytecode = hex::decode(attacker_bytecode_hex).unwrap();
+        
+        evm_executor.host.set_code(
+            attacker_addr,
+            Bytecode::new_raw(revm_primitives::Bytes::from(attacker_bytecode)),
+            &mut state,
+        );
+        evm_executor.host.evmstate.set_balance(attacker_addr, EVMU256::from(10000000000000000000_u128));
+        // 3. Construct input targeting CallbackTest.triggerCallback()
+        // with a NestedAction targeting CallbackTest.flagReentered()
+        let trigger_callback_hash = hex::decode("b4d401d7").unwrap();
+        let flag_reentered_hash = hex::decode("507976da").unwrap();
+        
+        let nested_action = NestedAction {
+            target: callback_test_addr,
+            calldata: bytes::Bytes::from(flag_reentered_hash),
+            value: EVMU256::ZERO,
+        };
+
+        let input = EVMInput {
+            caller: attacker_addr,
+            contract: callback_test_addr,
+            data: None,
+            sstate: StagedVMState::new_uninitialized(),
+            sstate_idx: 0,
+            txn_value: Some(EVMU256::ZERO),
+            step: false,
+            env: Default::default(),
+            access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+            liquidation_percent: 0,
+            direct_data: Bytes::from(trigger_callback_hash),
+            input_type: EVMInputTy::ABI,
+            randomness: vec![],
+            repeat: 1,
+            swap_data: HashMap::new(),
+            nested_actions: vec![nested_action],
+        };
+
+        // 4. Execute the call
+        let result = evm_executor.execute(&input, &mut state);
+        assert!(!result.reverted, "Execution of triggerCallback() reverted: {:?}", result);
+
+        // 5. Verify reentered flag is set to true on CallbackTest
+        // Let's call CallbackTest.reentered() (selector 3f09775e)
+        // Carry forward the execution state so reentered = true persists
+        let reentered_hash = hex::decode("3f09775e").unwrap();
+        let mut input_query = EVMInput {
+            caller: attacker_addr,
+            contract: callback_test_addr,
+            data: None,
+            sstate: result.new_state,
+            sstate_idx: 0,
+            txn_value: Some(EVMU256::ZERO),
+            step: false,
+            env: Default::default(),
+            access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+            liquidation_percent: 0,
+            direct_data: Bytes::from(reentered_hash),
+            input_type: EVMInputTy::ABI,
+            randomness: vec![],
+            repeat: 1,
+            swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
+        };
+
+        let query_result = evm_executor.execute(&input_query, &mut state);
+        assert!(!query_result.reverted, "Querying reentered reverted");
+
+        // Decode return data. It should be a 32-byte word with value 1 (true)
+        let mut expected_output = vec![0; 32];
+        expected_output[31] = 1;
+        assert_eq!(query_result.output, expected_output);
+    }
+ }
+ 
