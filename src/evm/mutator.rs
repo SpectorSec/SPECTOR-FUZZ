@@ -8,6 +8,8 @@ use libafl::{
     state::HasMetadata,
     Error,
 };
+use alloy_sol_types::SolCall;
+use foundry_cheatcodes::Vm;
 use libafl_bolts::{prelude::Rand, Named};
 use revm_interpreter::{interpreter_types::Jumps, Interpreter};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -15,11 +17,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{EVMInputT, NestedAction};
-use crate::evm::oracles::OracleTargetMetadata;
+use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
 use crate::{
     evm::{
         abi::{ABIAddressToInstanceMap, BoxedABI},
         input::EVMInputTy::Borrow,
+        middlewares::cheatcode::CHEATCODE_ADDRESS,
         types::{convert_u256_to_h160, EVMAddress, EVMU256},
         vm::{Constraint, EVMStateT},
     },
@@ -332,6 +335,28 @@ where
                             let calldata = abi.get_bytes();
                             let actions = input.get_nested_actions_mut();
                             actions.clear();
+
+                            // Optionally prepend a vm.prank action (30% of nested action gens)
+                            {
+                                let whale_meta = state.metadata_map()
+                                    .get::<WhaleAddressMetadata>()
+                                    .cloned();
+                                if let Some(whale_meta) = whale_meta {
+                                    if !whale_meta.addresses.is_empty() && state.rand_mut().below(100) < 30 {
+                                        let whale_addrs: Vec<&EVMAddress> = whale_meta.addresses.iter().collect();
+                                        let whale_idx = state.rand_mut().below(whale_addrs.len() as u64) as usize;
+                                        let whale_addr = *whale_addrs[whale_idx];
+                                        let prank_call = Vm::prank_0Call { msgSender: whale_addr };
+                                        let prank_calldata = prank_call.abi_encode();
+                                        actions.push(NestedAction {
+                                            target: CHEATCODE_ADDRESS.into(),
+                                            calldata: bytes::Bytes::from(prank_calldata),
+                                            value: EVMU256::ZERO,
+                                        });
+                                    }
+                                }
+                            }
+
                             actions.push(NestedAction {
                                 target: target_addr,
                                 calldata: bytes::Bytes::from(calldata),

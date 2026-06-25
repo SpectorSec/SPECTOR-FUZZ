@@ -364,6 +364,26 @@ where
             env: artifacts.initial_env.clone(),
         });
 
+        // Seed WhaleAddressMetadata with known whale addresses for vm.prank injection
+        {
+            use crate::evm::oracles::WhaleAddressMetadata;
+            use crate::evm::slot_detector::WHALES;
+            use crate::evm::contract_utils::{FIX_DEPLOYER, FOUNDRY_DEPLOYER};
+            use crate::evm::types::EVMAddress;
+            use std::str::FromStr;
+            let mut whale_set = HashSet::new();
+            for addr in WHALES {
+                whale_set.insert(*addr);
+            }
+            if let Ok(fix) = EVMAddress::from_str(FIX_DEPLOYER) {
+                whale_set.insert(fix);
+            }
+            if let Ok(foundry) = EVMAddress::from_str(FOUNDRY_DEPLOYER) {
+                whale_set.insert(foundry);
+            }
+            self.state.metadata_map_mut().insert(WhaleAddressMetadata { addresses: whale_set });
+        }
+
         for contract in &mut loader.contracts {
             if contract.abi.is_empty() {
                 // this contract's abi is not available, we will use 3 layers to handle this

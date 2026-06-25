@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use libafl_bolts::impl_serdeany;
 use serde::{Deserialize, Serialize};
 
-use super::types::EVMU512;
+use super::types::{EVMAddress, EVMU512};
 
 /// Stores addresses flagged by oracles so the mutator can bias NestedAction
 /// target selection toward addresses that triggered oracle detections.
@@ -14,6 +14,18 @@ pub struct OracleTargetMetadata {
 }
 
 impl_serdeany!(OracleTargetMetadata);
+
+/// Stores known whale/admin addresses that the mutator can use for
+/// vm.prank / vm.startPrank injection inside nested actions.
+/// Populated from WHALES constants, known deployers, and protocol admins
+/// discovered during execution.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WhaleAddressMetadata {
+    /// Set of addresses available for prank impersonation
+    pub addresses: HashSet<EVMAddress>,
+}
+
+impl_serdeany!(WhaleAddressMetadata);
 
 pub mod approval;
 pub mod arb_call;

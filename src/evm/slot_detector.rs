@@ -33,7 +33,7 @@ const KNOWN_SLOTS: &[(EVMAddress, u64)] = &[
 
 /// Well-known addresses that hold diverse tokens and have non-zero balances.
 /// Using a variety of protocols ensures coverage for most tokens.
-const WHALES: &[EVMAddress] = &[
+pub const WHALES: &[EVMAddress] = &[
     // MakerDAO Pause Proxy (holds DAI, MKR, USDC, etc.)
     evm_addr("0xBE8E3e3618f7474F8cB1d074A26afFef007E46FB"),
     // Aave Collector (AAVE, stkAAVE)
