@@ -494,18 +494,20 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use libafl::state::{HasMetadata, State};
+    use bytes::Bytes;
+    use libafl::state::HasMetadata;
+    use crate::evm::abi::{AEmpty, A256, A256InnerType, ABIAddressToInstanceMap};
+    use crate::evm::input::{EVMInput, EVMInputT, EVMInputTy};
     use crate::evm::oracles::OracleTargetMetadata;
-    use crate::evm::types::EVMFuzzState;
+    use crate::evm::types::{EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256};
+    use crate::evm::mutator::BoxedABI;
 
     #[test]
     fn test_oracle_target_metadata_push_and_read() {
-        let mut state: EVMFuzzState = crate::evm::types::EVMFuzzState::new(0);
+        let mut state = EVMFuzzState::new(0);
 
-        // Verify metadata is empty initially
         assert!(state.metadata_map().get::<OracleTargetMetadata>().is_none());
 
-        // Push a flagged address
         if state.metadata_map().get::<OracleTargetMetadata>().is_none() {
             state.metadata_map_mut().insert(OracleTargetMetadata::default());
         }
@@ -514,12 +516,79 @@ mod tests {
         meta.targets.entry(addr).or_insert_with(|| ("ArbitraryCall".to_string(), 8, 1));
         meta.targets.get_mut(&addr).unwrap().2 += 1;
 
-        // Verify count
         assert_eq!(meta.targets.get(&addr).unwrap().2, 2);
         assert_eq!(meta.targets.len(), 1);
-
-        // Verify reason and bug_idx
         assert_eq!(meta.targets.get(&addr).unwrap().0, "ArbitraryCall");
         assert_eq!(meta.targets.get(&addr).unwrap().1, 8);
+    }
+
+    #[test]
+    fn test_set_contract_and_abi_switches_selector() {
+        let contract = EVMAddress::default();
+        let mut input = EVMInput {
+            caller: EVMAddress::default(),
+            contract,
+            data: None,
+            sstate: EVMStagedVMState::new_uninitialized(),
+            sstate_idx: 0,
+            txn_value: Some(EVMU256::ZERO),
+            step: false,
+            env: Default::default(),
+            access_pattern: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
+            liquidation_percent: 0,
+            direct_data: Bytes::new(),
+            input_type: EVMInputTy::ABI,
+            randomness: vec![],
+            repeat: 1,
+            swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
+        };
+
+        let selectors: [[u8; 4]; 3] = [
+            [0x0f, 0xe1, 0xf4, 0xf7],
+            [0x2e, 0x1a, 0x7d, 0x4d],
+            [0x61, 0x4e, 0xd3, 0xe0],
+        ];
+
+        let abis: Vec<BoxedABI> = vec![
+            BoxedABI { b: Box::new(AEmpty {}), function: selectors[0] },
+            BoxedABI { b: Box::new(A256 { data: vec![0; 32], is_address: false, dont_mutate: false, inner_type: A256InnerType::Uint }), function: selectors[1] },
+            BoxedABI { b: Box::new(AEmpty {}), function: selectors[2] },
+        ];
+
+        input.set_contract_and_abi(contract, Some(abis[0].clone()));
+        assert_eq!(input.data.as_ref().unwrap().function, selectors[0]);
+
+        input.set_contract_and_abi(contract, Some(abis[1].clone()));
+        assert_eq!(input.data.as_ref().unwrap().function, selectors[1]);
+
+        input.set_contract_and_abi(contract, Some(abis[2].clone()));
+        assert_eq!(input.data.as_ref().unwrap().function, selectors[2]);
+
+        input.set_contract_and_abi(contract, Some(abis[0].clone()));
+        assert_eq!(input.data.as_ref().unwrap().function, selectors[0]);
+    }
+
+    #[test]
+    fn test_abi_address_to_instance_map_routing() {
+        let contract_a = EVMAddress::default();
+        let contract_b = {
+            let mut bytes = [0u8; 20];
+            bytes[19] = 1;
+            EVMAddress::from(bytes)
+        };
+
+        let deposit_sel = [0x0f, 0xe1, 0xf4, 0xf7];
+        let withdraw_sel = [0x2e, 0x1a, 0x7d, 0x4d];
+
+        let mut abi_map = ABIAddressToInstanceMap::new();
+        abi_map.add(contract_a, BoxedABI { b: Box::new(AEmpty {}), function: deposit_sel });
+        abi_map.add(contract_a, BoxedABI { b: Box::new(A256 { data: vec![0; 32], is_address: false, dont_mutate: false, inner_type: A256InnerType::Uint }), function: withdraw_sel });
+        abi_map.add(contract_b, BoxedABI { b: Box::new(AEmpty {}), function: deposit_sel });
+
+        assert_eq!(abi_map.map.get(&contract_a).unwrap().len(), 2);
+        assert_eq!(abi_map.map.get(&contract_b).unwrap().len(), 1);
+        assert_eq!(abi_map.map.get(&contract_a).unwrap()[0].function, deposit_sel);
+        assert_eq!(abi_map.map.get(&contract_a).unwrap()[1].function, withdraw_sel);
     }
 }
