@@ -336,7 +336,8 @@ where
                             let actions = input.get_nested_actions_mut();
                             actions.clear();
 
-                            // Optionally prepend a vm.prank action (30% of nested action gens)
+                            // Optionally inject a prank action (30% of nested action gens)
+                            // 50% single-call prank, 50% startPrank+stopPrank pair
                             {
                                 let whale_meta = state.metadata_map()
                                     .get::<WhaleAddressMetadata>()
@@ -346,22 +347,54 @@ where
                                         let whale_addrs: Vec<&EVMAddress> = whale_meta.addresses.iter().collect();
                                         let whale_idx = state.rand_mut().below(whale_addrs.len() as u64) as usize;
                                         let whale_addr = *whale_addrs[whale_idx];
-                                        let prank_call = Vm::prank_0Call { msgSender: whale_addr };
-                                        let prank_calldata = prank_call.abi_encode();
-                                        actions.push(NestedAction {
-                                            target: CHEATCODE_ADDRESS.into(),
-                                            calldata: bytes::Bytes::from(prank_calldata),
-                                            value: EVMU256::ZERO,
-                                        });
+
+                                        if state.rand_mut().below(100) < 50 {
+                                            // 50%: single-call vm.prank(whale)
+                                            let prank_call = Vm::prank_0Call { msgSender: whale_addr };
+                                            let prank_calldata = prank_call.abi_encode();
+                                            actions.push(NestedAction {
+                                                target: CHEATCODE_ADDRESS.into(),
+                                                calldata: bytes::Bytes::from(prank_calldata),
+                                                value: EVMU256::ZERO,
+                                            });
+                                            actions.push(NestedAction {
+                                                target: target_addr,
+                                                calldata: bytes::Bytes::from(calldata.clone()),
+                                                value: EVMU256::ZERO,
+                                            });
+                                        } else {
+                                            // 50%: vm.startPrank(whale) + target + vm.stopPrank()
+                                            let start_call = Vm::startPrank_0Call { msgSender: whale_addr };
+                                            let start_calldata = start_call.abi_encode();
+                                            actions.push(NestedAction {
+                                                target: CHEATCODE_ADDRESS.into(),
+                                                calldata: bytes::Bytes::from(start_calldata),
+                                                value: EVMU256::ZERO,
+                                            });
+                                            actions.push(NestedAction {
+                                                target: target_addr,
+                                                calldata: bytes::Bytes::from(calldata.clone()),
+                                                value: EVMU256::ZERO,
+                                            });
+                                            let stop_call = Vm::stopPrankCall {};
+                                            let stop_calldata = stop_call.abi_encode();
+                                            actions.push(NestedAction {
+                                                target: CHEATCODE_ADDRESS.into(),
+                                                calldata: bytes::Bytes::from(stop_calldata),
+                                                value: EVMU256::ZERO,
+                                            });
+                                        }
                                     }
                                 }
                             }
 
-                            actions.push(NestedAction {
-                                target: target_addr,
-                                calldata: bytes::Bytes::from(calldata),
-                                value: EVMU256::ZERO,
-                            });
+                            if actions.is_empty() {
+                                actions.push(NestedAction {
+                                    target: target_addr,
+                                    calldata: bytes::Bytes::from(calldata),
+                                    value: EVMU256::ZERO,
+                                });
+                            }
                             mutated = true;
                         }
                     }
@@ -669,5 +702,34 @@ mod tests {
         // Verify it can be cloned (needed by mutator to avoid borrow issues)
         let cloned = meta.clone();
         assert_eq!(cloned.addresses.len(), 2);
+    }
+
+    #[test]
+    fn test_start_stop_prank_action_abi_encoding() {
+        let whale = EVMAddress::from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        // 1. Encode vm.startPrank(whale)
+        let start_call = Vm::startPrank_0Call { msgSender: whale };
+        let start_encoded = start_call.abi_encode();
+        assert_eq!(start_encoded.len(), 36);
+
+        let decoded_start = VmCalls::abi_decode(&start_encoded).expect("startPrank decode should succeed");
+        match decoded_start {
+            VmCalls::startPrank_0(args) => {
+                assert_eq!(args.msgSender, whale);
+            }
+            other => panic!("Expected startPrank_0, got {:?}", other),
+        }
+
+        // 2. Encode vm.stopPrank()
+        let stop_call = Vm::stopPrankCall {};
+        let stop_encoded = stop_call.abi_encode();
+        assert_eq!(stop_encoded.len(), 4, "stopPrank has no arguments, should be 4-byte selector");
+
+        let decoded_stop = VmCalls::abi_decode(&stop_encoded).expect("stopPrank decode should succeed");
+        match decoded_stop {
+            VmCalls::stopPrank(_) => {}
+            other => panic!("Expected stopPrank, got {:?}", other),
+        }
     }
 }
