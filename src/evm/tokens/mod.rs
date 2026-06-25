@@ -118,7 +118,7 @@ pub trait PairContext {
 }
 
 #[derive(Clone)]
-enum PairContextTy {
+pub enum PairContextTy {
     Uniswap(Rc<RefCell<v2_transformer::UniswapPairContext>>),
     UniswapV3(Rc<RefCell<v3_transformer::UniswapV3PairContext>>),
     Weth(Rc<RefCell<weth_transformer::WethContext>>),
