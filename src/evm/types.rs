@@ -17,6 +17,8 @@ pub struct Env {
     pub cfg: CfgEnv,
     pub block: BlockEnv,
     pub tx: TxEnv,
+    #[serde(default)]
+    pub is_staleness_test: bool,
 }
 
 /// Common generic types for EVM fuzzing

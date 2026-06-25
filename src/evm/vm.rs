@@ -593,6 +593,10 @@ where
 
         self.host.evmstate = vm_state.clone();
         self.host.env = input.get_vm_env().clone();
+        self.host.is_staleness_test = input.get_vm_env().is_staleness_test;
+        if self.host.initial_block_timestamp.is_none() && !input.get_vm_env().is_staleness_test {
+            self.host.initial_block_timestamp = Some(input.get_vm_env().block.timestamp);
+        }
         self.host.env.tx.caller = if input.get_origin().is_zero() {
             input.get_caller()
         } else {
@@ -1200,7 +1204,7 @@ mod tests {
             host::{FuzzHost, JMP_MAP},
             input::{ConciseEVMInput, EVMInput, EVMInputTy, NestedAction},
             mutator::AccessPattern,
-            types::{fixed_address, generate_random_address, EVMFuzzState, EVMU256},
+            types::{fixed_address, generate_random_address, EVMFuzzState, EVMU256, Env},
             vm::{EVMExecutor, EVMState},
         },
         generic_vm::vm_executor::{GenericVM, MAP_SIZE},
@@ -1426,5 +1430,126 @@ mod tests {
         expected_output[31] = 1;
         assert_eq!(query_result.output, expected_output);
     }
- }
+
+    #[test]
+    fn test_warp_delta_sync_for_oracle_staleness() {
+        let mut state: EVMFuzzState = FuzzState::new(0);
+        let path = Path::new("work_dir");
+        if !path.exists() {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut evm_executor: EVMExecutor<EVMState, ConciseEVMInput, StdScheduler<EVMFuzzState>> = EVMExecutor::new(
+            FuzzHost::new(StdScheduler::new(), "work_dir".to_string()),
+            generate_random_address(&mut state),
+        );
+        tuple_list!();
+
+        // 1. Deploy mock oracle contract exposing latestRoundData (0xfeaf968c)
+        // bytecode for a simple contract returning:
+        // roundId = 0, answer = 0, startedAt = 1000, updatedAt = 1000, answeredInRound = 0
+        // Selector 0xfeaf968c
+        let mock_oracle_bytecode = hex::decode("601180600b6000396000f36103e86040526103e860605260a06000f3").unwrap();
+        let mock_oracle_addr = evm_executor
+            .deploy(
+                Bytecode::new_raw(revm_primitives::Bytes::from(mock_oracle_bytecode)),
+                None,
+                generate_random_address(&mut state),
+                &mut FuzzState::new(0),
+            )
+            .unwrap();
+
+        // Register code in host
+        evm_executor.host.set_code(
+            mock_oracle_addr,
+            Bytecode::new_raw(revm_primitives::Bytes::from(hex::decode("6103e86040526103e860605260a06000f3").unwrap())),
+            &mut state,
+        );
+
+        // 2. Deploy caller contract
+        let caller_bytecode = hex::decode("603b80600b6000396000f37ffeaf968c0000000000000000000000000000000000000000000000000000000000000060805260003560a060006004608084620f4240fa5060a06000f3").unwrap();
+        let caller_addr = evm_executor
+            .deploy(
+                Bytecode::new_raw(revm_primitives::Bytes::from(caller_bytecode)),
+                None,
+                generate_random_address(&mut state),
+                &mut FuzzState::new(0),
+            )
+            .unwrap();
+
+        evm_executor.host.set_code(
+            caller_addr,
+            Bytecode::new_raw(revm_primitives::Bytes::from(hex::decode("7ffeaf968c0000000000000000000000000000000000000000000000000000000060805260003560a060006004608084620f4240fa5060a06000f3").unwrap())),
+            &mut state,
+        );
+
+        // 3. Call caller contract Y with X in calldata, with warping
+        let mut calldata = vec![0; 32];
+        calldata[12..32].copy_from_slice(mock_oracle_addr.as_slice());
+
+        let mut env = Env::default();
+        env.block.timestamp = EVMU256::from(2000);
+        env.is_staleness_test = false;
+
+        let input = EVMInput {
+            caller: generate_random_address(&mut state),
+            contract: caller_addr,
+            data: None,
+            sstate: StagedVMState::new_uninitialized(),
+            sstate_idx: 0,
+            txn_value: Some(EVMU256::ZERO),
+            step: false,
+            env,
+            access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+            liquidation_percent: 0,
+            direct_data: Bytes::from(calldata.clone()),
+            input_type: EVMInputTy::ABI,
+            randomness: vec![],
+            repeat: 1,
+            swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
+        };
+
+        // Explicitly set initial block timestamp on the executor's host
+        evm_executor.host.initial_block_timestamp = Some(EVMU256::from(1000));
+
+        let res = evm_executor.execute(&input, &mut state);
+        assert!(!res.reverted);
+        assert_eq!(res.output.len(), 160);
+
+        // Parse round data: updatedAt is the 4th slot (offset 96..128)
+        let updated_at = EVMU256::try_from_be_slice(&res.output[96..128]).unwrap();
+        assert_eq!(updated_at, EVMU256::from(2000), "updatedAt must be adjusted by warp delta (1000)");
+
+        // 4. Call again with is_staleness_test = true. Output should NOT be synced, returned as original 1000.
+        let mut env_stale = Env::default();
+        env_stale.block.timestamp = EVMU256::from(2000);
+        env_stale.is_staleness_test = true;
+
+        let input_stale = EVMInput {
+            caller: generate_random_address(&mut state),
+            contract: caller_addr,
+            data: None,
+            sstate: StagedVMState::new_uninitialized(),
+            sstate_idx: 0,
+            txn_value: Some(EVMU256::ZERO),
+            step: false,
+            env: env_stale,
+            access_pattern: Rc::new(RefCell::new(AccessPattern::new())),
+            liquidation_percent: 0,
+            direct_data: Bytes::from(calldata),
+            input_type: EVMInputTy::ABI,
+            randomness: vec![],
+            repeat: 1,
+            swap_data: HashMap::new(),
+            nested_actions: Vec::new(),
+        };
+
+        let res_stale = evm_executor.execute(&input_stale, &mut state);
+        assert!(!res_stale.reverted);
+        assert_eq!(res_stale.output.len(), 160);
+
+        let updated_at_stale = EVMU256::try_from_be_slice(&res_stale.output[96..128]).unwrap();
+        assert_eq!(updated_at_stale, EVMU256::from(1000), "updatedAt must not be adjusted when is_staleness_test is true");
+    }
+}
  

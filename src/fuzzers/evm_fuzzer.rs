@@ -295,6 +295,7 @@ pub fn evm_fuzzer(
     state.add_metadata(instance_map);
 
     evm_executor.host.initialize(state);
+    evm_executor.host.initial_block_timestamp = Some(artifacts.initial_env.block.timestamp);
 
     // now evm executor is ready, we can clone it
 

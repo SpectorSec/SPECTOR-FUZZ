@@ -262,6 +262,10 @@ where
     pub expected_emits: std::collections::VecDeque<ExpectedEmit>,
     /// Expected calls set by vm.expectCall
     pub expected_calls: ExpectedCallTracker,
+    /// The base block timestamp when fork/execution started
+    pub initial_block_timestamp: Option<EVMU256>,
+    /// Whether the current transaction is a staleness check
+    pub is_staleness_test: bool,
 }
 
 impl<SC> Debug for FuzzHost<SC>
@@ -337,6 +341,8 @@ where
             expected_revert: self.expected_revert.clone(),
             expected_emits: self.expected_emits.clone(),
             expected_calls: self.expected_calls.clone(),
+            initial_block_timestamp: self.initial_block_timestamp,
+            is_staleness_test: self.is_staleness_test,
         }
     }
 }
@@ -420,6 +426,8 @@ where
             expected_revert: None,
             expected_emits: std::collections::VecDeque::new(),
             expected_calls: ExpectedCallTracker::new(),
+            initial_block_timestamp: None,
+            is_staleness_test: false,
         }
     }
 
@@ -1405,6 +1413,34 @@ where
                 self.call_allow_control_leak(&mut input, interp, output_info, state)
             }
         };
+        let was_cheatcode = input.target_address == CHEATCODE_ADDRESS;
+
+        if !was_cheatcode && res.0 == InstructionResult::Return {
+            let calldata = Self::get_input_bytes(&input.input);
+            let is_oracle_call = calldata.len() >= 4 && (
+                calldata[0..4] == [0xfe, 0xaf, 0x96, 0x8c] || // latestRoundData()
+                calldata[0..4] == [0x9a, 0x6f, 0xc8, 0xf5]   // getRoundData(uint80)
+            );
+            if is_oracle_call && !unsafe { IS_FAST_CALL_STATIC } && !self.is_staleness_test {
+                if let Some(initial_ts) = self.initial_block_timestamp {
+                    let delta = self.env.block.timestamp.saturating_sub(initial_ts);
+                    if delta > EVMU256::ZERO && res.2.len() >= 128 {
+                        let mut returned_data = res.2.to_vec();
+                        let mut started_at = EVMU256::try_from_be_slice(&returned_data[64..96]).unwrap_or(EVMU256::ZERO);
+                        let mut updated_at = EVMU256::try_from_be_slice(&returned_data[96..128]).unwrap_or(EVMU256::ZERO);
+                        if started_at > EVMU256::ZERO {
+                            started_at = started_at.saturating_add(delta);
+                            returned_data[64..96].copy_from_slice(&started_at.to_be_bytes::<32>());
+                        }
+                        if updated_at > EVMU256::ZERO {
+                            updated_at = updated_at.saturating_add(delta);
+                            returned_data[96..128].copy_from_slice(&updated_at.to_be_bytes::<32>());
+                        }
+                        res.2 = Bytes::from(returned_data);
+                    }
+                }
+            }
+        }
 
         let ret_buffer = res.2.clone();
         let was_cheatcode = input.target_address == CHEATCODE_ADDRESS;

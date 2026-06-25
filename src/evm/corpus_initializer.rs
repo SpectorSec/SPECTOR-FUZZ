@@ -901,6 +901,7 @@ where
                     let mut warped_env = artifacts.initial_env.clone();
                     warped_env.block.timestamp = artifacts.initial_env.block.timestamp
                         + EVMU256::from(delta);
+                    warped_env.is_staleness_test = true;
                     // Seed: call the oracle itself with warped time. The fuzzer
                     // will then combine this snapshot with downstream protocol calls.
                     let warp_seed = EVMInput {
