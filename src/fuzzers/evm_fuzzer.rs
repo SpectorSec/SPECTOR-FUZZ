@@ -45,6 +45,7 @@ use crate::{
             middleware::Middleware,
             reentrancy::ReentrancyTracer,
             sha3_bypass::{Sha3Bypass, Sha3TaintAnalysis},
+            value_capture::ValueCaptureMiddleware,
         },
         minimizer::EVMMinimizer,
         mutator::FuzzMutator,
@@ -199,6 +200,11 @@ pub fn evm_fuzzer(
     if config.reentrancy_oracle {
         debug!("reentrancy oracle enabled");
         fuzz_host.add_middlewares(Rc::new(RefCell::new(ReentrancyTracer::new())));
+    }
+
+    if config.value_capture {
+        debug!("value capture middleware enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(ValueCaptureMiddleware::new())));
     }
 
     let mut evm_executor: EVMQueueExecutor = EVMExecutor::new(fuzz_host, deployer);
@@ -903,6 +909,9 @@ pub fn evm_fuzzer(
                     // );
 
                     vm_state = state.get_execution_result().new_state.clone();
+                    if config.value_capture {
+                        info!("Observed values: {:?}", vm_state.state.observed_values);
+                    }
                     info!("================================================");
                 }
             }

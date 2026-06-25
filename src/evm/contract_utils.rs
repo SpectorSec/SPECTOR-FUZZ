@@ -305,7 +305,13 @@ impl ContractLoader {
         let mut file = File::open(path).unwrap();
         let mut data = String::new();
         file.read_to_string(&mut data).unwrap();
-        hex::decode(data.trim()).expect("Failed to parse hex file")
+        let trimmed = data.trim();
+        let hex_str = if let Some(stripped) = trimmed.strip_prefix("0x") {
+            stripped
+        } else {
+            trimmed
+        };
+        hex::decode(hex_str).expect("Failed to parse hex file")
     }
 
     fn constructor_args_encode(constructor_args: &[String]) -> Vec<u8> {

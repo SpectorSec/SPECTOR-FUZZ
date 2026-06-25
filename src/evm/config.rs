@@ -93,6 +93,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub math_calculate_oracle: bool,
     pub local_files_basedir_pattern: Option<String>,
     pub load_corpus: String,
+    pub value_capture: bool,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
 }

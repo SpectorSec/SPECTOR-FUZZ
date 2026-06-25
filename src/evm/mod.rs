@@ -228,6 +228,10 @@ pub struct EvmArgs {
     #[arg(long, default_value = "true")]
     sha3_bypass: bool,
 
+    /// Enable Value Capture Middleware (Phase 1)
+    #[arg(long, default_value = "false")]
+    value_capture: bool,
+
     /// Only fuzz contracts with the addresses provided, separated by comma
     #[arg(long, default_value = "")]
     only_fuzz: String,
@@ -335,6 +339,7 @@ impl fmt::Display for EvmArgs {
         write!(f, "    run_forever: {},\n", self.run_forever)?;
         write!(f, "    seed: {},\n", self.seed)?;
         write!(f, "    sha3_bypass: {},\n", self.sha3_bypass)?;
+        write!(f, "    value_capture: {},\n", self.value_capture)?;
         write!(f, "    only_fuzz: {},\n", self.only_fuzz)?;
         write!(f, "    base_path: {},\n", self.base_path)?;
         write!(f, "    spec_id: {},\n", self.spec_id)?;
@@ -836,6 +841,7 @@ pub fn evm_main(mut args: EvmArgs) {
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
+        value_capture: args.value_capture,
         etherscan_api_key,
     };
 
@@ -1025,6 +1031,7 @@ fn test_evm_offchain_setup() {
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
+        value_capture: args.value_capture,
         etherscan_api_key: String::from(""),
     };
 

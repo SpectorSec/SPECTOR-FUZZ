@@ -192,6 +192,7 @@ where
     // If you use RefCell, modifying middlewares during execution will cause a panic
     // because the executor borrows middlewares over its entire lifetime.
     pub middlewares: RwLock<Vec<Rc<RefCell<dyn Middleware<SC>>>>>,
+    pub last_call_result: Option<InstructionResult>,
 
     pub coverage_changed: bool,
 
@@ -307,6 +308,7 @@ where
             pc_to_call_hash: self.pc_to_call_hash.clone(),
             middlewares_enabled: false,
             middlewares: RwLock::new(Default::default()),
+            last_call_result: None,
             coverage_changed: false,
             flashloan_middleware: self.flashloan_middleware.clone(),
             middlewares_latent_call_actions: vec![],
@@ -392,6 +394,7 @@ where
             pc_to_call_hash: HashMap::new(),
             middlewares_enabled: false,
             middlewares: RwLock::new(Default::default()),
+            last_call_result: None,
             coverage_changed: false,
             flashloan_middleware: None,
             middlewares_latent_call_actions: vec![],
@@ -1451,6 +1454,7 @@ where
             self.clean_prank();
         }
 
+        self.last_call_result = Some(res.0);
         unsafe {
             if self.middlewares_enabled {
                 let mut middlewares = self.middlewares.read().unwrap().clone();
@@ -1462,6 +1466,7 @@ where
                 }
             }
         }
+        self.last_call_result = None;
         res
     }
 

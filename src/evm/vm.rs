@@ -34,7 +34,7 @@ use crate::{
         bytecode_analyzer,
         host::{FuzzHost, CMP_MAP, COVERAGE_NOT_CHANGED, JMP_MAP, READ_MAP, STATE_CHANGE, WRITE_MAP},
         input::{ConciseEVMInput, EVMInputT, EVMInputTy},
-        middlewares::middleware::Middleware,
+        middlewares::middleware::{Middleware, MiddlewareType},
         onchain::flashloan::FlashloanData,
         types::{float_scale_to_u512, EVMAddress, EVMU256, EVMU512},
         vm::Constraint::{NoLiquidation, Value},
@@ -229,6 +229,9 @@ pub struct EVMState {
 
     /// Balance of addresses
     pub balance: HashMap<EVMAddress, EVMU256>,
+
+    /// Observed return values from contract calls (for parameter routing)
+    pub observed_values: HashMap<String, Vec<EVMU256>>,
 
     /// Post execution context
     /// If control leak happens, we add the post execution context to the VM
@@ -678,6 +681,39 @@ where
             stack: interp.stack.data().clone(),
             memory: interp.memory.context_memory().to_vec(),
         };
+
+        // Capture top-level return values if value capture is enabled and execution succeeded
+        let is_value_capture_enabled = self.host.middlewares_enabled && {
+            let mws = self.host.middlewares.read().unwrap();
+            mws.iter().any(|mw| mw.borrow().get_type() == MiddlewareType::ValueCapture)
+        };
+
+        if is_value_capture_enabled && !is_reverted_or_control_leak(&r) && result.output.len() >= 32 {
+            let calldata = &data;
+            let mut selector = [0u8; 4];
+            if calldata.len() >= 4 {
+                selector.copy_from_slice(&calldata[0..4]);
+            }
+            let key = format!("{:?}_{}_return", input.get_contract(), hex::encode(selector));
+            let mut values_to_add = Vec::new();
+            for chunk in result.output.chunks_exact(32) {
+                let val = EVMU256::from_be_bytes::<32>(chunk.try_into().unwrap());
+                values_to_add.push(val);
+            }
+            if !values_to_add.is_empty() {
+                let observed = &mut result.new_state.observed_values;
+                let list = observed.entry(key).or_default();
+                for val in values_to_add {
+                    if !list.contains(&val) {
+                        list.push(val);
+                    }
+                }
+                if list.len() > 10 {
+                    let drain_idx = list.len() - 10;
+                    list.drain(0..drain_idx);
+                }
+            }
+        }
 
         // [todo] remove this
         unsafe {
