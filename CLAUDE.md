@@ -82,3 +82,10 @@ cargo test
 - `vendor/libafl_bolts-0.11.2` — patched, load-bearing
 - `tests/presets/v2_pair/*.bytecode` — included via include_str! in contract_utils.rs
 - `rust-toolchain.toml` — pins nightly version
+
+## Git Synchronization & SSH Push Setup
+*   **Target GitHub Repo**: `git@github.com:SpectorSec/SPECTOR-FUZZ.git` mapped under remote name `spectorfuzz`.
+*   **SSH Credentials**: Authenticates automatically using the user's SSH keys configured at `~/.ssh/id_ed25519` (linked to `SpectorSec` GitHub account).
+*   **Shallow/Divergent History Sync**: The remote repository was initialized with a different/shallow history. In order to sync local work, agents must:
+    1.  Ensure the repository is unshallowed by running `git fetch --unshallow upstream` if it is shallow.
+    2.  Force-push the local `main` branch to update the remote: `git push --force spectorfuzz main`.
