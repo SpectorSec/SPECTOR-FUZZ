@@ -519,11 +519,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use alloy_sol_types::{SolCall, SolInterface};
     use bytes::Bytes;
+    use foundry_cheatcodes::Vm::{self, VmCalls};
     use libafl::state::HasMetadata;
     use crate::evm::abi::{AEmpty, A256, A256InnerType, ABIAddressToInstanceMap};
     use crate::evm::input::{EVMInput, EVMInputT, EVMInputTy};
-    use crate::evm::oracles::OracleTargetMetadata;
+    use crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS;
+    use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
     use crate::evm::types::{EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256};
     use crate::evm::mutator::BoxedABI;
 
@@ -615,5 +618,56 @@ mod tests {
         assert_eq!(abi_map.map.get(&contract_b).unwrap().len(), 1);
         assert_eq!(abi_map.map.get(&contract_a).unwrap()[0].function, deposit_sel);
         assert_eq!(abi_map.map.get(&contract_a).unwrap()[1].function, withdraw_sel);
+    }
+
+    #[test]
+    fn test_prank_action_abi_encoding() {
+        let whale = EVMAddress::from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        // Encode vm.prank(whale)
+        let prank_call = Vm::prank_0Call { msgSender: whale };
+        let encoded = prank_call.abi_encode();
+
+        // Should be 36 bytes: 4-byte selector + 32-byte padded address
+        assert_eq!(encoded.len(), 36, "prank(address) abi_encode should be 36 bytes");
+
+        // Decode back and verify it's a prank_0 call
+        let decoded = VmCalls::abi_decode(&encoded).expect("abi_decode should succeed");
+        match decoded {
+            VmCalls::prank_0(args) => {
+                assert_eq!(args.msgSender, whale, "Decoded prank address should match");
+            }
+            other => panic!("Expected prank_0, got {:?}", other),
+        }
+
+        // Verify the NestedAction targets CHEATCODE_ADDRESS
+        use crate::evm::input::NestedAction;
+        let action = NestedAction {
+            target: CHEATCODE_ADDRESS.into(),
+            calldata: bytes::Bytes::from(encoded),
+            value: EVMU256::ZERO,
+        };
+        assert_eq!(action.target.as_slice(), crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS.as_slice());
+    }
+
+    #[test]
+    fn test_whale_address_metadata_seeding() {
+        let mut state = EVMFuzzState::new(0);
+        use std::collections::HashSet;
+
+        // Simulate what corpus_initializer does: insert WhaleAddressMetadata
+        let mut addresses = HashSet::new();
+        addresses.insert(EVMAddress::from([0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]));
+        addresses.insert(EVMAddress::from([0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]));
+        state.metadata_map_mut().insert(WhaleAddressMetadata { addresses });
+
+        // Verify metadata is populated
+        let meta = state.metadata_map().get::<WhaleAddressMetadata>()
+            .expect("WhaleAddressMetadata should exist after insert");
+        assert_eq!(meta.addresses.len(), 2, "Should have 2 whale addresses");
+
+        // Verify it can be cloned (needed by mutator to avoid borrow issues)
+        let cloned = meta.clone();
+        assert_eq!(cloned.addresses.len(), 2);
     }
 }
