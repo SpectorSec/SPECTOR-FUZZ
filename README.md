@@ -151,7 +151,7 @@ corpus_initializer.rs — detects token standards, oracle interfaces, privileged
     ↓
 evm_fuzzer.rs — auto-activates matching oracles
     ↓
-LibAFL mutation engine → revm fork execution
+LibAFL mutation engine → revm fork execution (interceptor middlewares)
     ↓
 Oracle layer — post-execution state observation
     ↓
@@ -159,6 +159,13 @@ LiquidationRouter — confirms economic extractability via fork-native DEX routi
     ↓
 findings/
 ```
+
+### The Exploit Loop: Middleware & Oracles
+Rather than executing code passively, SPECTOR-FUZZ runs a continuous feedback loop between the **Middleware** (the actors changing blockchain reality) and the **Oracles** (the observers checking safety rules):
+*   **State Manipulation (Middleware)**: The mutation engine uses the **Cheatcode Middleware** and **Flashloan Middleware** to construct a custom execution scenario (e.g., borrowing $50M in a flashloan, warping time 3 days ahead, and pranking a whale caller).
+*   **Observation (Oracles)**: Post-execution, the active **Oracle Suite** (like `ERC20Oracle`) scans the mutated EVM state. If an oracle detects a state leak (e.g., an unauthorized token balance increase), it triggers a validation callback.
+*   **Economic Validation (Oracle ⇄ Router)**: The Oracle passes the detected tokens to the **Autonomous Liquidation Router**. The router executes dynamic swaps to see if those assets can be swapped to WETH/USDC on-chain.
+*   **Confirm & Report**: If the liquidator successfully extracts value, the oracle flags it as a verified economic exploit and outputs the finding.
 
 ---
 
