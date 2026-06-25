@@ -1471,33 +1471,45 @@ impl OnChainConfig {
         //    ERC-4626, Curve, UniV2, UniV3 autonomously via on-chain registries).
         if self.liqsim_addr.is_some() {
             if let Some((_route_type, route_addr)) = self.liqsim_discover_route(token_addr) {
-                let token_str = format!("{:?}", token_addr).to_lowercase();
-                let weth_str = self.get_weth();
-                // Simulator confirmed a route exists — surface it so the rest of the
-                // pipeline (add_reserve_info, flashloan) can use it.
-                let chain_suffix = self.chain_name.as_str();
-                let (interface, src_exact) = match _route_type {
-                    3 => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
-                    4 => ("uniswapv3", format!("uniswapv3_{}", chain_suffix)),
-                    _ => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
-                };
-                return Some(PairData {
-                    src: "lp".to_string(),
-                    in_: 0,
-                    pair: format!("{:?}", route_addr).to_lowercase(),
-                    in_token: token_str.clone(),
-                    next: weth_str.clone(),
-                    interface: interface.to_string(),
-                    src_exact,
-                    initial_reserves_0: EVMU256::ZERO,
-                    initial_reserves_1: EVMU256::ZERO,
-                    decimals_0: 18,
-                    decimals_1: 18,
-                    token0: token_str,
-                    token1: weth_str,
-                });
+                if _route_type == 1 || _route_type == 2 || _route_type == 3 {
+                    return self.get_pair_from_fork(route_addr);
+                }
+
+                if _route_type != 4 {
+                    let token_str = format!("{:?}", token_addr).to_lowercase();
+                    let weth_str = self.get_weth();
+                    let chain_suffix = self.chain_name.as_str();
+                    let (interface, src_exact) = match _route_type {
+                        5 => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
+                        6 => {
+                            let mut fee = 3000;
+                            let fee_call = self.eth_call(route_addr, Bytes::from(vec![0xdd, 0xca, 0x3f, 0x43]));
+                            if fee_call.len() >= 32 {
+                                fee = u32::from_be_bytes(fee_call[28..32].try_into().unwrap_or([0, 11, 184, 0]));
+                            }
+                            ("uniswapv3", format!("uniswapv3:{}", fee))
+                        }
+                        _ => ("uniswapv2", format!("uniswapv2_{}", chain_suffix)),
+                    };
+                    return Some(PairData {
+                        src: "lp".to_string(),
+                        in_: 0,
+                        pair: format!("{:?}", route_addr).to_lowercase(),
+                        in_token: token_str.clone(),
+                        next: weth_str.clone(),
+                        interface: interface.to_string(),
+                        src_exact,
+                        initial_reserves_0: EVMU256::ZERO,
+                        initial_reserves_1: EVMU256::ZERO,
+                        decimals_0: 18,
+                        decimals_1: 18,
+                        token0: token_str,
+                        token1: weth_str,
+                    });
+                }
             }
         }
+
 
         // ── Fallback: Rust LiquidationRouter (works on non-Anvil endpoints too) ──
         let weth_str = self.get_weth();
@@ -1824,6 +1836,114 @@ mod tests {
         let mut config = OnChainConfig::new(BSC, 37381166);
         let v = config.get_v3_fee(EVMAddress::from_str("0x4f31fa980a675570939b737ebdde0471a4be40eb").unwrap());
         println!("{:?}", v);
+    }
+
+    #[test]
+    fn test_get_pair_from_fork_uniswap_v3_mocked() {
+        use std::net::TcpListener;
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            
+            // Connection 1: liqsim_discover_route call
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut buffer);
+                
+                let response_body = r#"{"jsonrpc":"2.0","result":"0x000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000aa","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            
+            // Connection 2: eth_call for Uniswap V3 pool fee() query
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut buffer);
+                
+                let response_body = r#"{"jsonrpc":"2.0","result":"0x00000000000000000000000000000000000000000000000000000000000001f4","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut config = OnChainConfig::new(Chain::ETH, 0);
+        config.endpoint_url = format!("http://127.0.0.1:{}", port);
+        config.liqsim_addr = Some(EVMAddress::from_str("0x00000000000000000000000000000000004C514C").unwrap());
+
+        let token = EVMAddress::from_str("0x000000000000000000000000000000000000000b").unwrap();
+        let pair_data_opt = config.get_pair_from_fork(token);
+        
+        assert!(pair_data_opt.is_some(), "Should resolve route via mock server");
+        let pair_data = pair_data_opt.unwrap();
+        
+        assert_eq!(pair_data.interface, "uniswapv3");
+        assert_eq!(pair_data.src_exact, "uniswapv3:500");
+        assert_eq!(pair_data.pair, "0x00000000000000000000000000000000000000aa");
+    }
+
+    #[test]
+    fn test_get_pair_from_fork_lending_recursion_mocked() {
+        use std::net::TcpListener;
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            
+            // Connection 1: vault token -> underlying
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut buffer);
+                
+                let response_body = r#"{"jsonrpc":"2.0","result":"0x000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000000000000000000000000000000000000bb","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+
+            // Connection 2: underlying -> WETH pair
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut buffer);
+                
+                let response_body = r#"{"jsonrpc":"2.0","result":"0x000000000000000000000000000000000000000000000000000000000000000500000000000000000000000000000000000000000000000000000000000000cc","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut config = OnChainConfig::new(Chain::ETH, 0);
+        config.endpoint_url = format!("http://127.0.0.1:{}", port);
+        config.liqsim_addr = Some(EVMAddress::from_str("0x00000000000000000000000000000000004C514C").unwrap());
+
+        let a_token = EVMAddress::from_str("0x00000000000000000000000000000000000000aa").unwrap();
+        let pair_data_opt = config.get_pair_from_fork(a_token);
+        
+        assert!(pair_data_opt.is_some(), "Should recursively resolve underlying asset");
+        let pair_data = pair_data_opt.unwrap();
+        
+        assert_eq!(pair_data.interface, "uniswapv2");
+        assert_eq!(pair_data.pair, "0x00000000000000000000000000000000000000cc");
+        assert_eq!(pair_data.in_token, "0x00000000000000000000000000000000000000bb");
     }
 
     // #[test]
