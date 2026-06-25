@@ -14,7 +14,7 @@ use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
         oracle::EVMBugResult,
-        oracles::ARB_CALL_BUG_IDX,
+        oracles::{OracleTargetMetadata, ARB_CALL_BUG_IDX},
         srcmap::SOURCE_MAP_PROVIDER,
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
@@ -78,6 +78,30 @@ impl
     ) -> Vec<u64> {
         if !ctx.post_state.arbitrary_calls.is_empty() {
             let mut res = vec![];
+
+            // Push flagged targets into OracleTargetMetadata for mutator feedback
+            {
+                let mut flagged_targets = Vec::new();
+                for (_caller, target, _pc) in ctx.post_state.arbitrary_calls.iter() {
+                    if !ctx.fuzz_state.has_caller(target) {
+                        flagged_targets.push(target.0 .0);
+                    }
+                }
+
+                if !flagged_targets.is_empty() {
+                    if !ctx.fuzz_state.has_metadata::<OracleTargetMetadata>() {
+                        ctx.fuzz_state.metadata_map_mut().insert(OracleTargetMetadata::default());
+                    }
+                    let meta = ctx.fuzz_state.metadata_map_mut()
+                        .get_mut::<OracleTargetMetadata>()
+                        .unwrap();
+                    for key in flagged_targets {
+                        let entry = meta.targets.entry(key).or_insert_with(|| ("ArbitraryCall".to_string(), ARB_CALL_BUG_IDX, 0));
+                        entry.2 += 1;
+                    }
+                }
+            }
+
             for (caller, target, pc) in ctx.post_state.arbitrary_calls.iter() {
                 if ctx.fuzz_state.has_caller(target) {
                     continue;

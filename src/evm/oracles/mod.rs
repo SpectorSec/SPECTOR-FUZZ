@@ -1,4 +1,19 @@
+use std::collections::HashMap;
+
+use libafl_bolts::impl_serdeany;
+use serde::{Deserialize, Serialize};
+
 use super::types::EVMU512;
+
+/// Stores addresses flagged by oracles so the mutator can bias NestedAction
+/// target selection toward addresses that triggered oracle detections.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OracleTargetMetadata {
+    /// Map from flagged address to (reason, bug_idx, hit_count)
+    pub targets: HashMap<[u8; 20], (String, u64, u64)>,
+}
+
+impl_serdeany!(OracleTargetMetadata);
 
 pub mod approval;
 pub mod arb_call;

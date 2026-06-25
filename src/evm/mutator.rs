@@ -15,9 +15,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{EVMInputT, NestedAction};
+use crate::evm::oracles::OracleTargetMetadata;
 use crate::{
     evm::{
-        abi::ABIAddressToInstanceMap,
+        abi::{ABIAddressToInstanceMap, BoxedABI},
         input::EVMInputTy::Borrow,
         types::{convert_u256_to_h160, EVMAddress, EVMU256},
         vm::{Constraint, EVMStateT},
@@ -290,7 +291,21 @@ where
 
             // Mutate nested actions (with 15% probability)
             if state.rand_mut().below(100) < 15 {
-                let keys = {
+                // Check oracle-flagged targets first (80% bias)
+                let oracle_targets = state.metadata_map()
+                    .get::<OracleTargetMetadata>()
+                    .map(|m| m.targets.keys().cloned().collect::<Vec<[u8; 20]>>())
+                    .unwrap_or_default();
+
+                let use_oracle_target = !oracle_targets.is_empty() && state.rand_mut().below(100) < 80;
+
+                if use_oracle_target {
+                    eprintln!("[FeedbackLoop] using {} oracle-flagged targets for NestedAction", oracle_targets.len());
+                }
+
+                let keys: Option<Vec<EVMAddress>> = if use_oracle_target {
+                    Some(oracle_targets.into_iter().map(EVMAddress::from).collect())
+                } else {
                     let abis = state.metadata_map().get::<ABIAddressToInstanceMap>();
                     abis.map(|m| m.map.keys().cloned().collect::<Vec<EVMAddress>>())
                 };
@@ -301,8 +316,8 @@ where
                         let target_addr = keys[target_idx];
 
                         let abi_len = {
-                            let abis = state.metadata_map().get::<ABIAddressToInstanceMap>().unwrap();
-                            abis.map.get(&target_addr).map(|v| v.len()).unwrap_or(0)
+                            let abis = state.metadata_map().get::<ABIAddressToInstanceMap>();
+                            abis.and_then(|m| m.map.get(&target_addr).map(|v| v.len())).unwrap_or(0)
                         };
 
                         if abi_len > 0 {
@@ -324,6 +339,38 @@ where
                             });
                             mutated = true;
                         }
+                    }
+                }
+            }
+
+            // Re-sample function selector with 10% probability
+            // Prevents getting stuck on a single function (e.g. deposit())
+            // Biases toward oracle-flagged targets (same 80% pattern as NestedAction)
+            if state.rand_mut().below(100) < 10 {
+                let abi_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
+                let oracle_targets: Vec<EVMAddress> = state.metadata_map()
+                    .get::<OracleTargetMetadata>()
+                    .map(|m| m.targets.keys().cloned().map(EVMAddress::from).collect())
+                    .unwrap_or_default();
+
+                let use_oracle_bias = !oracle_targets.is_empty() && state.rand_mut().below(100) < 80;
+
+                if let Some(abi_map) = abi_map {
+                    let mut candidates: Vec<(EVMAddress, BoxedABI)> = Vec::new();
+                    for (addr, abis) in &abi_map.map {
+                        if use_oracle_bias && !oracle_targets.contains(addr) {
+                            continue;
+                        }
+                        for abi in abis {
+                            candidates.push((*addr, abi.clone()));
+                        }
+                    }
+
+                    if !candidates.is_empty() {
+                        let idx = state.rand_mut().below(candidates.len() as u64) as usize;
+                        let (contract, chosen) = candidates.swap_remove(idx);
+                        input.set_contract_and_abi(contract, Some(chosen));
+                        mutated = true;
                     }
                 }
             }
@@ -441,5 +488,38 @@ where
             tries += 1;
         }
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use libafl::state::{HasMetadata, State};
+    use crate::evm::oracles::OracleTargetMetadata;
+    use crate::evm::types::EVMFuzzState;
+
+    #[test]
+    fn test_oracle_target_metadata_push_and_read() {
+        let mut state: EVMFuzzState = crate::evm::types::EVMFuzzState::new(0);
+
+        // Verify metadata is empty initially
+        assert!(state.metadata_map().get::<OracleTargetMetadata>().is_none());
+
+        // Push a flagged address
+        if state.metadata_map().get::<OracleTargetMetadata>().is_none() {
+            state.metadata_map_mut().insert(OracleTargetMetadata::default());
+        }
+        let meta = state.metadata_map_mut().get_mut::<OracleTargetMetadata>().unwrap();
+        let addr = [0x01u8; 20];
+        meta.targets.entry(addr).or_insert_with(|| ("ArbitraryCall".to_string(), 8, 1));
+        meta.targets.get_mut(&addr).unwrap().2 += 1;
+
+        // Verify count
+        assert_eq!(meta.targets.get(&addr).unwrap().2, 2);
+        assert_eq!(meta.targets.len(), 1);
+
+        // Verify reason and bug_idx
+        assert_eq!(meta.targets.get(&addr).unwrap().0, "ArbitraryCall");
+        assert_eq!(meta.targets.get(&addr).unwrap().1, 8);
     }
 }

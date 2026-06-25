@@ -5,9 +5,10 @@ use std::{
 
 use bytes::Bytes;
 use itertools::Itertools;
+use libafl::prelude::HasMetadata;
 use revm_interpreter::bytecode::Bytecode;
 
-use super::REENTRANCY_BUG_IDX;
+use super::{OracleTargetMetadata, REENTRANCY_BUG_IDX};
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
@@ -74,6 +75,17 @@ impl
         if reetrancy_metadata.found.is_empty() {
             return vec![];
         }
+        // Push flagged addresses into OracleTargetMetadata for mutator feedback
+        if ctx.fuzz_state.metadata_map().get::<OracleTargetMetadata>().is_none() {
+            ctx.fuzz_state.metadata_map_mut().insert(OracleTargetMetadata::default());
+        }
+        let meta = ctx.fuzz_state.metadata_map_mut().get_mut::<OracleTargetMetadata>().unwrap();
+        for (addr, _slot) in &reetrancy_metadata.found {
+            let key = addr.0 .0;
+            let entry = meta.targets.entry(key).or_insert_with(|| ("Reentrancy".to_string(), REENTRANCY_BUG_IDX, 0));
+            entry.2 += 1;
+        }
+
         reetrancy_metadata
             .found
             .iter()
