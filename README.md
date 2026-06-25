@@ -1,31 +1,62 @@
 # SPECTOR-FUZZ
-EVM-only DeFi flow extractor. Fork of ItyFuzz stripped to EVM and extended with an autonomous oracle pipeline.
+**EVM-only DeFi flow extractor. Fork of ItyFuzz stripped to EVM and extended with an autonomous oracle pipeline.**
 
-The thesis: every DeFi exploit is one of six data-flow primitives. We don't audit — we extract flows, confirm exploitability on a live fork, and produce output.
+*The thesis: Every DeFi exploit is one of six data-flow primitives. We don't audit code — we extract flows, confirm exploitability directly on a live fork, and produce actionable outcomes.*
 
-## What's different from upstream ItyFuzz
+---
 
-### Autonomous Liquidation Router
+## The Philosophy: The Six DeFi Primitives
+Rather than checking for simple code correctness or reverts, SPECTOR-FUZZ is designed around the concept that all DeFi exploits reduce to one of six fundamental data-flow leaks:
+
+1.  **Control Leak**: A caller gains execution flow (e.g., through arbitrary callbacks) they should not have.
+2.  **Value Leak**: More assets come out of a system than went in (direct economic drain).
+3.  **Message Leak**: Cross-contract calls are executed using unvalidated input.
+4.  **Permission Leak**: Privileged or administrative functions are successfully called by unprivileged actors.
+5.  **Invariant Leak**: Protocol accounting equations break (e.g., $k=xy$, or shares-to-assets inflation).
+6.  **Ownership Leak**: Asset ownership (ERC-721/1155/20) is transferred without explicit authorization.
+
+By treating the fork state as the absolute ground truth, SPECTOR-FUZZ executes transactions in real time, observing state mutations. If an oracle detects a leak, the exploit is confirmed.
+
+---
+
+## The Progressive Intelligence Pipeline
+SPECTOR-FUZZ does not execute blindly. It uses a dual-phase pipeline that transitions seamlessly from static analysis to dynamic runtime adaptation as the fuzzing campaign progresses:
+
+### Phase 1: Static Blueprinting (Reconnaissance)
+*   **ABI Fingerprinting**: At startup, it scans target bytecodes to build an initial intelligence map of selectors.
+*   **Auto-Oracle Activation**: Automatically maps signatures to corresponding bug detectors (e.g., detecting an ERC-4626 vault signature activates `ERC4626Oracle`; detecting a Chainlink feed activates `FreshnessOracle`).
+
+### Phase 2: Dynamic Runtime Discovery (Adaptation)
+As the chain state evolves, parameters (like pool tokens or initialized states) change. The fuzzer adapts dynamically:
+*   **Consensus Slot Detection**: Uses `eth_createAccessList`-based tracing to dynamically map token balance storage layouts (supporting both Vyper and Solidity custom formats) to pre-fund caller balances via whale consensus.
+*   **Attacker Bytecode Injection & Callback Surface**: Injecting an attacker contract on-the-fly, the fuzzer registers hook entry points (like `executeOperation` for flashloans or receiver hooks) as active mutation paths.
+*   **Warp Delta Sync**: Dynamically accelerates block warp and time simulation to bypass time-lock deadlocks and trigger freshness oracle checks.
+*   **Oracle-Biased Function Re-sampling**: Dynamically re-biases inputs to avoid getting stuck in loops, focusing instead on branches that trigger oracle events.
+
+---
+
+## Features & Extensions
+
+### 1. Autonomous Liquidation Router
 Replaces the Node.js pairs server entirely. The fork IS the pairs server.
-
 Queries Curve registry, Uniswap V2/V3 factories, and ERC-4626 vaults directly via `eth_call` against the live fork state. No external processes, no hardcoded pool addresses, no hints.
-
 *   **Recursive Route Discovery**: Dynamically resolves and traces exit routes for vault and lending tokens (Compound, Aave, ERC-4626) recursively back to WETH.
 *   **Dynamic Uniswap V3 Fee Resolution**: Queries active pool fees directly on-chain via `fee()` calls to format accurate swap paths.
 *   **Priority**: ERC-4626 redeem → Curve registry → UniV2 getPair → UniV3 getPool → Illiquid
-*   Per-chain factory overrides for BSC, Polygon, Arbitrum, Optimism.
+*   **Overrides**: Per-chain factory overrides for BSC, Polygon, Arbitrum, Optimism.
 
-### ABI Fingerprinting Pipeline
-Oracles activate automatically from selector detection — no manual configuration.
+### 2. ABI Fingerprinting Pipeline
+Oracles activate automatically from selector detection — no manual configuration:
 
 | Selector | Detected as | Oracle activated |
 |----------|-------------|------------------|
 | `0x07a2d13a` | ERC-4626 vault | `ERC4626Oracle` |
 | `0xfeaf968c` | Chainlink oracle | `FreshnessOracle` |
 | `0x3644e515` | EIP-712 domain | permit seed corpus |
-| 17 privileged keywords | Permission boundary | `FunctionOracle` |
+| *17 keywords* | Permission boundary | `FunctionOracle` |
 
-### Oracle Suite (`-d all`)
+### 3. Oracle Suite (`-d all`)
+All 14 DeFi Ghost properties are covered:
 
 | Oracle | Detects | Ghost |
 |--------|---------|-------|
@@ -42,21 +73,21 @@ Oracles activate automatically from selector detection — no manual configurati
 | `RebasingOracle` | Rebasing token balance desync | #5 |
 | `CrossChainOracle` | Cross-chain message trust boundary | #6 |
 
-All 14 DeFi Ghost properties covered.
+### 4. Cheatcode Extensions & Nested Pranking
+Supports `vm.computeCreateAddress`, `vm.computeCreate2Address` (both variants), and `vm.getNonce` for predicting CREATE2 exploit addresses.
+*   **Nested Multi-call Pranks**: Seamlessly supports `startPrank` and `stopPrank` pairs for complex multi-call nested impersonations.
+*   **Full suite**: `vm.prank`, `vm.deal`, `vm.warp`, `vm.roll`, `vm.load`, `vm.store`, `vm.etch`, `vm.label`, `vm.createSelectFork`, `vm.expectRevert`, `vm.expectEmit`, `vm.recordLogs`, and all assert variants.
 
-### Cheatcode Extensions
-`vm.computeCreateAddress`, `vm.computeCreate2Address` (both variants), `vm.getNonce` — CREATE2 exploit address prediction pattern.
+### 5. Callback Surface Seeds
+Corpus entries for hook entry points:
+*   `onERC721Received` — NFT safeTransferFrom callback
+*   `onERC1155Received` / `onERC1155BatchReceived` — ERC-1155 callbacks
+*   `executeOperation` — Aave/Balancer flashloan callback
+*   `tokensReceived` — ERC-777 send callback
 
-Full existing suite: `vm.prank`, `vm.startPrank`, `vm.deal`, `vm.warp`, `vm.roll`, `vm.load`, `vm.store`, `vm.etch`, `vm.label`, `vm.createSelectFork`, `vm.expectRevert`, `vm.expectEmit`, `vm.recordLogs`, and all assert variants.
+These represent free execution windows mid-protocol-state that the fuzzer explores automatically.
 
-### Callback Surface Seeds
-Corpus entries for every hook entry point:
-- `onERC721Received` — NFT `safeTransferFrom` callback
-- `onERC1155Received` / `onERC1155BatchReceived` — ERC-1155 callbacks
-- `executeOperation` — Aave/Balancer flashloan callback
-- `tokensReceived` — ERC-777 send callback
-
-These are free execution windows mid-protocol-state. The fuzzer explores them automatically.
+---
 
 ## Quick Start
 
@@ -86,8 +117,7 @@ ityfuzz evm \
 ityfuzz evm -t "build/*" -d all --run-forever -w ./findings
 ```
 
-## Key Flags
-
+### Key Flags
 | Flag | What it does |
 |------|--------------|
 | `-t` | Target: glob pattern, address, or comma-separated addresses |
@@ -101,18 +131,7 @@ ityfuzz evm -t "build/*" -d all --run-forever -w ./findings
 | `--concolic` | Symbolic execution for deeper path coverage |
 | `--onchain-storage-fetching dump` | Faster storage fetch for large contracts |
 
-Full flag reference in `src/evm/config.rs`.
-
-## Six Primitives
-Every DeFi exploit reduces to one:
-1. **Control leak** — caller gains execution it shouldn't have
-2. **Value leak** — more comes out than went in
-3. **Message leak** — cross-contract call with unvalidated input
-4. **Permission leak** — privileged function called by unprivileged caller
-5. **Invariant leak** — protocol accounting breaks (k=xy, shares/assets ratio)
-6. **Ownership leak** — asset ownership transferred without authorization
-
-The oracle suite maps directly to these. `-d all` covers all six.
+---
 
 ## Architecture
 
@@ -132,10 +151,10 @@ LiquidationRouter — confirms economic extractability via fork-native DEX routi
 findings/
 ```
 
-The fork is ground truth. No static analysis, no inference, no probability. The oracle fires because it observed the state change.
+---
 
 ## Based on
-- ItyFuzz — fuzzland
-- revm — EVM execution
-- LibAFL — fuzzing engine
-- foundry-cheatcodes — cheatcode interface
+*   **ItyFuzz** (Fuzzland) — hybrid fuzzing framework
+*   **revm** — EVM execution backend
+*   **LibAFL** — core fuzzing engine
+*   **foundry-cheatcodes** — cheatcode interfaces
