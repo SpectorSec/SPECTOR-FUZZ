@@ -277,6 +277,7 @@ mod tests {
                 repeat: 1,
                 swap_data: HashMap::new(),
                 nested_actions: Vec::new(),
+            campaign: None,
             };
 
             let execution_result = evm_executor.execute(&input, &mut state);
@@ -345,6 +346,7 @@ mod tests {
                 repeat: 1,
                 swap_data: HashMap::new(),
                 nested_actions: Vec::new(),
+            campaign: None,
             };
 
             let execution_result = evm_executor.execute(&input, &mut state);

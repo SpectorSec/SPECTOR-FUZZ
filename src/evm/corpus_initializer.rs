@@ -568,6 +568,7 @@ where
                                 repeat: 1,
                                 swap_data: HashMap::new(),
                                 nested_actions: Vec::new(),
+            campaign: None,
                             };
                             add_input_to_corpus!(
                                 self.state, &mut self.scheduler, eip712_seed, &artifacts
@@ -761,6 +762,7 @@ where
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
         add_input_to_corpus!(self.state, &mut self.scheduler, input.clone(), artifacts);
 
@@ -810,6 +812,7 @@ where
                             repeat: 1,
                             swap_data: HashMap::new(),
                             nested_actions: Vec::new(),
+            campaign: None,
                         };
                         add_input_to_corpus!(self.state, &mut self.scheduler, permit_seed, artifacts);
                     }
@@ -878,6 +881,7 @@ where
                         repeat: 1,
                         swap_data: HashMap::new(),
                         nested_actions: Vec::new(),
+            campaign: None,
                     };
                     add_input_to_corpus!(self.state, &mut self.scheduler, cc_seed, artifacts);
                 }
@@ -921,6 +925,7 @@ where
                         repeat: 1,
                         swap_data: HashMap::new(),
                         nested_actions: Vec::new(),
+            campaign: None,
                     };
                     add_input_to_corpus!(self.state, &mut self.scheduler, warp_seed, artifacts);
                 }
@@ -1072,6 +1077,7 @@ where
                                 repeat: 1,
                                 swap_data: HashMap::new(),
                                 nested_actions: Vec::new(),
+            campaign: None,
                             };
                             add_input_to_corpus!(self.state, &mut self.scheduler, hook_seed, artifacts);
                         }

@@ -49,6 +49,7 @@ use crate::{
         },
         minimizer::EVMMinimizer,
         mutator::FuzzMutator,
+        planner::CampaignTargetCache,
         onchain::{flashloan::Flashloan, offchain::OffChainConfig, ChainConfig, OnChain, WHITELIST_ADDR},
         oracles::{
             approval::SuspiciousApprovalOracle,
@@ -337,7 +338,15 @@ pub fn evm_fuzzer(
         evm_executor_ref.clone(),
         config.concolic_num_threads,
     );
-    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone());
+    if config.campaign_orchestrator {
+        let instance_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
+        let cache = instance_map
+            .map(|m| CampaignTargetCache::new(&m, Vec::new()))
+            .unwrap_or_else(|| CampaignTargetCache::new(&ABIAddressToInstanceMap::default(), Vec::new()));
+        state.add_metadata(cache);
+    }
+
+    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator);
 
     state.metadata_map_mut().insert(UncoveredBranchesMetadata::new());
     let std_stage = PowerABIMutationalStage::new(mutator);

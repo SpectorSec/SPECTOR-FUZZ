@@ -1572,6 +1572,7 @@ where
                             repeat: 1,
                             swap_data: HashMap::new(),
                             nested_actions: Vec::new(),
+                            campaign: None,
                         };
                         add_corpus(self, state, &input);
                     });

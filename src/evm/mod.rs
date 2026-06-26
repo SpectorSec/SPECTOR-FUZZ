@@ -18,6 +18,7 @@ pub mod onchain;
 pub mod topology;
 pub mod oracle;
 pub mod oracles;
+pub mod planner;
 pub mod presets;
 pub mod producers;
 pub mod scheduler;
@@ -232,6 +233,10 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     value_capture: bool,
 
+    /// Enable Campaign Orchestrator for multi-step exploit synthesis (Phase 3)
+    #[arg(long, default_value = "false")]
+    campaign_orchestrator: bool,
+
     /// Only fuzz contracts with the addresses provided, separated by comma
     #[arg(long, default_value = "")]
     only_fuzz: String,
@@ -340,6 +345,7 @@ impl fmt::Display for EvmArgs {
         write!(f, "    seed: {},\n", self.seed)?;
         write!(f, "    sha3_bypass: {},\n", self.sha3_bypass)?;
         write!(f, "    value_capture: {},\n", self.value_capture)?;
+        write!(f, "    campaign_orchestrator: {},\n", self.campaign_orchestrator)?;
         write!(f, "    only_fuzz: {},\n", self.only_fuzz)?;
         write!(f, "    base_path: {},\n", self.base_path)?;
         write!(f, "    spec_id: {},\n", self.spec_id)?;
@@ -842,6 +848,7 @@ pub fn evm_main(mut args: EvmArgs) {
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture,
+        campaign_orchestrator: args.campaign_orchestrator,
         etherscan_api_key,
     };
 
@@ -1032,6 +1039,7 @@ fn test_evm_offchain_setup() {
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture,
+        campaign_orchestrator: args.campaign_orchestrator,
         etherscan_api_key: String::from(""),
     };
 

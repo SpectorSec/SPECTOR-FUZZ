@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "etherscan": {
+      "command": "node",
+      "args": [
+        "/home/skyler/etherscan-v2-mcp-server/dist/index.js",
+        "--stdio"
+      ],
+      "env": {
+        "ETHERSCAN_API_KEY": "F2Y8KBJ66MHHPJ2IGT94IIUW4SD7KJKXBQ"
+      }
+    },
+    "alchemy": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@alchemy/mcp-server"
+      ],
+      "env": {
+        "ALCHEMY_API_KEY": "ZudLM8AAn0OCfiE5JvhAL"
+      }
+    }
+  }
+}

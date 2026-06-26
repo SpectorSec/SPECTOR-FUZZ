@@ -70,6 +70,8 @@ pub const LIQ_PERCENT: u64 = 10;
 pub const RANDOMNESS_CHOICE_2: u64 = 6;
 /// Maximum number of retries to try to find a valid mutation
 pub const MUTATION_RETRIES: usize = 20;
+/// Related to [MUTATOR_SAMPLE_MAX]
+pub const CAMPAIGN_CHOICE: u64 = 10;
 
 // src/evm/scheduler.rs
 pub const POWER_MULTIPLIER: f64 = 32.0;

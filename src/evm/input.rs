@@ -32,6 +32,28 @@ use crate::{
     state_input::StagedVMState,
 };
 
+/// A linkage edge in a campaign: a value captured under `from_registry_key` (using the
+/// Phase 1/2 `{target:?}_{selector_hex}_return` format) is routed to parameter at `to_param_index`
+/// of step `to_step`. This avoids positional alignment on raw EVM returndata bytes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StepLinkage {
+    pub from_step: usize,
+    /// The observed_values registry key in `{target:?}_{selector_hex}_return` format,
+    /// matching how value_capture.rs stores return values. Replaces positional word indexing.
+    pub from_registry_key: String,
+    pub to_step: usize,
+    pub to_param_index: usize,
+}
+
+/// A planned multi-step campaign executed atomically within one fuzzer event.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CampaignSequence {
+    /// Ordered list of campaign steps (serializable form).
+    pub steps: Vec<ConciseEVMInput>,
+    /// Explicit output-to-input linkage table.
+    pub linkages: Vec<StepLinkage>,
+}
+
 /// EVM Input Types
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub enum EVMInputTy {
@@ -105,6 +127,9 @@ pub trait EVMInputT {
 
     fn get_nested_actions(&self) -> Vec<NestedAction>;
     fn get_nested_actions_mut(&mut self) -> &mut Vec<NestedAction>;
+
+    fn get_campaign(&self) -> &Option<CampaignSequence>;
+    fn get_campaign_mut(&mut self) -> &mut Option<CampaignSequence>;
 }
 
 /// EVM Input
@@ -160,6 +185,10 @@ pub struct EVMInput {
     pub swap_data: HashMap<String, SwapInfo>,
 
     pub nested_actions: Vec<NestedAction>,
+
+    /// Campaign sequence (multi-step atomic exploit plan).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<CampaignSequence>,
 }
 
 /// EVM Input Minimum for Deserializing
@@ -212,6 +241,8 @@ pub struct ConciseEVMInput {
     pub swap_data: HashMap<String, SwapInfo>,
 
     pub nested_actions: Vec<NestedAction>,
+
+    pub campaign: Option<CampaignSequence>,
 }
 
 /// EVM Input Minimum for Deserializing with human readable ABI
@@ -304,6 +335,7 @@ impl ConciseEVMInput {
             return_data,
             swap_data,
             nested_actions: input.get_nested_actions(),
+            campaign: input.get_campaign().clone(),
         }
     }
 
@@ -331,8 +363,9 @@ impl ConciseEVMInput {
             layer: input.get_state().get_post_execution_len(),
             call_leak,
             return_data: None,
-            swap_data: input.get_swap_data(),
+                swap_data: input.get_swap_data(),
             nested_actions: input.get_nested_actions(),
+            campaign: input.get_campaign().clone(),
         }
     }
 
@@ -361,6 +394,7 @@ impl ConciseEVMInput {
                 repeat: self.repeat,
                 swap_data: self.swap_data.clone(),
                 nested_actions: self.nested_actions.clone(),
+                campaign: self.campaign.clone(),
             },
             self.call_leak,
         )
@@ -717,6 +751,14 @@ impl EVMInputT for EVMInput {
 
     fn get_nested_actions_mut(&mut self) -> &mut Vec<NestedAction> {
         &mut self.nested_actions
+    }
+
+    fn get_campaign(&self) -> &Option<CampaignSequence> {
+        &self.campaign
+    }
+
+    fn get_campaign_mut(&mut self) -> &mut Option<CampaignSequence> {
+        &mut self.campaign
     }
 }
 

@@ -1307,6 +1307,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         let mut state = FuzzState::new(0);
@@ -1346,6 +1347,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         let execution_result_5 = evm_executor.execute(&input_5, &mut state);
@@ -1429,6 +1431,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: vec![nested_action],
+            campaign: None,
         };
 
         // 4. Execute the call
@@ -1456,6 +1459,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         let query_result = evm_executor.execute(&input_query, &mut state);
@@ -1543,6 +1547,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         // Explicitly set initial block timestamp on the executor's host
@@ -1578,6 +1583,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         let res_stale = evm_executor.execute(&input_stale, &mut state);

@@ -104,6 +104,7 @@ where
                 repeat: 1,
                 swap_data: HashMap::new(),
                 nested_actions: Vec::new(),
+            campaign: None,
             }
         }
         .as_any()

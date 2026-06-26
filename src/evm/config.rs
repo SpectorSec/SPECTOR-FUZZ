@@ -94,6 +94,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub local_files_basedir_pattern: Option<String>,
     pub load_corpus: String,
     pub value_capture: bool,
+    pub campaign_orchestrator: bool,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
 }

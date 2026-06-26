@@ -18,6 +18,7 @@ use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{EVMInputT, NestedAction};
 use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
+use crate::evm::planner::{plan_campaign, CampaignTargetCache};
 use crate::{
     evm::{
         abi::{ABIAddressToInstanceMap, BoxedABI},
@@ -30,6 +31,7 @@ use crate::{
     input::{ConciseSerde, VMInputT},
     r#const::{
         ABI_MUTATE_CHOICE,
+        CAMPAIGN_CHOICE,
         EXPLOIT_PRESET_CHOICE,
         HAVOC_CHOICE,
         HAVOC_MAX_ITERS,
@@ -118,6 +120,8 @@ where
     /// Scheduler for selecting the next VM state to use if we decide to mutate
     /// the VM state of the input
     pub infant_scheduler: SC,
+    /// Enable campaign orchestrator mode (atomic multi-step exploit sequences).
+    pub campaign_orchestrator: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
 
@@ -130,9 +134,10 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC) -> Self {
+    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool) -> Self {
         Self {
             infant_scheduler,
+            campaign_orchestrator,
             phantom: Default::default(),
         }
     }
@@ -257,6 +262,18 @@ where
                 }
             }
         }
+        // Campaign generation: ~10% probability when orchestrator is enabled
+        if self.campaign_orchestrator
+            && state.rand_mut().below(MUTATOR_SAMPLE_MAX) < CAMPAIGN_CHOICE
+        {
+            if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
+                if let Some(campaign) = plan_campaign(cache) {
+                    *input.get_campaign_mut() = Some(campaign);
+                    return Ok(MutationResult::Mutated);
+                }
+            }
+        }
+
         // determine whether we should conduct havoc
         // (a sequence of mutations in batch vs single mutation)
         // let mut amount_of_args = input.get_data_abi().map(|abi|
@@ -608,6 +625,7 @@ mod tests {
             repeat: 1,
             swap_data: HashMap::new(),
             nested_actions: Vec::new(),
+            campaign: None,
         };
 
         let selectors: [[u8; 4]; 3] = [
