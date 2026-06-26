@@ -24,7 +24,7 @@ use crate::{
         input::EVMInputTy::Borrow,
         middlewares::cheatcode::CHEATCODE_ADDRESS,
         types::{convert_u256_to_h160, EVMAddress, EVMU256},
-        vm::{Constraint, EVMStateT},
+        vm::{Constraint, EVMState, EVMStateT},
     },
     generic_vm::vm_state::VMStateT,
     input::{ConciseSerde, VMInputT},
@@ -331,7 +331,12 @@ where
                             };
 
                             let mut abi = chosen_abi;
-                            abi.mutate_with_vm_slots(state, None);
+                            abi.mutate_with_vm_slots(
+                                state,
+                                None,
+                                Some(target_addr),
+                                Some(&input.get_state().as_any().downcast_ref::<EVMState>().unwrap().observed_values),
+                            );
                             let calldata = abi.get_bytes();
                             let actions = input.get_nested_actions_mut();
                             actions.clear();

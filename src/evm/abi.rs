@@ -28,7 +28,8 @@ use crate::evm::abi::ABILossyType::{TArray, TDynamic, TEmpty, TUnknown, T256};
 use crate::{
     evm::{
         concolic::expr::Expr,
-        types::{EVMAddress, EVMU256},
+        types::{EVMAddress, EVMU256, convert_u256_to_h160},
+        oracles::WhaleAddressMetadata,
     },
     generic_vm::vm_state::VMStateT,
     input::ConciseSerde,
@@ -384,7 +385,7 @@ impl BoxedABI {
         Addr: Clone + Debug + Serialize + DeserializeOwned,
         CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
     {
-        self.mutate_with_vm_slots(state, None)
+        self.mutate_with_vm_slots(state, None, None, None)
     }
 
     /// Mutate the args and crossover with slots in the VM state
@@ -394,6 +395,8 @@ impl BoxedABI {
         &mut self,
         state: &mut S,
         vm_slots: Option<HashMap<EVMU256, EVMU256>>,
+        active_contract: Option<EVMAddress>,
+        observed_values: Option<&HashMap<String, Vec<EVMU256>>>,
     ) -> MutationResult
     where
         S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<EVMAddress> + HasMetadata,
@@ -413,15 +416,97 @@ impl BoxedABI {
                     return MutationResult::Skipped;
                 }
                 if a256.is_address {
-                    if state.rand_mut().below(SAMPLE_MAX) < RANDOM_ADDRESS_CHOICE {
-                        a256.data = state.get_rand_address().0.to_vec();
+                    let mut chosen_addr = None;
+
+                    // 1. Try Observed Return Values (Linkage)
+                    if let Some(observed) = observed_values {
+                        if !observed.is_empty() && state.rand_mut().below(100) < 50 {
+                            let mut candidates = Vec::new();
+                            // Contract-Local Linkage
+                            if let Some(active) = active_contract {
+                                let prefix = format!("{:?}", active);
+                                for (key, vals) in observed {
+                                    if key.starts_with(&prefix) {
+                                        candidates.extend(vals.iter().cloned());
+                                    }
+                                }
+                            }
+                            // State-Wide Linkage Fallback
+                            if candidates.is_empty() {
+                                for vals in observed.values() {
+                                    candidates.extend(vals.iter().cloned());
+                                }
+                            }
+                            if !candidates.is_empty() {
+                                let val = candidates[state.rand_mut().below(candidates.len() as u64) as usize];
+                                chosen_addr = Some(convert_u256_to_h160(val));
+                            }
+                        }
+                    }
+
+                    // 2. Try Deployed Target and Whale Address Registries
+                    if chosen_addr.is_none() {
+                        let mut candidates = Vec::new();
+                        if let Some(abis) = state.metadata_map().get::<ABIAddressToInstanceMap>() {
+                            candidates.extend(abis.map.keys().cloned());
+                        }
+                        if let Some(whale_meta) = state.metadata_map().get::<WhaleAddressMetadata>() {
+                            candidates.extend(whale_meta.addresses.iter().cloned());
+                        }
+                        if !candidates.is_empty() && state.rand_mut().below(100) < 90 {
+                            let idx = state.rand_mut().below(candidates.len() as u64) as usize;
+                            chosen_addr = Some(candidates[idx]);
+                        }
+                    }
+
+                    // 3. Standard Fallback
+                    if let Some(addr) = chosen_addr {
+                        a256.data = addr.0.to_vec();
                     } else {
-                        a256.data = [0; 20].to_vec();
+                        if state.rand_mut().below(SAMPLE_MAX) < RANDOM_ADDRESS_CHOICE {
+                            a256.data = state.get_rand_address().0.to_vec();
+                        } else {
+                            a256.data = [0; 20].to_vec();
+                        }
                     }
 
                     MutationResult::Mutated
                 } else {
-                    byte_mutator(state, a256, vm_slots)
+                    let mut used_observed = false;
+
+                    // 1. Try Observed Return Values (Linkage)
+                    if let Some(observed) = observed_values {
+                        if !observed.is_empty() && state.rand_mut().below(100) < 50 {
+                            let mut candidates = Vec::new();
+                            // Contract-Local Linkage
+                            if let Some(active) = active_contract {
+                                let prefix = format!("{:?}", active);
+                                for (key, vals) in observed {
+                                    if key.starts_with(&prefix) {
+                                        candidates.extend(vals.iter().cloned());
+                                    }
+                                }
+                            }
+                            // State-Wide Linkage Fallback
+                            if candidates.is_empty() {
+                                for vals in observed.values() {
+                                    candidates.extend(vals.iter().cloned());
+                                }
+                            }
+                            if !candidates.is_empty() {
+                                let val = candidates[state.rand_mut().below(candidates.len() as u64) as usize];
+                                a256.data = val.to_be_bytes::<32>().to_vec();
+                                used_observed = true;
+                            }
+                        }
+                    }
+
+                    // 2. Standard Fallback (incorporates vm_slots storage values)
+                    if !used_observed {
+                        byte_mutator(state, a256, vm_slots)
+                    } else {
+                        MutationResult::Mutated
+                    }
                 }
             }
             // mutate dynamic args
@@ -442,7 +527,7 @@ impl BoxedABI {
                     match state.rand_mut().below(SAMPLE_MAX) {
                         0..=MUTATE_CHOICE_MAX => {
                             let index: usize = state.rand_mut().next() as usize % data_len;
-                            let result = aarray.data[index].mutate_with_vm_slots(state, vm_slots);
+                            let result = aarray.data[index].mutate_with_vm_slots(state, vm_slots, active_contract, observed_values);
                             return result;
                         }
                         MUTATE_CHOICE_MAX..=EXPAND_CHOICE_MAX => {
@@ -468,7 +553,7 @@ impl BoxedABI {
                     }
                 } else {
                     let index: usize = state.rand_mut().next() as usize % data_len;
-                    return aarray.data[index].mutate_with_vm_slots(state, vm_slots);
+                    return aarray.data[index].mutate_with_vm_slots(state, vm_slots, active_contract, observed_values);
                 }
                 MutationResult::Mutated
             }
@@ -480,7 +565,7 @@ impl BoxedABI {
                     return MutationResult::Skipped;
                 }
                 if (state.rand_mut().below(SAMPLE_MAX)) < MUTATE_CHOICE_MAX {
-                    a_unknown.concrete.mutate_with_vm_slots(state, vm_slots)
+                    a_unknown.concrete.mutate_with_vm_slots(state, vm_slots, active_contract, observed_values)
                 } else {
                     a_unknown.concrete = sample_abi(state, a_unknown.size);
                     MutationResult::Mutated
@@ -1416,6 +1501,82 @@ mod tests {
     fn test_100_times() {
         for _ in 0..100 {
             test_complex();
+        }
+    }
+
+    #[test]
+    fn test_observed_and_whale_linkage_selection() {
+        use crate::evm::oracles::WhaleAddressMetadata;
+
+        // 1. Test mutating address using observed_values (contract-local linkage)
+        {
+            let mut test_state = FuzzState::new(0);
+            // Populate fallback address pool to avoid panic if standard fallback is selected
+            test_state.add_address(&EVMAddress::repeat_byte(0x99));
+            
+            let active_contract = EVMAddress::repeat_byte(0xAA);
+            let observed_addr = EVMAddress::repeat_byte(0xBB);
+            
+            let mut observed_values = HashMap::new();
+            let key = format!("{:?}_00000000_return", active_contract);
+            let val_u256 = EVMU256::from_be_bytes({
+                let mut buf = [0u8; 32];
+                buf[12..32].copy_from_slice(observed_addr.0.as_slice());
+                buf
+            });
+            observed_values.insert(key, vec![val_u256]);
+
+            // Run in a loop to ensure we eventually hit the linkage selection branch
+            let mut found_observed = false;
+            for _ in 0..100 {
+                let mut abi = get_abi_type_boxed(&String::from("address"));
+                abi.mutate_with_vm_slots::<EVMAddress, EVMAddress, EVMState, EVMFuzzState, ConciseEVMInput>(
+                    &mut test_state,
+                    None,
+                    Some(active_contract),
+                    Some(&observed_values),
+                );
+
+                let mutated_bytes = abi.get_bytes();
+                let mutated_addr = EVMAddress::from_slice(&mutated_bytes[16..36]);
+                if mutated_addr == observed_addr {
+                    found_observed = true;
+                    break;
+                }
+            }
+            assert!(found_observed, "Should have successfully linked to observed_values");
+        }
+
+        // 2. Test mutating address using WhaleAddressMetadata when observed_values is empty
+        {
+            let mut test_state = FuzzState::new(0);
+            test_state.add_address(&EVMAddress::repeat_byte(0x99));
+            
+            let whale_addr = EVMAddress::repeat_byte(0xCC);
+            let mut whale_meta = WhaleAddressMetadata::default();
+            whale_meta.addresses.insert(whale_addr);
+            test_state.metadata_map_mut().insert(whale_meta);
+
+            // Run in a loop to ensure we eventually hit the whale selection branch
+            let mut found_whale = false;
+            for _ in 0..100 {
+                let mut abi = get_abi_type_boxed(&String::from("address"));
+                let empty_observed = HashMap::new();
+                abi.mutate_with_vm_slots::<EVMAddress, EVMAddress, EVMState, EVMFuzzState, ConciseEVMInput>(
+                    &mut test_state,
+                    None,
+                    None,
+                    Some(&empty_observed),
+                );
+
+                let mutated_bytes = abi.get_bytes();
+                let mutated_addr = EVMAddress::from_slice(&mutated_bytes[16..36]);
+                if mutated_addr == whale_addr {
+                    found_whale = true;
+                    break;
+                }
+            }
+            assert!(found_whale, "Should have successfully linked to whale_addr");
         }
     }
 }

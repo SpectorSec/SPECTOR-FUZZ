@@ -1069,7 +1069,12 @@ impl VMInputT<EVMState, EVMAddress, EVMAddress, ConciseEVMInput> for EVMInput {
         }
         let vm_slots = self.get_state().get(&self.get_contract()).cloned();
         match self.data {
-            Some(ref mut data) => data.mutate_with_vm_slots(state, vm_slots),
+            Some(ref mut data) => data.mutate_with_vm_slots(
+                state,
+                vm_slots,
+                Some(self.contract),
+                Some(&self.sstate.state.observed_values),
+            ),
             None => MutationResult::Skipped,
         }
     }
