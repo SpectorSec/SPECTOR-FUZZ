@@ -18,7 +18,7 @@ use crate::evm::{
 };
 
 /// Protocol family inferred from ABI selector fingerprinting.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolFamily {
     ERC20,
     ERC721,
@@ -60,7 +60,7 @@ impl ProtocolFamily {
 }
 
 /// Exploit class derived from protocol family co-occurrence.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExploitClass {
     /// ERC-4626 + Chainlink: price-gated vault — share price manipulation via stale oracle.
     /// Euler, Midas, EUL pattern.
@@ -137,6 +137,7 @@ impl ExploitClass {
 }
 
 /// Result of topology analysis across all target contracts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyReport {
     pub families: HashSet<ProtocolFamily>,
     /// (exploit class, confidence 0-100), sorted descending by confidence.
@@ -383,6 +384,8 @@ pub struct HintSet {
 }
 
 impl_serdeany!(TopologyHints);
+
+impl_serdeany!(TopologyReport);
 
 impl TopologyHints {
     /// Build hint sets from the topology report using selectors the ABI loader

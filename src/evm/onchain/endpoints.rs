@@ -26,7 +26,8 @@ use super::ChainConfig;
 use crate::{
     cache::{Cache, FileSystemCache},
     evm::{
-        liquidation::{LiquidationRoute, LiquidationRouter},
+        liquidation::{DefaultLiquidationRouter, LiquidationRoute},
+        liquidation_router::LiquidationRouter,
         tokens::TokenContext,
         types::{EVMAddress, EVMU256},
     },
@@ -1514,7 +1515,7 @@ impl OnChainConfig {
         // ── Fallback: Rust LiquidationRouter (works on non-Anvil endpoints too) ──
         let weth_str = self.get_weth();
         let weth = EVMAddress::from_str(&weth_str).ok()?;
-        let router = LiquidationRouter::default().with_chain(
+        let router = DefaultLiquidationRouter::default().with_chain(
             weth,
             self.v2_factory_for_chain(),
             self.v2_router_for_chain(),
@@ -1523,7 +1524,7 @@ impl OnChainConfig {
         let mut rpc_call = |addr: EVMAddress, data: Bytes| -> Vec<u8> {
             self.eth_call(addr, data).to_vec()
         };
-        let route = router.discover_route(token_addr, &mut rpc_call);
+        let route = router.route_to_base(token_addr, &mut rpc_call);
         let token_str = format!("{:?}", token_addr).to_lowercase();
         match route {
             LiquidationRoute::UniV2 { pair, .. } => {

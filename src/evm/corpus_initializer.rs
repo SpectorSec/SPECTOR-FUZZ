@@ -630,6 +630,18 @@ where
 
                 artifacts.topology = Some(report);
             }
+
+            // Build TopologyHints from the topology report and actual ABI selectors
+            // and insert into state metadata so the scheduler's gamma-ray boost
+            // and mutator's campaign probability can consume them.
+            if let Some(ref report) = artifacts.topology {
+                use crate::evm::topology::TopologyHints;
+                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi);
+                self.state.add_metadata(hints);
+                // Store the full TopologyReport so campaign planners can
+                // prioritize exploit targets by ranked class.
+                self.state.add_metadata(report.clone());
+            }
         }
 
         let mut tc = Testcase::new(artifacts.initial_state.clone());

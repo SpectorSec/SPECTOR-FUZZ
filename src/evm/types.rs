@@ -1,12 +1,15 @@
 use bytes::Bytes;
 use crypto::{digest::Digest, sha3::Sha3};
 use libafl::prelude::HasRand;
-use libafl_bolts::bolts_prelude::{Rand, RomuDuoJrRand};
+use libafl_bolts::{bolts_prelude::{Rand, RomuDuoJrRand}, serdeany::SerdeAny};
 use primitive_types::H160;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_interpreter::bytecode::Bytecode;
 use revm_primitives::{hardfork::SpecId, ruint::aliases::U512, Address, U256};
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+use crate::generic_vm::vm_state::VMStateT;
+use crate::input::ConciseSerde;
 
 /// SpecId re-export for callers that previously used `revm_primitives::SpecId`
 pub use revm_primitives::hardfork::SpecId as EVMSpecId;
@@ -66,6 +69,61 @@ pub type EVMFuzzMutator<'a> = FuzzMutator<
 pub type EVMInfantStateState = InfantStateState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>;
 
 pub type EVMStagedVMState = StagedVMState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>;
+
+/// Metadata to store campaign intermediate states for oracle consumption.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct CampaignIntermediateStates<Loc, Addr, VS, CI>
+where
+    VS: VMStateT + Default + Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Addr: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Loc: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    CI: Serialize + serde::de::DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
+{
+    pub states: Vec<StagedVMState<Loc, Addr, VS, CI>>,
+}
+
+impl<Loc, Addr, VS, CI> SerdeAny for CampaignIntermediateStates<Loc, Addr, VS, CI>
+where
+    VS: VMStateT + Default + Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Addr: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Loc: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    CI: Serialize + serde::de::DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
+{
+    fn as_any(&self) -> &dyn ::core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn ::core::any::Any {
+        self
+    }
+
+    fn as_any_boxed(
+        self: Box<CampaignIntermediateStates<Loc, Addr, VS, CI>>,
+    ) -> Box<dyn ::core::any::Any> {
+        self
+    }
+}
+
+#[cfg(any(not(feature = "serdeany_autoreg"), miri))]
+impl<Loc, Addr, VS, CI> CampaignIntermediateStates<Loc, Addr, VS, CI>
+where
+    VS: VMStateT + Default + Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Addr: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    Loc: Serialize + serde::de::DeserializeOwned + Debug + Clone + 'static,
+    CI: Serialize + serde::de::DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
+{
+    /// Manually register this type at a later point in time
+    ///
+    /// # Safety
+    /// This may never be called concurrently as it dereferences the `RegistryBuilder` without acquiring a lock.
+    pub unsafe fn register() {
+        libafl_bolts::serdeany::RegistryBuilder::register::<CampaignIntermediateStates<Loc, Addr, VS, CI>>();
+    }
+}
+
+/// Concrete EVM instantiation of campaign intermediate states.
+pub type CampaignIntermediateStatesEVM = CampaignIntermediateStates<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>;
 
 pub type EVMExecutionResult = ExecutionResult<EVMAddress, EVMAddress, EVMState, Vec<u8>, ConciseEVMInput>;
 

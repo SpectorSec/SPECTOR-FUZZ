@@ -21,6 +21,7 @@ use crate::{
     input::{ConciseSerde, VMInputT},
     state::HasExecutionResult,
     state_input::StagedVMState,
+    evm::types::CampaignIntermediateStates,
 };
 
 #[cfg(feature = "evm")]
@@ -145,17 +146,20 @@ where
         // SAFETY: I = EVMInput, and types match, in the EVM monomorphization (cfg evm).
         #[cfg(feature = "evm")]
         if let Some(evm_input) = input.as_any().downcast_ref::<EVMInput>() {
-            use crate::evm::types::EVMStagedVMState;
+            use crate::evm::types::{CampaignIntermediateStates, EVMStagedVMState};
             if let Some(campaign) = &evm_input.campaign {
                 if !campaign.steps.is_empty() {
                     let steps = campaign.steps.clone();
                     let mut current_state: EVMStagedVMState = evm_input.sstate.clone();
+                    let mut intermediate_states: Vec<EVMStagedVMState> = Vec::new();
 
                     for step_ci in steps.iter().take(steps.len() - 1) {
-                        let (step_input, _) = step_ci.to_input(current_state);
+                        let (step_input, _) = step_ci.to_input(current_state.clone());
                         let step_ref: &I = unsafe { &*(&step_input as *const EVMInput as *const I) };
                         let res = self.vm.deref().borrow_mut().execute(step_ref, state);
                         state.set_execution_result(res);
+                        // Capture intermediate state for oracle consumption
+                        intermediate_states.push(current_state);
                         if state.get_execution_result().reverted {
                             return Ok(ExitKind::Ok);
                         }
@@ -170,6 +174,10 @@ where
                     let last_ref: &I = unsafe { &*(&last_input as *const EVMInput as *const I) };
                     let res = self.vm.deref().borrow_mut().execute(last_ref, state);
                     state.set_execution_result(res);
+                    // Store intermediate states in state metadata for oracle access
+                    state.add_metadata(CampaignIntermediateStates {
+                        states: intermediate_states,
+                    });
                     return Ok(ExitKind::Ok);
                 }
             }

@@ -99,7 +99,7 @@ mod tests {
             .metadata_map()
             .get::<CampaignTargetCache>()
             .expect("CampaignTargetCache not found");
-        let campaign = plan_campaign(cache).expect("plan_campaign returned None");
+        let campaign = plan_campaign(cache, None).expect("plan_campaign returned None");
 
         assert_eq!(campaign.steps.len(), 2, "expected 2-step campaign (ABI->ABI)");
         assert_eq!(campaign.steps[0].contract, vault_addr);

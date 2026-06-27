@@ -46,6 +46,9 @@ where
     pub executor: Rc<RefCell<E>>,
     /// The input executed by the VM
     pub input: &'a I,
+    /// Intermediate states from multi-step campaign execution (if campaign was run).
+    /// Allows oracles to inspect state drift across the entire chained sequence.
+    pub campaign_intermediate_states: Option<Vec<crate::state_input::StagedVMState<Loc, Addr, VS, CI>>>,
     pub phantom: PhantomData<(Addr, Code, By, Loc, SlotTy, Out, CI)>,
 }
 
@@ -63,7 +66,13 @@ where
 {
     /// Create a new oracle context
     #[allow(clippy::type_complexity)]
-    pub fn new(fuzz_state: &'a mut S, pre_state: &'a VS, executor: Rc<RefCell<E>>, input: &'a I) -> Self {
+    pub fn new(
+        fuzz_state: &'a mut S,
+        pre_state: &'a VS,
+        executor: Rc<RefCell<E>>,
+        input: &'a I,
+        campaign_intermediate_states: Option<Vec<crate::state_input::StagedVMState<Loc, Addr, VS, CI>>>,
+    ) -> Self {
         Self {
             post_state: fuzz_state.get_execution_result().new_state.state.clone(),
             fuzz_state,
@@ -71,6 +80,7 @@ where
             metadata: SerdeAnyMap::new(),
             executor,
             input,
+            campaign_intermediate_states,
             phantom: Default::default(),
         }
     }

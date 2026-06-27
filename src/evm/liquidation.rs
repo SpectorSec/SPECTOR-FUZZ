@@ -18,6 +18,7 @@ use std::str::FromStr;
 
 use bytes::Bytes;
 
+use crate::evm::liquidation_router::LiquidationRouter;
 use crate::evm::types::{EVMAddress, EVMU256};
 
 // ── Well-known on-chain addresses (mainnet, same on most forks) ──────────────
@@ -146,7 +147,7 @@ pub enum LiquidationRoute {
 
 // ── Main router ───────────────────────────────────────────────────────────────
 
-pub struct LiquidationRouter {
+pub struct DefaultLiquidationRouter {
     pub weth: EVMAddress,
     pub v2_factory: EVMAddress,
     pub v2_router:  EVMAddress,
@@ -156,7 +157,7 @@ pub struct LiquidationRouter {
     pub v3_fees: Vec<u32>,
 }
 
-impl Default for LiquidationRouter {
+impl Default for DefaultLiquidationRouter {
     fn default() -> Self {
         Self {
             weth: EVMAddress::from_str("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap(),
@@ -169,48 +170,13 @@ impl Default for LiquidationRouter {
     }
 }
 
-impl LiquidationRouter {
+impl DefaultLiquidationRouter {
     /// Override WETH and factory for non-mainnet chains (BSC, Polygon, etc.)
     pub fn with_chain(mut self, weth: EVMAddress, v2_factory: EVMAddress, v2_router: EVMAddress) -> Self {
         self.weth = weth;
         self.v2_factory = v2_factory;
         self.v2_router  = v2_router;
         self
-    }
-
-    /// Core entry point: given a token, discover the best liquidation route
-    /// by making static calls directly against the fork state.
-    ///
-    /// `call` is a closure that wraps fast_static_call for a single (addr, data) pair.
-    /// Signature: `|(addr, calldata)| → Vec<u8>` (empty = call failed/reverted).
-    pub fn discover_route<F>(&self, token: EVMAddress, call: &mut F) -> LiquidationRoute
-    where
-        F: FnMut(EVMAddress, Bytes) -> Vec<u8>,
-    {
-        // ── 1. ERC-4626 ──────────────────────────────────────────────────────
-        let asset_result = call(token, Bytes::from(ERC4626_ASSET_SEL.to_vec()));
-        if let Some(underlying) = decode_address(&asset_result) {
-            return LiquidationRoute::Vault { vault: token, underlying };
-        }
-
-        // ── 2. Curve (via on-chain registry) ─────────────────────────────────
-        if let Some(route) = self.try_curve(token, call) {
-            return route;
-        }
-
-        // ── 3. Uniswap V2 ────────────────────────────────────────────────────
-        if let Some(pair) = self.try_v2_pair(token, call) {
-            return LiquidationRoute::UniV2 { pair, router: self.v2_router };
-        }
-
-        // ── 4. Uniswap V3 ────────────────────────────────────────────────────
-        for &fee in &self.v3_fees {
-            if let Some(pool) = self.try_v3_pool(token, fee, call) {
-                return LiquidationRoute::UniV3 { pool, fee };
-            }
-        }
-
-        LiquidationRoute::Illiquid
     }
 
     // ── Curve discovery ───────────────────────────────────────────────────────
@@ -292,5 +258,42 @@ impl LiquidationRouter {
         cd.extend_from_slice(&fee_slot);
         let result = call(self.v3_factory, Bytes::from(cd));
         decode_address(&result)
+    }
+}
+
+impl LiquidationRouter for DefaultLiquidationRouter {
+    /// Core entry point: given a token, discover the best liquidation route
+    /// by making static calls directly against the fork state.
+    ///
+    /// `call` is a closure that wraps fast_static_call for a single (addr, data) pair.
+    /// Signature: `|(addr, calldata)| → Vec<u8>` (empty = call failed/reverted).
+    fn route_to_base<F>(&self, token: EVMAddress, call: &mut F) -> LiquidationRoute
+    where
+        F: FnMut(EVMAddress, Bytes) -> Vec<u8>,
+    {
+        // ── 1. ERC-4626 ──────────────────────────────────────────────────────
+        let asset_result = call(token, Bytes::from(ERC4626_ASSET_SEL.to_vec()));
+        if let Some(underlying) = decode_address(&asset_result) {
+            return LiquidationRoute::Vault { vault: token, underlying };
+        }
+
+        // ── 2. Curve (via on-chain registry) ─────────────────────────────────
+        if let Some(route) = self.try_curve(token, call) {
+            return route;
+        }
+
+        // ── 3. Uniswap V2 ────────────────────────────────────────────────────
+        if let Some(pair) = self.try_v2_pair(token, call) {
+            return LiquidationRoute::UniV2 { pair, router: self.v2_router };
+        }
+
+        // ── 4. Uniswap V3 ────────────────────────────────────────────────────
+        for &fee in &self.v3_fees {
+            if let Some(pool) = self.try_v3_pool(token, fee, call) {
+                return LiquidationRoute::UniV3 { pool, fee };
+            }
+        }
+
+        LiquidationRoute::Illiquid
     }
 }

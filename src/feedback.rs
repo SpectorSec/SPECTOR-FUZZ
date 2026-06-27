@@ -32,6 +32,8 @@ use crate::{
     r#const::{INFANT_STATE_INITIAL_VOTES, KNOWN_STATE_MAX_SIZE, KNOWN_STATE_SKIP_SIZE},
     scheduler::HasVote,
     state::{HasExecutionResult, HasInfantStateState, InfantStateState},
+    state_input::StagedVMState,
+    evm::types::CampaignIntermediateStates,
 };
 
 /// OracleFeedback is a wrapper around a set of oracles and producers.
@@ -94,11 +96,11 @@ impl<'a, VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E>
 where
     S: State + HasExecutionResult<Loc, Addr, VS, Out, CI> + HasCorpus + HasMetadata + UsesInput<Input = I> + 'static,
     I: VMInputT<VS, Loc, Addr, CI> + 'static,
-    VS: Default + VMStateT,
-    Addr: Serialize + DeserializeOwned + Debug + Clone,
-    Loc: Serialize + DeserializeOwned + Debug + Clone,
+    VS: Default + VMStateT + 'static,
+    Addr: Serialize + DeserializeOwned + Debug + Clone + 'static,
+    Loc: Serialize + DeserializeOwned + Debug + Clone + 'static,
     Out: Default + Into<Vec<u8>> + Clone,
-    CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
+    CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
     E: GenericVM<VS, Code, By, Loc, Addr, SlotTy, Out, I, S, CI>,
 {
     /// Create a new [`OracleFeedback`]
@@ -124,8 +126,12 @@ where
             return false;
         }
         // set up oracle context
+        let campaign_intermediate_states = state
+            .metadata_map()
+            .get::<CampaignIntermediateStates<Loc, Addr, VS, CI>>()
+            .map(|m| m.states.clone());
         let mut oracle_ctx: OracleCtx<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> =
-            OracleCtx::new(state, input.get_state(), self.executor.clone(), input);
+            OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states);
 
         // cleanup producers by calling `notify_end` hooks
         macro_rules! before_exit {
@@ -185,11 +191,11 @@ impl<'a, VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> Feedback<S>
 where
     S: State + HasExecutionResult<Loc, Addr, VS, Out, CI> + HasCorpus + HasMetadata + UsesInput<Input = I> + 'static,
     I: VMInputT<VS, Loc, Addr, CI> + 'static,
-    VS: Default + VMStateT,
-    Addr: Serialize + DeserializeOwned + Debug + Clone,
-    Loc: Serialize + DeserializeOwned + Debug + Clone,
+    VS: Default + VMStateT + 'static,
+    Addr: Serialize + DeserializeOwned + Debug + Clone + 'static,
+    Loc: Serialize + DeserializeOwned + Debug + Clone + 'static,
     Out: Default + Into<Vec<u8>> + Clone,
-    CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
+    CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde + 'static,
     E: GenericVM<VS, Code, By, Loc, Addr, SlotTy, Out, I, S, CI>,
 {
     /// since OracleFeedback is just a wrapper around one stateless oracle
@@ -227,23 +233,27 @@ where
                 .unwrap()
                 .current_bugs
                 .clear();
-        }
+}
 
-        // set up oracle context
-        let mut oracle_ctx: OracleCtx<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> =
-            OracleCtx::new(state, input.get_state(), self.executor.clone(), input);
+            // set up oracle context
+            let campaign_intermediate_states = state
+                .metadata_map()
+                .get::<CampaignIntermediateStates<Loc, Addr, VS, CI>>()
+                .map(|m| m.states.clone());
+            let mut oracle_ctx: OracleCtx<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> =
+                OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states);
 
-        // cleanup producers by calling `notify_end` hooks
-        macro_rules! before_exit {
-            () => {
-                self.producers.iter().for_each(|producer| {
-                    producer.deref().borrow_mut().notify_end(&mut oracle_ctx);
-                });
-            };
-        }
+            // cleanup producers by calling `notify_end` hooks
+            macro_rules! before_exit {
+                () => {
+                    self.producers.iter().for_each(|producer| {
+                        producer.deref().borrow_mut().notify_end(&mut oracle_ctx);
+                    });
+                };
+            }
 
-        // execute producers
-        self.producers.iter().for_each(|producer| {
+            // execute producers
+            self.producers.iter().for_each(|producer| {
             producer.deref().borrow_mut().produce(&mut oracle_ctx);
         });
 

@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use libafl_bolts::impl_serdeany;
 use serde::{Deserialize, Serialize};
 
 use crate::evm::abi::{ABIAddressToInstanceMap, BoxedABI};
 use crate::evm::input::{CampaignSequence, ConciseEVMInput, EVMInputTy};
+use crate::evm::topology::{ExploitClass, TopologyReport};
 use crate::evm::types::{EVMAddress, EVMU256};
 
 /// Vault/prime selectors: functions that accept assets and change protocol state.
@@ -57,6 +58,9 @@ impl CampaignTargetCache {
 /// Deterministic state machine that builds a multi-step campaign sequence.
 ///
 /// Uses the pre-filtered `CampaignTargetCache` for O(1) target selection.
+/// When `topology_report` is provided, exploit classes ranked by the topology
+/// engine are used to prioritize targets (e.g., preferring same-contract
+/// prime/exploit pairs for vault-like vulnerability patterns).
 ///
 /// Builds one of:
 ///   - Borrow → ABI(prime) → ABI(exploit)  (when borrowable tokens available)
@@ -67,6 +71,7 @@ impl CampaignTargetCache {
 /// `None` if insufficient targets were found.
 pub fn plan_campaign(
     cache: &CampaignTargetCache,
+    topology_report: Option<&TopologyReport>,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
 
@@ -75,15 +80,13 @@ pub fn plan_campaign(
         steps.push(build_borrow_step(*token_addr));
     }
 
-    // Step N: Prime state (deposit/mint/stake into target protocol)
-    let has_prime = cache.prime_targets.first().map(|(addr, _, _)| *addr);
-    if let Some(prime_addr) = has_prime {
-        steps.push(build_abi_step(prime_addr));
-
-        // Step N+1: Trigger exploit (withdraw/redeem/liquidate from target)
-        if let Some((exploit_addr, _, _)) = cache.exploit_targets.first() {
-            steps.push(build_abi_step(*exploit_addr));
-        }
+    // Populate prime + exploit steps, respecting topology hints
+    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report);
+    if let Some(addr) = prime_step {
+        steps.push(build_abi_step(addr));
+    }
+    if let Some(addr) = exploit_step {
+        steps.push(build_abi_step(addr));
     }
 
     // Minimum viable campaign: at least 2 steps
@@ -92,6 +95,47 @@ pub fn plan_campaign(
     }
 
     Some(CampaignSequence { steps, linkages: Vec::new() })
+}
+
+/// Pick prime and exploit target addresses, using topology intelligence
+/// to prefer same-contract pairs when the top-ranked exploit class
+/// suggests a single-contract vulnerability (ERC-4626 vaults, staking
+/// pools, etc.).
+fn pick_prime_and_exploit<'a>(
+    cache: &'a CampaignTargetCache,
+    topology_report: Option<&TopologyReport>,
+) -> (Option<EVMAddress>, Option<EVMAddress>) {
+    let prefer_same_contract = topology_report
+        .and_then(|r| r.ranked.first())
+        .map(|(cls, _)| {
+            matches!(
+                cls,
+                ExploitClass::PriceGatedVault
+                    | ExploitClass::FlashDepositDrain
+                    | ExploitClass::RewardAccumulator
+            )
+        })
+        .unwrap_or(false);
+
+    if prefer_same_contract {
+        // Try to find an address that appears in both prime and exploit lists
+        let exploit_addrs: HashSet<EVMAddress> = cache
+            .exploit_targets
+            .iter()
+            .map(|(a, _, _)| *a)
+            .collect();
+        for (addr, _, _) in &cache.prime_targets {
+            if exploit_addrs.contains(addr) {
+                return (Some(*addr), Some(*addr));
+            }
+        }
+    }
+
+    // Default: pick first from each list
+    (
+        cache.prime_targets.first().map(|(a, _, _)| *a),
+        cache.exploit_targets.first().map(|(a, _, _)| *a),
+    )
 }
 
 /// Find all contracts whose ABI list includes any of the given selectors.
@@ -158,7 +202,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map: HashMap::new() };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(!cache.is_viable());
-        assert!(plan_campaign(&cache).is_none());
+        assert!(plan_campaign(&cache, None).is_none());
     }
 
     #[test]
@@ -169,7 +213,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(!cache.is_viable());
-        assert!(plan_campaign(&cache).is_none());
+        assert!(plan_campaign(&cache, None).is_none());
     }
 
     #[test]
@@ -182,7 +226,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(cache.is_viable());
-        let campaign = plan_campaign(&cache).expect("should produce campaign");
+        let campaign = plan_campaign(&cache, None).expect("should produce campaign");
         assert_eq!(campaign.steps.len(), 2);
         assert_eq!(campaign.steps[0].input_type, EVMInputTy::ABI);
         assert_eq!(campaign.steps[0].contract, prime_addr);
@@ -201,12 +245,38 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, vec![token]);
         assert!(cache.is_viable());
-        let campaign = plan_campaign(&cache).expect("should produce campaign");
+        let campaign = plan_campaign(&cache, None).expect("should produce campaign");
         assert_eq!(campaign.steps.len(), 3);
         assert_eq!(campaign.steps[0].input_type, EVMInputTy::Borrow);
         assert_eq!(campaign.steps[0].contract, token);
         assert_eq!(campaign.steps[1].input_type, EVMInputTy::ABI);
         assert_eq!(campaign.steps[2].input_type, EVMInputTy::ABI);
+    }
+
+    #[test]
+    fn test_plan_campaign_same_contract_with_topology() {
+        use crate::evm::topology::{ExploitClass, ProtocolFamily, TopologyReport};
+        let mut map = HashMap::new();
+        let vault_addr = EVMAddress::from([0x10; 20]);
+        // Same contract has both prime (deposit) and exploit (redeem) selectors
+        map.insert(vault_addr, vec![
+            make_abi(PRIME_SELECTORS[0]),
+            make_abi(EXPLOIT_SELECTORS[1]), // redeem
+        ]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+        assert!(cache.is_viable());
+
+        // Build a topology report that ranks PriceGatedVault (same-contract class) highest
+        let mut families = HashSet::new();
+        families.insert(ProtocolFamily::ERC4626);
+        families.insert(ProtocolFamily::Chainlink);
+        let report = TopologyReport::analyze(families);
+        // Same address has both prime+exploit selectors → should pair on same contract
+        let campaign = plan_campaign(&cache, Some(&report)).expect("should produce campaign");
+        assert_eq!(campaign.steps.len(), 2);
+        assert_eq!(campaign.steps[0].contract, campaign.steps[1].contract,
+            "topology with same-contract class should pick same address");
     }
 }
 

@@ -19,6 +19,7 @@ use super::onchain::flashloan::CAN_LIQUIDATE;
 use crate::evm::input::{EVMInputT, NestedAction};
 use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
 use crate::evm::planner::{plan_campaign, CampaignTargetCache};
+use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
     evm::{
         abi::{ABIAddressToInstanceMap, BoxedABI},
@@ -262,14 +263,22 @@ where
                 }
             }
         }
-        // Campaign generation: ~10% probability when orchestrator is enabled
-        if self.campaign_orchestrator
-            && state.rand_mut().below(MUTATOR_SAMPLE_MAX) < CAMPAIGN_CHOICE
-        {
-            if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
-                if let Some(campaign) = plan_campaign(cache) {
-                    *input.get_campaign_mut() = Some(campaign);
-                    return Ok(MutationResult::Mutated);
+        // Campaign generation: probability scaled by topology confidence when orchestrator is enabled
+        if self.campaign_orchestrator {
+            let campaign_threshold = if let Some(hints) = state.metadata_map().get::<TopologyHints>() {
+                let max_conf = hints.sets.iter().map(|s| s.confidence).max().unwrap_or(0) as f64;
+                // Scale: 10% base * (1 + confidence/100), e.g., 95% conf -> ~19.5%
+                ((CAMPAIGN_CHOICE as f64) * (1.0 + max_conf / 100.0)).min(MUTATOR_SAMPLE_MAX as f64) as u64
+            } else {
+                CAMPAIGN_CHOICE
+            };
+            if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
+                if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
+                    let topology_report = state.metadata_map().get::<TopologyReport>();
+                    if let Some(campaign) = plan_campaign(cache, topology_report) {
+                        *input.get_campaign_mut() = Some(campaign);
+                        return Ok(MutationResult::Mutated);
+                    }
                 }
             }
         }
