@@ -1,6 +1,7 @@
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use libafl::prelude::HasMetadata;
 use bytes::Bytes;
 use revm_interpreter::bytecode::Bytecode;
 
@@ -8,7 +9,7 @@ use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
         oracle::EVMBugResult,
-        oracles::FUNCTION_BUG_IDX,
+        oracles::{FUNCTION_BUG_IDX, TrustedCallerMetadata},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -105,7 +106,32 @@ impl
         EVMQueueExecutor,
     > for FunctionOracle
 {
-    fn transition(&self, _ctx: &mut EVMOracleCtx<'_>, _stage: u64) -> u64 {
+    fn transition(&self, ctx: &mut EVMOracleCtx<'_>, _stage: u64) -> u64 {
+        // Populate TrustedCallerMetadata for Ghost Identities
+        // When a privileged function call succeeds, record the caller as trusted for that (contract, selector)
+        if !self.rules.is_empty() {
+            let result = ctx.fuzz_state.get_execution_result();
+            if !result.reverted {
+                let caller = ctx.input.get_caller();
+                let contract = ctx.input.get_contract();
+                let data = ctx.input.get_direct_data();
+                if data.len() >= 4 {
+                    let selector: [u8; 4] = data[..4].try_into().unwrap();
+                    let key = (contract, selector);
+                    // Only populate if this is a known privileged function
+                    if self.rules.contains_key(&key) {
+                        if !ctx.fuzz_state.has_metadata::<TrustedCallerMetadata>() {
+                            ctx.fuzz_state.metadata_map_mut().insert(TrustedCallerMetadata::default());
+                        }
+                        let meta = ctx.fuzz_state.metadata_map_mut()
+                            .get_mut::<TrustedCallerMetadata>()
+                            .unwrap();
+                        let dynamic_key = format!("0x{:?}_0x{:?}", contract, selector);
+                        meta.trusted_callers.entry(dynamic_key).or_default().insert(caller);
+                    }
+                }
+            }
+        }
         0
     }
 
@@ -146,13 +172,20 @@ impl
         let selector: [u8; 4] = data[..4].try_into().unwrap();
 
         let key = (contract, selector);
-        let allowed = match self.rules.get(&key) {
+        // Check static rules first (from corpus init)
+        let allowed_static = match self.rules.get(&key) {
             Some(a) => a,
             None => return vec![],
         };
 
-        // If the caller is explicitly allowed, no violation.
-        if allowed.contains(&caller) {
+        // Also check dynamic TrustedCallerMetadata (Ghost Identities)
+        let dynamic_key = format!("0x{:?}_0x{:?}", contract, selector);
+        let allowed_dynamic = ctx.fuzz_state.metadata_map()
+            .get::<TrustedCallerMetadata>()
+            .and_then(|m| m.trusted_callers.get(&dynamic_key));
+
+        // If caller is in either allowed set, no violation
+        if allowed_static.contains(&caller) || allowed_dynamic.map(|set| set.contains(&caller)).unwrap_or(false) {
             return vec![];
         }
 

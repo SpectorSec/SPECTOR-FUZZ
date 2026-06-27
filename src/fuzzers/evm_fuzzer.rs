@@ -346,7 +346,7 @@ pub fn evm_fuzzer(
         state.add_metadata(cache);
     }
 
-    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator);
+    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator, config.ghost_identities);
 
     state.metadata_map_mut().insert(UncoveredBranchesMetadata::new());
     let std_stage = PowerABIMutationalStage::new(mutator);

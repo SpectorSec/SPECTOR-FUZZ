@@ -27,6 +27,19 @@ pub struct WhaleAddressMetadata {
 
 impl_serdeany!(WhaleAddressMetadata);
 
+/// Stores protocol contract addresses that are authorized callers of
+/// privileged functions. Used by the mutator to inject vm.prank(trusted_address)
+/// when targeting privileged selectors (e.g., onlyRouter, onlyVault guards).
+/// Key: "0xAddress_0xSelector" -> Set of addresses that successfully
+/// called the privileged function without reverting.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TrustedCallerMetadata {
+    /// Key formatted as "0xAddress_0xSelector" for Serde compatibility
+    pub trusted_callers: HashMap<String, HashSet<EVMAddress>>,
+}
+
+impl_serdeany!(TrustedCallerMetadata);
+
 pub mod approval;
 pub mod arb_call;
 pub mod crosschain;

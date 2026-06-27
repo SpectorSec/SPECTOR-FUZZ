@@ -384,6 +384,12 @@ where
             self.state.metadata_map_mut().insert(WhaleAddressMetadata { addresses: whale_set });
         }
 
+        // Insert TrustedCallerMetadata for Ghost Identities (identity spoofing)
+        {
+            use crate::evm::oracles::TrustedCallerMetadata;
+            self.state.metadata_map_mut().insert(TrustedCallerMetadata::default());
+        }
+
         for contract in &mut loader.contracts {
             if contract.abi.is_empty() {
                 // this contract's abi is not available, we will use 3 layers to handle this

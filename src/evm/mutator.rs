@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{EVMInputT, NestedAction};
-use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
+use crate::evm::oracles::{OracleTargetMetadata, TrustedCallerMetadata, WhaleAddressMetadata};
 use crate::evm::planner::{plan_campaign, CampaignTargetCache};
 use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
@@ -123,6 +123,8 @@ where
     pub infant_scheduler: SC,
     /// Enable campaign orchestrator mode (atomic multi-step exploit sequences).
     pub campaign_orchestrator: bool,
+    /// Enable Ghost Identities (identity spoofing for privileged functions).
+    pub ghost_identities: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
 
@@ -135,10 +137,11 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool) -> Self {
+    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool) -> Self {
         Self {
             infant_scheduler,
             campaign_orchestrator,
+            ghost_identities,
             phantom: Default::default(),
         }
     }
@@ -356,6 +359,7 @@ where
                                 abis.map.get(&target_addr).unwrap()[abi_idx].clone()
                             };
 
+                            let selector = chosen_abi.function;
                             let mut abi = chosen_abi;
                             abi.mutate_with_vm_slots(
                                 state,
@@ -370,18 +374,51 @@ where
                             // Optionally inject a prank action (30% of nested action gens)
                             // 50% single-call prank, 50% startPrank+stopPrank pair
                             {
-                                let whale_meta = state.metadata_map()
-                                    .get::<WhaleAddressMetadata>()
-                                    .cloned();
-                                if let Some(whale_meta) = whale_meta {
-                                    if !whale_meta.addresses.is_empty() && state.rand_mut().below(100) < 30 {
-                                        let whale_addrs: Vec<&EVMAddress> = whale_meta.addresses.iter().collect();
-                                        let whale_idx = state.rand_mut().below(whale_addrs.len() as u64) as usize;
-                                        let whale_addr = *whale_addrs[whale_idx];
+                                // First, check if we have trusted callers for this (target, selector) pair
+                                // from TrustedCallerMetadata (Ghost Identities feature)
+                                let trusted_addr = if self.ghost_identities {
+                                    let key = format!("0x{:?}_0x{:?}", target_addr, selector);
+                                    let trusted_set = state.metadata_map()
+                                        .get::<TrustedCallerMetadata>()
+                                        .and_then(|m| m.trusted_callers.get(&key).cloned());
+                                    if let Some(set) = trusted_set {
+                                        if !set.is_empty() {
+                                            let addrs: Vec<EVMAddress> = set.into_iter().collect();
+                                            let idx = state.rand_mut().below(addrs.len() as u64) as usize;
+                                            Some(addrs[idx])
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
 
+                                let prank_addr = trusted_addr.or_else(|| {
+                                    // Fallback to WhaleAddressMetadata
+                                    let whale_set = state.metadata_map()
+                                        .get::<WhaleAddressMetadata>()
+                                        .map(|w| w.addresses.clone());
+                                    if let Some(set) = whale_set {
+                                        if !set.is_empty() {
+                                            let addrs: Vec<EVMAddress> = set.into_iter().collect();
+                                            let idx = state.rand_mut().below(addrs.len() as u64) as usize;
+                                            Some(addrs[idx])
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                if let Some(prank_addr) = prank_addr {
+                                    if state.rand_mut().below(100) < 30 {
                                         if state.rand_mut().below(100) < 50 {
-                                            // 50%: single-call vm.prank(whale)
-                                            let prank_call = Vm::prank_0Call { msgSender: whale_addr };
+                                            // 50%: single-call vm.prank(addr)
+                                            let prank_call = Vm::prank_0Call { msgSender: prank_addr };
                                             let prank_calldata = prank_call.abi_encode();
                                             actions.push(NestedAction {
                                                 target: CHEATCODE_ADDRESS.into(),
@@ -394,8 +431,8 @@ where
                                                 value: EVMU256::ZERO,
                                             });
                                         } else {
-                                            // 50%: vm.startPrank(whale) + target + vm.stopPrank()
-                                            let start_call = Vm::startPrank_0Call { msgSender: whale_addr };
+                                            // 50%: vm.startPrank(addr) + target + vm.stopPrank()
+                                            let start_call = Vm::startPrank_0Call { msgSender: prank_addr };
                                             let start_calldata = start_call.abi_encode();
                                             actions.push(NestedAction {
                                                 target: CHEATCODE_ADDRESS.into(),
@@ -582,15 +619,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use alloy_sol_types::{SolCall, SolInterface};
     use bytes::Bytes;
     use foundry_cheatcodes::Vm::{self, VmCalls};
     use libafl::state::HasMetadata;
+    use serde_json;
     use crate::evm::abi::{AEmpty, A256, A256InnerType, ABIAddressToInstanceMap};
     use crate::evm::input::{EVMInput, EVMInputT, EVMInputTy};
     use crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS;
-    use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata};
+    use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata, TrustedCallerMetadata};
     use crate::evm::types::{EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256};
     use crate::evm::mutator::BoxedABI;
 
@@ -763,5 +801,98 @@ mod tests {
             VmCalls::stopPrank(_) => {}
             other => panic!("Expected stopPrank, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_trusted_caller_metadata_serde_roundtrip() {
+        use std::collections::HashSet;
+
+        let addr_a = EVMAddress::from([0x11; 20]);
+        let addr_b = EVMAddress::from([0x22; 20]);
+        let contract = EVMAddress::from([0xaa; 20]);
+        let selector: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];
+        let key = format!("0x{:?}_0x{:?}", contract, selector);
+
+        let mut meta = TrustedCallerMetadata::default();
+        let mut callers = HashSet::new();
+        callers.insert(addr_a);
+        callers.insert(addr_b);
+        meta.trusted_callers.insert(key.clone(), callers);
+
+        // Serialize + deserialize via serde_json
+        let encoded = serde_json::to_string(&meta).expect("serialize should succeed");
+        let decoded: TrustedCallerMetadata = serde_json::from_str(&encoded).expect("deserialize should succeed");
+
+        let entry = decoded.trusted_callers.get(&key).expect("key should exist after round-trip");
+        assert_eq!(entry.len(), 2, "should have 2 trusted callers");
+        assert!(entry.contains(&addr_a));
+        assert!(entry.contains(&addr_b));
+        assert!(entry.contains(&addr_a)); // verify idempotent
+    }
+
+    #[test]
+    fn test_trusted_caller_metadata_in_state() {
+        use std::collections::HashSet;
+
+        let mut state = EVMFuzzState::new(0);
+        let contract = EVMAddress::from([0xbb; 20]);
+        let selector: [u8; 4] = [0x0f, 0xe1, 0xf4, 0xf7];
+        let trusted = EVMAddress::from([0x33; 20]);
+        let key = format!("0x{:?}_0x{:?}", contract, selector);
+
+        let mut callers = HashSet::new();
+        callers.insert(trusted);
+        let meta = TrustedCallerMetadata { trusted_callers: HashMap::from([(key.clone(), callers)]) };
+        state.metadata_map_mut().insert(meta);
+
+        let stored = state.metadata_map().get::<TrustedCallerMetadata>()
+            .expect("TrustedCallerMetadata should exist");
+        let entry = stored.trusted_callers.get(&key).expect("key should exist");
+        assert!(entry.contains(&trusted));
+        assert_eq!(entry.len(), 1);
+    }
+
+    #[test]
+    fn test_trusted_caller_metadata_fallback_to_whale() {
+        use std::collections::HashSet;
+
+        let mut state = EVMFuzzState::new(0);
+
+        let mut whale_addrs = HashSet::new();
+        let whale = EVMAddress::from([0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        whale_addrs.insert(whale);
+        state.metadata_map_mut().insert(WhaleAddressMetadata { addresses: whale_addrs });
+
+        assert!(state.metadata_map().get::<TrustedCallerMetadata>().is_none(),
+            "TrustedCallerMetadata should not exist when not inserted");
+
+        let whales = state.metadata_map().get::<WhaleAddressMetadata>().expect("WhaleAddressMetadata should exist");
+        assert_eq!(whales.addresses.len(), 1);
+        assert!(whales.addresses.contains(&whale));
+    }
+
+    #[test]
+    fn test_trusted_caller_metadata_empty_is_default() {
+        let meta = TrustedCallerMetadata::default();
+        assert!(meta.trusted_callers.is_empty(), "default TrustedCallerMetadata should have empty map");
+
+        let mut state = EVMFuzzState::new(0);
+        state.metadata_map_mut().insert(TrustedCallerMetadata::default());
+
+        let stored = state.metadata_map().get::<TrustedCallerMetadata>()
+            .expect("TrustedCallerMetadata should exist after insert");
+        assert!(stored.trusted_callers.is_empty(), "stored metadata should have empty trusted_callers map");
+    }
+
+    #[test]
+    fn test_trusted_caller_metadata_key_format() {
+        let contract = EVMAddress::from([0xcc; 20]);
+        let selector: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+        let key = format!("0x{:?}_0x{:?}", contract, selector);
+
+        // Verify the key starts with "0x" and contains both hex representations
+        assert!(key.starts_with("0x"), "key should start with 0x");
+        assert!(key.contains("_0x"), "key should contain _0x separator");
+        assert!(key.len() > 20, "key should be a non-trivial string");
     }
 }

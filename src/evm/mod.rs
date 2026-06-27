@@ -238,6 +238,10 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     campaign_orchestrator: bool,
 
+    /// Enable Ghost Identities (identity spoofing / confused deputy) for privileged function access
+    #[arg(long, default_value = "false")]
+    ghost_identities: bool,
+
     /// Only fuzz contracts with the addresses provided, separated by comma
     #[arg(long, default_value = "")]
     only_fuzz: String,
@@ -850,6 +854,7 @@ pub fn evm_main(mut args: EvmArgs) {
         load_corpus: args.load_corpus,
         value_capture: args.value_capture,
         campaign_orchestrator: args.campaign_orchestrator,
+        ghost_identities: args.ghost_identities,
         etherscan_api_key,
     };
 
@@ -1041,6 +1046,7 @@ fn test_evm_offchain_setup() {
         load_corpus: args.load_corpus,
         value_capture: args.value_capture,
         campaign_orchestrator: args.campaign_orchestrator,
+        ghost_identities: args.ghost_identities,
         etherscan_api_key: String::from(""),
     };
 

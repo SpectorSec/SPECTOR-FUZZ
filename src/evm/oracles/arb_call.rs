@@ -14,7 +14,7 @@ use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
         oracle::EVMBugResult,
-        oracles::{OracleTargetMetadata, ARB_CALL_BUG_IDX},
+        oracles::{OracleTargetMetadata, ARB_CALL_BUG_IDX, TrustedCallerMetadata},
         srcmap::SOURCE_MAP_PROVIDER,
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
@@ -103,6 +103,17 @@ impl
             }
 
             for (caller, target, pc) in ctx.post_state.arbitrary_calls.iter() {
+                // Skip if caller is a trusted caller for this target+pc (Ghost Identities)
+                // pc here is the program counter; we'd need selector. For now, skip if
+                // TrustedCallerMetadata has this caller for any selector on this target.
+                let is_trusted = ctx.fuzz_state.metadata_map()
+                    .get::<TrustedCallerMetadata>()
+                    .map(|m| m.trusted_callers.iter()
+                        .any(|(key, addrs)| key.starts_with(&format!("0x{:?}_", target)) && addrs.contains(caller)))
+                    .unwrap_or(false);
+                if is_trusted {
+                    continue;
+                }
                 if ctx.fuzz_state.has_caller(target) {
                     continue;
                 }
