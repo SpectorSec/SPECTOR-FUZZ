@@ -22,6 +22,7 @@ use crate::{
     state::HasExecutionResult,
     state_input::StagedVMState,
     evm::types::CampaignIntermediateStates,
+    evm::oracles::CampaignWarpStates,
 };
 
 #[cfg(feature = "evm")]
@@ -186,9 +187,12 @@ where
                     let last_ref: &I = unsafe { &*(&last_input as *const EVMInput as *const I) };
                     let res = self.vm.deref().borrow_mut().execute(last_ref, state);
                     state.set_execution_result(res);
-                    // Store intermediate states in state metadata for oracle access
+                    // Store intermediate states and warps in state metadata for oracle access
                     state.add_metadata(CampaignIntermediateStates {
                         states: intermediate_states,
+                    });
+                    state.add_metadata(CampaignWarpStates {
+                        warps: campaign.warps.clone(),
                     });
                     return Ok(ExitKind::Ok);
                 }

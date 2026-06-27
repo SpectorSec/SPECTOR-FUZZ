@@ -60,6 +60,15 @@ pub struct TemporalBalanceSnapshot {
 
 impl_serdeany!(TemporalBalanceSnapshot);
 
+/// Stores the temporal warp operations (block advances) from a campaign execution.
+/// Allows oracles to access the exact warps that occurred during execution.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CampaignWarpStates {
+    pub warps: Vec<(usize, u64)>,
+}
+
+impl_serdeany!(CampaignWarpStates);
+
 pub mod temporal_skim;
 
 pub mod approval;

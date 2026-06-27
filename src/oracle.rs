@@ -49,6 +49,10 @@ where
     /// Intermediate states from multi-step campaign execution (if campaign was run).
     /// Allows oracles to inspect state drift across the entire chained sequence.
     pub campaign_intermediate_states: Option<Vec<crate::state_input::StagedVMState<Loc, Addr, VS, CI>>>,
+    /// The temporal warps (block advances) injected during this campaign execution.
+    /// Allows oracles to filter out warp-induced state changes (e.g., timelock expiry,
+    /// Chainlink staleness, reentrancy guards bypassed by block advancement).
+    pub temporal_warps: Option<Vec<(usize, u64)>>,
     pub phantom: PhantomData<(Addr, Code, By, Loc, SlotTy, Out, CI)>,
 }
 
@@ -72,6 +76,7 @@ where
         executor: Rc<RefCell<E>>,
         input: &'a I,
         campaign_intermediate_states: Option<Vec<crate::state_input::StagedVMState<Loc, Addr, VS, CI>>>,
+        temporal_warps: Option<Vec<(usize, u64)>>,
     ) -> Self {
         Self {
             post_state: fuzz_state.get_execution_result().new_state.state.clone(),
@@ -81,6 +86,7 @@ where
             executor,
             input,
             campaign_intermediate_states,
+            temporal_warps,
             phantom: Default::default(),
         }
     }

@@ -34,6 +34,7 @@ use crate::{
     state::{HasExecutionResult, HasInfantStateState, InfantStateState},
     state_input::StagedVMState,
     evm::types::CampaignIntermediateStates,
+    evm::oracles::CampaignWarpStates,
 };
 
 /// OracleFeedback is a wrapper around a set of oracles and producers.
@@ -130,8 +131,12 @@ where
             .metadata_map()
             .get::<CampaignIntermediateStates<Loc, Addr, VS, CI>>()
             .map(|m| m.states.clone());
+        let temporal_warps = state
+            .metadata_map()
+            .get::<CampaignWarpStates>()
+            .map(|m| m.warps.clone());
         let mut oracle_ctx: OracleCtx<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> =
-            OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states);
+            OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states, temporal_warps);
 
         // cleanup producers by calling `notify_end` hooks
         macro_rules! before_exit {
@@ -240,8 +245,12 @@ where
                 .metadata_map()
                 .get::<CampaignIntermediateStates<Loc, Addr, VS, CI>>()
                 .map(|m| m.states.clone());
+            let temporal_warps = state
+                .metadata_map()
+                .get::<CampaignWarpStates>()
+                .map(|m| m.warps.clone());
             let mut oracle_ctx: OracleCtx<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> =
-                OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states);
+                OracleCtx::new(state, input.get_state(), self.executor.clone(), input, campaign_intermediate_states, temporal_warps);
 
             // cleanup producers by calling `notify_end` hooks
             macro_rules! before_exit {
