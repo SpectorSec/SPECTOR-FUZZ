@@ -52,6 +52,12 @@ pub struct CampaignSequence {
     pub steps: Vec<ConciseEVMInput>,
     /// Explicit output-to-input linkage table.
     pub linkages: Vec<StepLinkage>,
+    /// Warp (block advance) operations to inject before specific step indices.
+    /// Each entry: (step_index, block_delta) — advance block.number and
+    /// block.timestamp by delta blocks before executing the step at that index.
+    /// Empty by default for backward compatibility with Features 001-004.
+    #[serde(default)]
+    pub warps: Vec<(usize, u64)>,
 }
 
 /// EVM Input Types

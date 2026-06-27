@@ -26,6 +26,8 @@ use crate::{
 
 #[cfg(feature = "evm")]
 use crate::evm::input::EVMInput;
+#[cfg(feature = "evm")]
+use crate::evm::types::EVMU256;
 
 /// Wrapper of smart contract VM, which implements LibAFL [`Executor`]
 /// TODO: in the future, we may need to add handlers?
@@ -153,8 +155,13 @@ where
                     let mut current_state: EVMStagedVMState = evm_input.sstate.clone();
                     let mut intermediate_states: Vec<EVMStagedVMState> = Vec::new();
 
-                    for step_ci in steps.iter().take(steps.len() - 1) {
-                        let (step_input, _) = step_ci.to_input(current_state.clone());
+                    for (i, step_ci) in steps.iter().enumerate().take(steps.len() - 1) {
+                        let (mut step_input, _) = step_ci.to_input(current_state.clone());
+                        // Apply warp delta before execute, so vm.rs:598 picks up the warped env
+                        if let Some(delta) = campaign.warps.iter().find(|(idx, _)| *idx == i).map(|(_, d)| d) {
+                            step_input.env.block.number += EVMU256::from(*delta);
+                            step_input.env.block.timestamp += EVMU256::from(*delta * 12);
+                        }
                         let step_ref: &I = unsafe { &*(&step_input as *const EVMInput as *const I) };
                         let res = self.vm.deref().borrow_mut().execute(step_ref, state);
                         state.set_execution_result(res);
@@ -170,7 +177,12 @@ where
                         };
                     }
 
-                    let (last_input, _) = steps.last().unwrap().to_input(current_state);
+                    let last_idx = steps.len() - 1;
+                    let (mut last_input, _) = steps.last().unwrap().to_input(current_state);
+                    if let Some(delta) = campaign.warps.iter().find(|(idx, _)| *idx == last_idx).map(|(_, d)| d) {
+                        last_input.env.block.number += EVMU256::from(*delta);
+                        last_input.env.block.timestamp += EVMU256::from(*delta * 12);
+                    }
                     let last_ref: &I = unsafe { &*(&last_input as *const EVMInput as *const I) };
                     let res = self.vm.deref().borrow_mut().execute(last_ref, state);
                     state.set_execution_result(res);

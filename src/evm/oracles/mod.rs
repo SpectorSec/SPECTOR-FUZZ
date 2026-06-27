@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use libafl_bolts::impl_serdeany;
 use serde::{Deserialize, Serialize};
 
-use super::types::{EVMAddress, EVMU512};
+use super::types::{EVMAddress, EVMU256, EVMU512};
 
 /// Stores addresses flagged by oracles so the mutator can bias NestedAction
 /// target selection toward addresses that triggered oracle detections.
@@ -39,6 +39,28 @@ pub struct TrustedCallerMetadata {
 }
 
 impl_serdeany!(TrustedCallerMetadata);
+
+/// Stores a snapshot of token balances taken before a temporal warp (block
+/// advancement). Used by TemporalSkimOracle to detect cross-round state
+/// divergence — balance changes that occurred "off-screen" during the block
+/// advancement between campaign steps.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TemporalBalanceSnapshot {
+    /// Map from "0xToken_0xAccount" string key to balance at snapshot time.
+    /// Uses string keys for Serde JSON compatibility (same pattern as
+    /// TrustedCallerMetadata). The keys are formatted by snapshot_key() in
+    /// temporal_skim.rs. Parsed back via pairs field for querying.
+    pub balances: HashMap<String, EVMU256>,
+    /// Parallel ordered list of (token, account) pairs matching the balance
+    /// map keys, preserved for deterministic query reconstruction.
+    pub pairs: Vec<(EVMAddress, EVMAddress)>,
+    /// Block number at which the snapshot was taken.
+    pub snapshot_block: EVMU256,
+}
+
+impl_serdeany!(TemporalBalanceSnapshot);
+
+pub mod temporal_skim;
 
 pub mod approval;
 pub mod arb_call;
@@ -78,6 +100,7 @@ pub static CROSSCHAIN_BUG_IDX: u64 = 15;
 pub static REBASING_BUG_IDX: u64 = 16;
 pub static ERC4626_BUG_IDX: u64 = 17;
 pub static FRESHNESS_BUG_IDX: u64 = 18;
+pub static TEMPORAL_SKIM_BUG_IDX: u64 = 19;
 
 /// Divide a U512 by another U512 and return a string with the decimal point at
 /// the correct position For example, 1000 / 3 = 333.333, then a = 1000e6, b =

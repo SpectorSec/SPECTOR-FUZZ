@@ -72,6 +72,7 @@ impl CampaignTargetCache {
 pub fn plan_campaign(
     cache: &CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
+    temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
 
@@ -94,7 +95,21 @@ pub fn plan_campaign(
         return None;
     }
 
-    Some(CampaignSequence { steps, linkages: Vec::new() })
+    // Temporal Pre-condition Skimming: Insert a warp (block advance) between
+    // the prime step (state priming) and the exploit step. The warp simulates
+    // block progression during which state divergence (interest accrual, reward
+    // accumulation, oracle price changes) can occur off-screen.
+    let mut warps: Vec<(usize, u64)> = Vec::new();
+    if temporal_skimming {
+        // The exploit step is always the last step. Insert warp before it.
+        // Index is steps.len() - 1 (0-indexed).
+        let exploit_idx = steps.len() - 1;
+        // Default warp: 10 blocks (~2 minutes). Sufficient to trigger most
+        // reward-accrual and timelock-based divergence patterns.
+        warps.push((exploit_idx, 10));
+    }
+
+    Some(CampaignSequence { steps, linkages: Vec::new(), warps })
 }
 
 /// Pick prime and exploit target addresses, using topology intelligence
@@ -202,7 +217,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map: HashMap::new() };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(!cache.is_viable());
-        assert!(plan_campaign(&cache, None).is_none());
+        assert!(plan_campaign(&cache, None, false).is_none());
     }
 
     #[test]
@@ -213,7 +228,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(!cache.is_viable());
-        assert!(plan_campaign(&cache, None).is_none());
+        assert!(plan_campaign(&cache, None, false).is_none());
     }
 
     #[test]
@@ -226,7 +241,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(cache.is_viable());
-        let campaign = plan_campaign(&cache, None).expect("should produce campaign");
+        let campaign = plan_campaign(&cache, None, false).expect("should produce campaign");
         assert_eq!(campaign.steps.len(), 2);
         assert_eq!(campaign.steps[0].input_type, EVMInputTy::ABI);
         assert_eq!(campaign.steps[0].contract, prime_addr);
@@ -245,7 +260,7 @@ mod tests {
         let abi_map = ABIAddressToInstanceMap { map };
         let cache = CampaignTargetCache::new(&abi_map, vec![token]);
         assert!(cache.is_viable());
-        let campaign = plan_campaign(&cache, None).expect("should produce campaign");
+        let campaign = plan_campaign(&cache, None, false).expect("should produce campaign");
         assert_eq!(campaign.steps.len(), 3);
         assert_eq!(campaign.steps[0].input_type, EVMInputTy::Borrow);
         assert_eq!(campaign.steps[0].contract, token);
@@ -273,10 +288,43 @@ mod tests {
         families.insert(ProtocolFamily::Chainlink);
         let report = TopologyReport::analyze(families);
         // Same address has both prime+exploit selectors → should pair on same contract
-        let campaign = plan_campaign(&cache, Some(&report)).expect("should produce campaign");
+        let campaign = plan_campaign(&cache, Some(&report), false).expect("should produce campaign");
         assert_eq!(campaign.steps.len(), 2);
         assert_eq!(campaign.steps[0].contract, campaign.steps[1].contract,
             "topology with same-contract class should pick same address");
+    }
+
+    #[test]
+    fn test_planner_adds_warp_when_temporal_skimming_enabled() {
+        let mut map = HashMap::new();
+        let prime_addr = EVMAddress::from([0x01; 20]);
+        let exploit_addr = EVMAddress::from([0x02; 20]);
+        map.insert(prime_addr, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(exploit_addr, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        // temporal_skimming = true → should insert warp before exploit step
+        let campaign = plan_campaign(&cache, None, true).expect("should produce campaign");
+        assert_eq!(campaign.steps.len(), 2);
+        assert_eq!(campaign.warps.len(), 1, "should have 1 warp entry");
+        assert_eq!(campaign.warps[0].0, 1, "warp should be before exploit step (index 1)");
+        assert_eq!(campaign.warps[0].1, 10, "warp should default to 10 blocks");
+    }
+
+    #[test]
+    fn test_planner_no_warp_when_temporal_skimming_disabled() {
+        let mut map = HashMap::new();
+        let prime_addr = EVMAddress::from([0x01; 20]);
+        let exploit_addr = EVMAddress::from([0x02; 20]);
+        map.insert(prime_addr, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(exploit_addr, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        // temporal_skimming = false → no warps (backward compatible)
+        let campaign = plan_campaign(&cache, None, false).expect("should produce campaign");
+        assert!(campaign.warps.is_empty(), "no warps when temporal_skimming is disabled");
     }
 }
 

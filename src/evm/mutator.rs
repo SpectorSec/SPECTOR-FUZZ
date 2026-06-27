@@ -125,6 +125,8 @@ where
     pub campaign_orchestrator: bool,
     /// Enable Ghost Identities (identity spoofing for privileged functions).
     pub ghost_identities: bool,
+    /// Enable Temporal Pre-condition Skimming (multi-block state priming).
+    pub temporal_skimming: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
 
@@ -137,11 +139,12 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool) -> Self {
+    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool) -> Self {
         Self {
             infant_scheduler,
             campaign_orchestrator,
             ghost_identities,
+            temporal_skimming,
             phantom: Default::default(),
         }
     }
@@ -278,7 +281,7 @@ where
             if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
                 if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
                     let topology_report = state.metadata_map().get::<TopologyReport>();
-                    if let Some(campaign) = plan_campaign(cache, topology_report) {
+                    if let Some(campaign) = plan_campaign(cache, topology_report, self.temporal_skimming) {
                         *input.get_campaign_mut() = Some(campaign);
                         return Ok(MutationResult::Mutated);
                     }
@@ -894,5 +897,74 @@ mod tests {
         assert!(key.starts_with("0x"), "key should start with 0x");
         assert!(key.contains("_0x"), "key should contain _0x separator");
         assert!(key.len() > 20, "key should be a non-trivial string");
+    }
+
+    #[test]
+    fn test_temporal_balance_snapshot_serde_roundtrip() {
+        use crate::evm::oracles::TemporalBalanceSnapshot;
+
+        let token = EVMAddress::from([0xaa; 20]);
+        let account = EVMAddress::from([0xbb; 20]);
+        let key = format!("0x{:?}_0x{:?}", token, account);
+        let mut balances = HashMap::new();
+        balances.insert(key.clone(), EVMU256::from(1000u64));
+
+        let snapshot = TemporalBalanceSnapshot {
+            balances,
+            pairs: vec![(token, account)],
+            snapshot_block: EVMU256::from(42u64),
+        };
+
+        let encoded = serde_json::to_string(&snapshot).expect("serialize should succeed");
+        let decoded: TemporalBalanceSnapshot = serde_json::from_str(&encoded).expect("deserialize should succeed");
+
+        assert_eq!(decoded.balances.len(), 1);
+        assert_eq!(decoded.balances[&key], EVMU256::from(1000u64));
+        assert_eq!(decoded.pairs.len(), 1);
+        assert_eq!(decoded.pairs[0], (token, account));
+        assert_eq!(decoded.snapshot_block, EVMU256::from(42u64));
+    }
+
+    #[test]
+    fn test_temporal_balance_snapshot_in_state() {
+        use crate::evm::oracles::TemporalBalanceSnapshot;
+
+        let mut state = EVMFuzzState::new(0);
+        let token = EVMAddress::from([0xcc; 20]);
+        let account = EVMAddress::from([0xdd; 20]);
+        let key = format!("0x{:?}_0x{:?}", token, account);
+        let mut balances = HashMap::new();
+        balances.insert(key.clone(), EVMU256::from(500u64));
+
+        state.metadata_map_mut().insert(TemporalBalanceSnapshot {
+            balances,
+            pairs: vec![(token, account)],
+            snapshot_block: EVMU256::from(100u64),
+        });
+
+        let stored = state.metadata_map().get::<TemporalBalanceSnapshot>()
+            .expect("TemporalBalanceSnapshot should exist");
+        assert_eq!(stored.balances.len(), 1);
+        assert_eq!(stored.balances[&key], EVMU256::from(500u64));
+        assert_eq!(stored.pairs.len(), 1);
+        assert_eq!(stored.snapshot_block, EVMU256::from(100u64));
+
+        // Verify we can remove it (as the oracle does after consuming)
+        state.metadata_map_mut().remove::<TemporalBalanceSnapshot>();
+        assert!(state.metadata_map().get::<TemporalBalanceSnapshot>().is_none());
+    }
+
+    #[test]
+    fn test_campaign_sequence_warps_default_empty() {
+        let campaign = crate::evm::input::CampaignSequence {
+            steps: Vec::new(),
+            linkages: Vec::new(),
+            warps: Vec::new(),
+        };
+        assert!(campaign.warps.is_empty());
+        // Verify backward compatibility: default when deserialized from old format
+        let json = r#"{"steps":[],"linkages":[]}"#;
+        let decoded: crate::evm::input::CampaignSequence = serde_json::from_str(json).expect("should deserialize without warps field");
+        assert!(decoded.warps.is_empty(), "warps should default to empty for backward compat");
     }
 }

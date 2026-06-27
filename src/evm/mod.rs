@@ -242,6 +242,12 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     ghost_identities: bool,
 
+    /// Enable Temporal Pre-condition Skimming (multi-block state priming).
+    /// When active, campaign steps can include block-advance (warp) operations
+    /// between prime and exploit steps to detect cross-round state divergence.
+    #[arg(long, default_value = "false")]
+    temporal_skimming: bool,
+
     /// Only fuzz contracts with the addresses provided, separated by comma
     #[arg(long, default_value = "")]
     only_fuzz: String,
@@ -855,6 +861,7 @@ pub fn evm_main(mut args: EvmArgs) {
         value_capture: args.value_capture,
         campaign_orchestrator: args.campaign_orchestrator,
         ghost_identities: args.ghost_identities,
+        temporal_skimming: args.temporal_skimming,
         etherscan_api_key,
     };
 
@@ -1047,6 +1054,7 @@ fn test_evm_offchain_setup() {
         value_capture: args.value_capture,
         campaign_orchestrator: args.campaign_orchestrator,
         ghost_identities: args.ghost_identities,
+        temporal_skimming: args.temporal_skimming,
         etherscan_api_key: String::from(""),
     };
 

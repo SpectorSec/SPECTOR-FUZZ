@@ -346,7 +346,7 @@ pub fn evm_fuzzer(
         state.add_metadata(cache);
     }
 
-    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator, config.ghost_identities);
+    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator, config.ghost_identities, config.temporal_skimming);
 
     state.metadata_map_mut().insert(UncoveredBranchesMetadata::new());
     let std_stage = PowerABIMutationalStage::new(mutator);
@@ -469,6 +469,13 @@ pub fn evm_fuzzer(
         let known_contracts: StdHashSet<EVMAddress> = artifacts.address_to_name.keys().cloned().collect();
         let rebasing_oracle = RebasingOracle::new(known_contracts, artifacts.address_to_name.clone());
         oracles.push(Rc::new(RefCell::new(rebasing_oracle)));
+    }
+
+    if config.temporal_skimming {
+        use crate::evm::oracles::temporal_skim::TemporalSkimOracle;
+        let temporal_oracle = TemporalSkimOracle::new(artifacts.address_to_name.clone());
+        oracles.push(Rc::new(RefCell::new(temporal_oracle)));
+        info!("Temporal Skim oracle activated (--temporal-skimming)");
     }
 
     // Auto-detected from ABI fingerprinting — no config flag needed.
