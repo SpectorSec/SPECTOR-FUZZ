@@ -3,6 +3,27 @@
 
 *The thesis: Every DeFi exploit is one of six data-flow primitives. We don't audit code — we extract flows, confirm exploitability directly on a live fork, and produce actionable outcomes.*
 
+## Design Lineage: From Incident Data to Fuzzer Architecture
+
+SPECTOR-FUZZ was not designed from abstract vulnerability taxonomies. Every major architectural decision — the campaign planner, the topology engine, the NestedAction mutator, the LiquidationRouter, the attacker contract system — was derived by mining [6 years of real DeFi incident reports](../DeFi-Security-Incident/) and studying **attacker flows** across vulnerability categories.
+
+The methodology: instead of labeling incidents by root cause (Reentrancy, Flash Loan, Oracle Manipulation) and stopping there, each report was analyzed for the *chain of operations* the attacker performed — what they called, in what order, with what identities, across how many transactions.
+
+### Direct Lineage
+
+| Attack Pattern (from incidents) | Fuzzer Architecture |
+|---|---|
+| Unprotected callbacks — attackers hijack `onERC721Received`, `executeOperation`, `uniswapV3SwapCallback` to inject payloads during protocol execution | Attacker bytecode injection on caller addresses + NestedAction system + host bridge that writes staged actions into EVM storage slots before executing the callback bytecode |
+| Arbitrary call / unverified input (74 incidents) — attackers supply target+calldata to drain via `transferFrom`, swaps, or vault withdrawals | NestedAction mutator biased 80% toward oracle-flagged targets; `OracleTargetMetadata` feeds back from oracles into mutation bias |
+| Access control + flash loan + oracle manipulation combos — attackers sequence a borrow, a price move, and a privileged call | Campaign planner (`plan_campaign`) generates topology-ranked multi-step sequences; `TopologyReport` drives step ordering and same-contract prioritization |
+| Profit extraction via swaps — attackers convert drained tokens to ETH | LiquidationRouter (`route_to_base`) discovers exit routes; `liquidation_percent` on inputs triggers ERC20Oracle's post-execution `.sell()` calls |
+| Cross-contract identity spoofing (confused deputy) — attackers make `msg.sender` appear as a trusted router/vault to bypass `onlyRouter`, `onlyVault` modifiers | Prank system (`vm.prank`) exists and is wired; currently fed by `WhaleAddressMetadata` (rich EOAs). Ghost Identities — using protocol contract addresses as prank targets — is the next evolution |
+| Multi-block state priming — Tx 1 deposits/manipulates, Tx 2 exploits after internal accounting desyncs | Temporal Pre-condition Skimming — not yet built. Campaign steps execute atomically within one event; cross-block state evolution requires a different architecture |
+
+### Why This Matters
+
+A vulnerability scanner finds bugs. An exploit flow generator finds *attack chains*. By encoding how real attackers actually sequence operations — not just what root cause they exploit — SPECTOR-FUZZ can discover exploits that span multiple primitives, multiple contracts, and multiple steps, because it learned those chains from the ground truth of 500+ real incidents spanning 2020–2026.
+
 ---
 
 ## The Philosophy: The Six DeFi Primitives
