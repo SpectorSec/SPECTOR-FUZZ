@@ -223,7 +223,7 @@ pub fn clear_branch_status() {
         {
             // Per-execution: reset the "clock was read" flag. CMP_TEMPORAL_DIST
             // is NOT cleared here — it's a monotonic-min map reset per-probe by the
-            // warp secant (cmp_t_reset_at), same model as CMP_MAP.
+            // warp secant (executor controlled probe), same model as CMP_MAP.
             TS_TOUCHED = false;
         }
     }

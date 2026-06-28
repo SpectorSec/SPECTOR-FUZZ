@@ -69,14 +69,34 @@ registered `CampaignIntermediateStates` serdeany (manual impl, register() was ne
 called) — surfaced once campaigns ran to completion.
 
 **Live result:** `warp* = 5000 EXACTLY on every probe (37k+), zero outliers,
-deterministic` — from any base (e.g. base=110 → 5000 too). The executor probe is now
-the authoritative warp refinement; the mutator secant just supplies an exploration
-base it corrects. host.rs exposes `temporal_argmin/temporal_read/temporal_reset_all/
-evmu256_to_u128_sat` as the shared source of truth.
+deterministic` — from any base (e.g. base=110 → 5000 too). The executor probe is the
+authoritative warp refinement. host.rs exposes `temporal_argmin/temporal_read/
+temporal_reset_all/evmu256_to_u128_sat` as the shared source of truth.
 
 Test races fixed along the way: `CMP_*` global-static tests serialized via mutex;
-`FUNCTION_SIG` write tests serialized too. `test_cmp_warp_secant_end_to_end` updated
-to the block-delta math (passes `--ignored --test-threads=1`).
+`FUNCTION_SIG` write tests serialized too.
+
+## Cleanup — CLOSED (2026-06-28)
+
+**Mutator warp secant removed (was redundant).** Once the executor became the
+authoritative warp refinement, the mutator's warp path only set a base the executor
+recomputed. Removed: `apply_cmp_warp`, `cmp_warp_secant`, `cmp_argmin_temporal`,
+`cmp_t_read_at`, `cmp_t_reset_at` (mutator), `CmpSecantState` (feedback), and the
+`test_cmp_warp_secant_end_to_end` unit test (it validated the removed 3-phase mutator
+machine; the executor probe is covered by `secant_step` math tests + the live run +
+`test_campaign_execution_integration`). The planner's base warp now flows straight to
+the executor. Kept: value/calldata secants (E/B) and their `cmp_argmin`/`cmp_read_at`/
+`cmp_reset_at` + `secant_step`. Both build configs green; 20 mutator + 9 planner tests pass.
+
+**Deposit-funding — closed as fork-reality (not a real-environment blocker).** The
+controlled probe works whenever the time-gated function is self-responsive (reads the
+clock and the relevant state already exists). On a real fork — the actual deployment
+environment — protocol state (deposits/TVL) pre-exists, so reward/timelock functions
+ARE self-responsive; `AccrualSelfPrimedMock` models this and converges exactly. The
+"campaign must call `deposit(nonzero)` first" need is an EMPTY-offchain-fixture artifact,
+not a fork concern. The general offchain solution (linking a prior step's funding into a
+later step) is the Engagement Seeder's job (Feature 002, step output→input linkage), not
+the secant's. So: no secant-side gap remains.
 
 ~~Also deferred: the pre-existing revm-41 panic on low-level value-calls.~~
 **FIXED (2026-06-28).** Root cause was the CALLDATA read in `host.rs` `call_internal`:

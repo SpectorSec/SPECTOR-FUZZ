@@ -703,28 +703,6 @@ pub enum SecantPhase {
     Probe2,
 }
 
-/// Secant probe state for campaign warp aiming (Application C).
-///
-/// `pin_idx` pins ONE comparison (the argmin of CMP_MAP at full 256-bit width)
-/// for the whole episode so both probes measure the same check. `d1` is u128,
-/// not u64, because accrual distances are wei-scale and `as_u64` would truncate
-/// exactly the case Application C exists for.
-/// `pin_pc` is the ownership fingerprint of the pinned comparison; reads validate
-/// against it to detect slot aliasing. `cooldown` rate-limits episodes (see the
-/// throughput gate in the mutator) so probing cannot run back-to-back forever.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct CmpSecantState {
-    pub phase: SecantPhase,
-    pub pin_idx: usize,
-    pub pin_pc: u64,
-    pub x1: u64,
-    pub d1: u128,
-    pub bn1: u64, // block.number at the D1 measurement (for real-delta slope)
-    pub cooldown: u32,
-}
-
-impl_serdeany!(CmpSecantState);
-
 /// Secant probe state for txn_value / msg.value aiming (Application E).
 /// `x1` is u128 (wei-scale values overflow u64).
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

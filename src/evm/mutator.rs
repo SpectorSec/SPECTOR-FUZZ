@@ -160,47 +160,10 @@ unsafe fn cmp_argmin() -> Option<(usize, u64, u128)> {
     best.map(|(i, d)| (i, crate::evm::host::CMP_PC[i], evmu256_to_u128_sat(d)))
 }
 
-/// Argmin over the TIME-GATED flip-distance map (`CMP_TEMPORAL_DIST`): the
-/// closest-to-flip comparison that executed after a TIMESTAMP/NUMBER read. Uses
-/// the true gap |v1-v2| (which has a gradient below a `>=` threshold, unlike the
-/// coverage abs_diff), so the warp secant pins the reward/timelock threshold
-/// instead of an unrelated globally-closest check.
-/// # Safety: reads the global CMP_TEMPORAL_DIST / CMP_TEMPORAL_PC statics.
-#[cfg(feature = "cmp")]
-unsafe fn cmp_argmin_temporal() -> Option<(usize, u64, u128)> {
-    let mut best: Option<(usize, EVMU256)> = None;
-    for (i, &d) in crate::evm::host::CMP_TEMPORAL_DIST.iter().enumerate() {
-        if d > EVMU256::ZERO && d < EVMU256::MAX && best.map_or(true, |(_, bd)| d < bd) {
-            best = Some((i, d));
-        }
-    }
-    best.map(|(i, d)| (i, crate::evm::host::CMP_TEMPORAL_PC[i], evmu256_to_u128_sat(d)))
-}
-
-/// Read the time-gated flip-distance AND the block.number it was measured at,
-/// validating ownership against `CMP_TEMPORAL_PC` (aliasing abort). `None` if
-/// untouched this run or a colliding clock-gated comparison took the slot.
-/// # Safety: reads the global CMP_TEMPORAL_DIST / CMP_TEMPORAL_PC / CMP_TEMPORAL_BN statics.
-#[cfg(feature = "cmp")]
-unsafe fn cmp_t_read_at(idx: usize, expect_fp: u64) -> Option<(u128, u64)> {
-    if crate::evm::host::CMP_TEMPORAL_PC[idx] != expect_fp {
-        return None;
-    }
-    let d = crate::evm::host::CMP_TEMPORAL_DIST[idx];
-    if d >= EVMU256::MAX {
-        None
-    } else {
-        Some((evmu256_to_u128_sat(d), crate::evm::host::CMP_TEMPORAL_BN[idx]))
-    }
-}
-
-/// Reset a pinned time-gated slot so the next execution measures it fresh.
-/// # Safety: writes the global CMP_TEMPORAL_DIST / CMP_TEMPORAL_PC statics.
-#[cfg(feature = "cmp")]
-unsafe fn cmp_t_reset_at(idx: usize) {
-    crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::MAX;
-    crate::evm::host::CMP_TEMPORAL_PC[idx] = 0;
-}
+// Time-gated (warp) secant targeting now lives in the campaign executor via
+// controlled probes; it reads the temporal maps through `host::temporal_*`. The
+// former mutator-side copies (cmp_argmin_temporal / cmp_t_read_at / cmp_t_reset_at)
+// were removed as redundant.
 
 /// Read the distance at a pinned index, validating that the slot still belongs
 /// to the pinned comparison (`expect_fp`). `None` if the slot was untouched
@@ -251,121 +214,6 @@ fn secant_step(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     Some(x1.saturating_add(step))
 }
 
-/// Application C core: three-phase snapshot-secant over a campaign warp.
-/// Extracted as a free function (takes the TIMESTAMP/NUMBER access flags directly)
-/// so it is testable end-to-end without constructing a full `FuzzMutator`.
-/// See `SecantPhase` for why three phases are required.
-#[cfg(feature = "cmp")]
-fn cmp_warp_secant<S>(campaign: &mut CampaignSequence, ts_read: bool, num_read: bool, state: &mut S)
-where
-    S: HasMetadata,
-{
-    if campaign.warps.is_empty() {
-        return;
-    }
-    // Gate (b): only probe if TIMESTAMP or NUMBER was read this execution.
-    if !ts_read && !num_read {
-        return;
-    }
-
-    let mut secant = state
-        .metadata_map()
-        .get::<crate::feedback::CmpSecantState>()
-        .cloned()
-        .unwrap_or_default();
-
-    const PROBE_DELTA: u64 = 100;
-    const MAX_WARP: u64 = 1_000_000;
-    const COOLDOWN: u32 = 8;
-
-    match secant.phase {
-        crate::feedback::SecantPhase::Idle => {
-            // Throughput is bounded by the cooldown alone. (Do NOT gate on the
-            // global `CmpMetadata.cmp_interesting` here — that tracks COVERAGE
-            // CMP_MAP progress, which is ~always false once coverage saturates and
-            // strangled the temporal secant. A pinnable temporal target + cooldown
-            // is the correct, sufficient start condition.)
-            if secant.cooldown > 0 {
-                secant.cooldown -= 1;
-                state.metadata_map_mut().insert(secant);
-                return;
-            }
-            // Pin the closest-to-flip TIME-DEPENDENT comparison (not the global
-            // argmin, which is usually a trivial d=1 check unrelated to time).
-            let Some((pin_idx, pin_pc, d)) = (unsafe { cmp_argmin_temporal() }) else { return };
-            if d == 0 {
-                return;
-            }
-            // Measurement 1 runs at the current base warp; reset the pinned index
-            // so the next execution writes a FRESH distance there.
-            let x1 = campaign.warps[0].1;
-            secant.pin_idx = pin_idx;
-            secant.pin_pc = pin_pc;
-            secant.x1 = x1;
-            secant.phase = crate::feedback::SecantPhase::Probe1;
-            unsafe { cmp_t_reset_at(pin_idx) };
-            for w in &mut campaign.warps {
-                w.1 = x1;
-            }
-            tracing::debug!("[secant-warp] start pin_idx={} d={} x1={}", pin_idx, d, x1);
-        }
-        crate::feedback::SecantPhase::Probe1 => {
-            // D1 + the block.number it was measured at (ownership-validated).
-            let Some((d1, bn1)) = (unsafe { cmp_t_read_at(secant.pin_idx, secant.pin_pc) }) else {
-                // Pinned comparison did not execute, or its slot was taken by a
-                // colliding site — abort rather than blend.
-                tracing::debug!("[secant-warp] probe1 abort: pinned cmp not executed / aliased");
-                secant.phase = crate::feedback::SecantPhase::Idle;
-                secant.cooldown = COOLDOWN;
-                state.metadata_map_mut().insert(secant);
-                return;
-            };
-            secant.d1 = d1;
-            secant.bn1 = bn1;
-            let x2 = secant.x1.saturating_add(PROBE_DELTA);
-            secant.phase = crate::feedback::SecantPhase::Probe2;
-            unsafe { cmp_t_reset_at(secant.pin_idx) };
-            for w in &mut campaign.warps {
-                w.1 = x2;
-            }
-            tracing::debug!("[secant-warp] probe1 d1={} bn1={} -> probe x2={}", d1, bn1, x2);
-        }
-        crate::feedback::SecantPhase::Probe2 => {
-            let x2 = secant.x1.saturating_add(PROBE_DELTA);
-            secant.phase = crate::feedback::SecantPhase::Idle;
-            secant.cooldown = COOLDOWN;
-            // Slope from the REAL block-number delta (not the assumed probe δ), so
-            // the estimate is correct even when the two probes came from different
-            // executions: rate = (d1 - d2) / (bn2 - bn1);  warp* = x2 + d2/rate.
-            let Some((d2, bn2)) = (unsafe { cmp_t_read_at(secant.pin_idx, secant.pin_pc) }) else {
-                tracing::debug!("[secant-warp] probe2 abort: pinned cmp not executed / aliased");
-                state.metadata_map_mut().insert(secant);
-                return;
-            };
-            let dd = secant.d1.saturating_sub(d2); // gap closed (gap shrinks as bn grows)
-            let dbn = bn2.saturating_sub(secant.bn1) as u128; // real block delta
-            if dd == 0 || dbn == 0 {
-                // Flat gradient → time is NOT the lever (saturated accrual, cliff
-                // past cap, time-independent check, or no block movement). Self-diagnose.
-                tracing::debug!("[secant-warp] probe2 d2={} dbn={} FLAT: time not the lever", d2, dbn);
-                state.metadata_map_mut().insert(secant);
-                return;
-            }
-            // warp* = x2 + d2 * dbn / dd   (additional warp from x2 to close gap d2)
-            let step = d2.saturating_mul(dbn).saturating_div(dd);
-            let warp_delta = (x2 as u128).saturating_add(step).min(MAX_WARP as u128) as u64;
-            tracing::debug!(
-                "[secant-warp] probe2 d1={} d2={} dbn={} -> warp*={}",
-                secant.d1, d2, dbn, warp_delta
-            );
-            for w in &mut campaign.warps {
-                w.1 = warp_delta;
-            }
-        }
-    }
-
-    state.metadata_map_mut().insert(secant);
-}
 
 /// [`FuzzMutator`] is a mutator that mutates the input based on the ABI and
 /// access pattern
@@ -478,22 +326,6 @@ where
         true
     }
 
-    /// Snapshot-secant warp refinement (Application C). Three-phase, pinned-index,
-    /// per-execution-fresh. See `SecantPhase` for why three phases are required.
-    ///
-    /// Secant: slope = (D1 − D2) / δ,  warp* = x1 + D1 / slope = x1 + D1·δ / dd.
-    /// Linear accrual (the target case) is exact after the two probes; the
-    /// flat-gradient branch self-diagnoses when time is not the lever.
-    #[cfg(feature = "cmp")]
-    fn apply_cmp_warp<I, S>(&self, campaign: &mut CampaignSequence, input: &I, state: &mut S)
-    where
-        I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
-        S: HasMetadata,
-    {
-        // Gate (b): only probe if TIMESTAMP or NUMBER was read this execution.
-        let ap = input.get_access_pattern().borrow().clone();
-        cmp_warp_secant(campaign, ap.timestamp, ap.number, state);
-    }
 
     /// Snapshot-secant for txn_value / msg.value (Application E).
     ///
@@ -785,12 +617,10 @@ where
             if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
                 if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
                     let topology_report = state.metadata_map().get::<TopologyReport>();
-                    if let Some(mut campaign) = plan_campaign(cache, topology_report, self.temporal_skimming) {
-                        // CMP_MAP-guided warp: if TIMESTAMP or NUMBER was
-                        // accessed, use the minimum comparison distance as the
-                        // warp delta (it IS the exact amount needed).
-                        #[cfg(feature = "cmp")]
-                        self.apply_cmp_warp(&mut campaign, input, state);
+                    if let Some(campaign) = plan_campaign(cache, topology_report, self.temporal_skimming) {
+                        // Warp refinement is done by the campaign EXECUTOR via
+                        // controlled probes (src/executor.rs) — clean, deterministic.
+                        // The planner's base warp flows through unchanged here.
                         *input.get_campaign_mut() = Some(campaign);
                         return Ok(MutationResult::Mutated);
                     }
@@ -1581,124 +1411,4 @@ mod tests {
         assert_ne!(fp1, fp2, "distinct PCs must produce distinct fingerprints");
     }
 
-    /// End-to-end (Tier 1.5): drives the FULL `cmp_warp_secant` 3-phase state
-    /// machine — pinning, ownership-validated reads, per-execution reset, gates,
-    /// phase transitions, campaign.warps mutation — over simulated execution,
-    /// WITHOUT the Feature 003 planner. Between phases we set CMP_MAP to the
-    /// distance the contract would produce at that warp.
-    ///
-    /// Both scenarios live in ONE test (run sequentially) so their `cmp_argmin`
-    /// scans cannot race each other on the global CMP_MAP under parallel test
-    /// execution; seeded distances stay below the only other writer's value (777).
-    // Drives the full state machine via `cmp_argmin`, which SCANS the entire
-    // global CMP_MAP. The parallel test suite writes CMP_MAP via EVM execution in
-    // other tests, so this must run isolated. Run with:
-    //   cargo test --features cmp,dataflow --bin ityfuzz \
-    //     test_cmp_warp_secant_end_to_end -- --ignored --test-threads=1
-    #[cfg(feature = "cmp")]
-    #[test]
-    #[ignore = "touches global CMP_MAP; run with --ignored --test-threads=1"]
-    fn test_cmp_warp_secant_end_to_end() {
-        let _g = CMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::evm::input::CampaignSequence;
-
-        let seed_md = || {
-            let mut state = EVMFuzzState::new(0);
-            let mut md = crate::feedback::CmpMetadata::new();
-            md.set_cmp_interesting(true); // allow an episode to start
-            state.metadata_map_mut().insert(md);
-            state
-        };
-        let new_campaign = || CampaignSequence {
-            steps: Vec::new(),
-            linkages: Vec::new(),
-            warps: vec![(0usize, 10u64)], // base warp x1 = 10
-        };
-
-        // ── Scenario 1: linear accrual distance(w) = 600 − w → true flip w = 600 ──
-        // Seeds the TEMPORAL flip-distance map (what the warp secant reads).
-        {
-            let idx = 1500usize;
-            let dist = |w: u64| -> u64 { 600u64.saturating_sub(w) };
-            let mut state = seed_md();
-            let mut campaign = new_campaign();
-
-            // Idle: seed the time-gated slot so cmp_argmin_temporal pins it.
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(dist(10)); // 590
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xBEEF;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state);
-            assert_eq!(campaign.warps[0].1, 10, "Idle measures at base warp x1=10");
-
-            // Probe1: gap 590 measured at block 10.
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(dist(10)); // 590
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xBEEF;
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 10;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state);
-            assert_eq!(campaign.warps[0].1, 110, "Probe1 sets x2 = x1 + δ(100)");
-
-            // Probe2: gap 490 measured at block 110 → rate = (590-490)/(110-10) = 1,
-            // warp* = x2(110) + d2(490)*dbn(100)/dd(100) = 110 + 490 = 600.
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(dist(110)); // 490
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xBEEF;
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 110;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state);
-            assert_eq!(
-                campaign.warps[0].1, 600,
-                "Probe2 converges to the true flip warp via real block-delta slope"
-            );
-
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::MAX;
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0;
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 0;
-            }
-        }
-
-        // ── Scenario 2: aliasing abort — a colliding site takes the slot before
-        //    Probe2; the secant must self-diagnose, not blend two comparisons. ──
-        {
-            let idx = 1500usize; // reuse (scenario 1 cleaned up); sequential, no race
-            let mut state = seed_md();
-            let mut campaign = new_campaign();
-
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(500u64);
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xAAAA; // pinned owner
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 10;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state); // Idle pins 0xAAAA
-
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(500u64);
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xAAAA;
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 10;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state); // Probe1
-            assert_eq!(campaign.warps[0].1, 110, "advanced to probe x2");
-
-            // Colliding site takes the slot (different owner) before Probe2.
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::from(1u64);
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0xBBBB; // not the pinned owner
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 110;
-            }
-            super::cmp_warp_secant(&mut campaign, false, true, &mut state); // Probe2
-            assert_eq!(
-                campaign.warps[0].1, 110,
-                "aliasing must abort (warp stays at x2), not converge on a blended slope"
-            );
-
-            unsafe {
-                crate::evm::host::CMP_TEMPORAL_DIST[idx] = EVMU256::MAX;
-                crate::evm::host::CMP_TEMPORAL_PC[idx] = 0;
-                crate::evm::host::CMP_TEMPORAL_BN[idx] = 0;
-            }
-        }
-    }
 }
