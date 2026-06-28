@@ -179,10 +179,70 @@ where
                     }
 
                     let last_idx = steps.len() - 1;
+                    // Warp delta for the exploit step (the planner's base; the secant
+                    // refines it below via controlled probes).
+                    let mut warp_delta: u64 = campaign
+                        .warps
+                        .iter()
+                        .find(|(idx, _)| *idx == last_idx)
+                        .map(|(_, d)| *d)
+                        .unwrap_or(0);
+
+                    // ── Controlled-probe warp refinement (Application C) ──
+                    // Re-execute the exploit step at two controlled warps from the
+                    // SAME prefix state, so only the warp varies → a clean slope with
+                    // no cross-iteration noise. Compute the warp that flips the
+                    // time-gated threshold and use it for the real execution below.
+                    #[cfg(feature = "cmp")]
+                    if warp_delta > 0 {
+                        use crate::evm::host::{temporal_argmin, temporal_read, temporal_reset_all};
+                        const DELTA: u64 = 100;
+                        const MAX_WARP: u64 = 1_000_000;
+                        let base = warp_delta;
+
+                        // Probe 1 at `base`.
+                        unsafe { temporal_reset_all() };
+                        {
+                            let (mut p, _) = steps.last().unwrap().to_input(current_state.clone());
+                            p.env.block.number += EVMU256::from(base);
+                            p.env.block.timestamp += EVMU256::from(base * 12);
+                            let pr: &I = unsafe { &*(&p as *const EVMInput as *const I) };
+                            let _ = self.vm.deref().borrow_mut().execute(pr, state);
+                        }
+                        if let Some((pin, fp, d1, _bn1)) = unsafe { temporal_argmin() } {
+                            // Probe 2 at `base + DELTA` (fresh measurement).
+                            unsafe { temporal_reset_all() };
+                            {
+                                let (mut p, _) = steps.last().unwrap().to_input(current_state.clone());
+                                p.env.block.number += EVMU256::from(base + DELTA);
+                                p.env.block.timestamp += EVMU256::from((base + DELTA) * 12);
+                                let pr: &I = unsafe { &*(&p as *const EVMInput as *const I) };
+                                let _ = self.vm.deref().borrow_mut().execute(pr, state);
+                            }
+                            if let Some((d2, _bn2)) = unsafe { temporal_read(pin, fp) } {
+                                // gap shrinks as warp grows: rate = (d1-d2)/DELTA;
+                                // warp* = base + d1/rate = base + d1*DELTA/(d1-d2).
+                                if d1 > d2 {
+                                    let dd = d1 - d2;
+                                    let step = d1.saturating_mul(DELTA as u128).saturating_div(dd);
+                                    warp_delta = (base as u128)
+                                        .saturating_add(step)
+                                        .min(MAX_WARP as u128)
+                                        as u64;
+                                    tracing::debug!(
+                                        "[secant-exec] controlled probe: base={} d1={} d2={} -> warp*={}",
+                                        base, d1, d2, warp_delta
+                                    );
+                                }
+                                // d1<=d2 → flat (time not the lever) → keep base.
+                            }
+                        }
+                    }
+
                     let (mut last_input, _) = steps.last().unwrap().to_input(current_state);
-                    if let Some(delta) = campaign.warps.iter().find(|(idx, _)| *idx == last_idx).map(|(_, d)| d) {
-                        last_input.env.block.number += EVMU256::from(*delta);
-                        last_input.env.block.timestamp += EVMU256::from(*delta * 12);
+                    if warp_delta > 0 {
+                        last_input.env.block.number += EVMU256::from(warp_delta);
+                        last_input.env.block.timestamp += EVMU256::from(warp_delta * 12);
                     }
                     let last_ref: &I = unsafe { &*(&last_input as *const EVMInput as *const I) };
                     let res = self.vm.deref().borrow_mut().execute(last_ref, state);

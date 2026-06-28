@@ -339,6 +339,13 @@ pub fn evm_fuzzer(
         config.concolic_num_threads,
     );
     if config.campaign_orchestrator {
+        // The executor stores CampaignIntermediateStates as metadata after a campaign
+        // run; its SerdeAny impl needs explicit registration (the others use
+        // impl_serdeany!). Without this, the first insert panics "inserted without
+        // registration". Safe here: single-threaded setup, before fuzzing starts.
+        unsafe {
+            crate::evm::types::CampaignIntermediateStatesEVM::register();
+        }
         let instance_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
         let cache = instance_map
             .map(|m| CampaignTargetCache::new(&m, Vec::new()))

@@ -97,6 +97,58 @@ pub fn cmp_owner_fp(addr: EVMAddress, pc: usize) -> u64 {
     }
 }
 
+/// Saturating EVMU256 → u128 (preserves wei-scale gaps; `as_u64` would truncate).
+#[cfg(feature = "cmp")]
+#[inline(always)]
+pub fn evmu256_to_u128_sat(d: EVMU256) -> u128 {
+    let l = d.as_limbs();
+    if l[2] != 0 || l[3] != 0 {
+        u128::MAX
+    } else {
+        (l[0] as u128) | ((l[1] as u128) << 64)
+    }
+}
+
+/// Clear the temporal flip-distance map (for a clean per-probe measurement).
+/// # Safety: writes the global temporal statics.
+#[cfg(feature = "cmp")]
+pub unsafe fn temporal_reset_all() {
+    for i in 0..MAP_SIZE {
+        CMP_TEMPORAL_DIST[i] = EVMU256::MAX;
+        CMP_TEMPORAL_PC[i] = 0;
+        CMP_TEMPORAL_BN[i] = 0;
+    }
+}
+
+/// Closest-to-flip time-gated comparison: (index, owner_fp, dist, block_number).
+/// # Safety: reads the global temporal statics.
+#[cfg(feature = "cmp")]
+pub unsafe fn temporal_argmin() -> Option<(usize, u64, u128, u64)> {
+    let mut best: Option<(usize, EVMU256)> = None;
+    for (i, &d) in CMP_TEMPORAL_DIST.iter().enumerate() {
+        if d > EVMU256::ZERO && d < EVMU256::MAX && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, d)| (i, CMP_TEMPORAL_PC[i], evmu256_to_u128_sat(d), CMP_TEMPORAL_BN[i]))
+}
+
+/// Read the time-gated flip-distance + block.number at a pinned index, validating
+/// ownership (aliasing abort). Returns `(dist, block_number)`.
+/// # Safety: reads the global temporal statics.
+#[cfg(feature = "cmp")]
+pub unsafe fn temporal_read(idx: usize, expect_fp: u64) -> Option<(u128, u64)> {
+    if idx >= MAP_SIZE || CMP_TEMPORAL_PC[idx] != expect_fp {
+        return None;
+    }
+    let d = CMP_TEMPORAL_DIST[idx];
+    if d >= EVMU256::MAX {
+        None
+    } else {
+        Some((evmu256_to_u128_sat(d), CMP_TEMPORAL_BN[idx]))
+    }
+}
+
 pub static mut ABI_MAX_SIZE: [usize; MAP_SIZE] = [0; MAP_SIZE];
 pub static mut STATE_CHANGE: bool = false;
 

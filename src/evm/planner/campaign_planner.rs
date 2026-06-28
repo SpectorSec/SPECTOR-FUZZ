@@ -56,8 +56,10 @@ pub struct CampaignTargetCache {
     pub borrowable_tokens: Vec<EVMAddress>,
     /// Fallback campaign targets: contracts the selector allowlist didn't match
     /// but that look campaignable (>= 2 functions incl. a trigger-named one).
-    /// A single such address forms a same-contract prime->exploit 2-step chain.
-    pub generic_targets: Vec<EVMAddress>,
+    /// Each entry is (address, prime_fn_abi, exploit_fn_abi) — the exploit is the
+    /// trigger-named function (pinned so the executor probe calls it), the prime is
+    /// a different (benign) function. Forms a same-contract prime->exploit chain.
+    pub generic_targets: Vec<(EVMAddress, Option<BoxedABI>, Option<BoxedABI>)>,
 }
 
 impl_serdeany!(CampaignTargetCache);
@@ -106,13 +108,13 @@ pub fn plan_campaign(
         steps.push(build_borrow_step(*token_addr));
     }
 
-    // Populate prime + exploit steps, respecting topology hints
+    // Populate prime + exploit steps (with concrete function ABIs), respecting hints
     let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report);
-    if let Some(addr) = prime_step {
-        steps.push(build_abi_step(addr));
+    if let Some((addr, abi)) = prime_step {
+        steps.push(build_abi_step(addr, abi));
     }
-    if let Some(addr) = exploit_step {
-        steps.push(build_abi_step(addr));
+    if let Some((addr, abi)) = exploit_step {
+        steps.push(build_abi_step(addr, abi));
     }
 
     // Minimum viable campaign: at least 2 steps
@@ -141,10 +143,12 @@ pub fn plan_campaign(
 /// to prefer same-contract pairs when the top-ranked exploit class
 /// suggests a single-contract vulnerability (ERC-4626 vaults, staking
 /// pools, etc.).
+type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
+
 fn pick_prime_and_exploit<'a>(
     cache: &'a CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
-) -> (Option<EVMAddress>, Option<EVMAddress>) {
+) -> (PickedStep, PickedStep) {
     let prefer_same_contract = topology_report
         .and_then(|r| r.ranked.first())
         .map(|(cls, _)| {
@@ -158,32 +162,32 @@ fn pick_prime_and_exploit<'a>(
         .unwrap_or(false);
 
     if prefer_same_contract {
-        // Try to find an address that appears in both prime and exploit lists
-        let exploit_addrs: HashSet<EVMAddress> = cache
-            .exploit_targets
-            .iter()
-            .map(|(a, _, _)| *a)
-            .collect();
-        for (addr, _, _) in &cache.prime_targets {
-            if exploit_addrs.contains(addr) {
-                return (Some(*addr), Some(*addr));
+        // Prefer an address in both lists, pinning each side's concrete function.
+        for (addr, _, p_abi) in &cache.prime_targets {
+            if let Some((_, _, e_abi)) = cache.exploit_targets.iter().find(|(a, _, _)| a == addr) {
+                return (
+                    Some((*addr, Some(p_abi.clone()))),
+                    Some((*addr, Some(e_abi.clone()))),
+                );
             }
         }
     }
 
-    // Default: pick first from each selector-matched list.
-    let prime = cache.prime_targets.first().map(|(a, _, _)| *a);
-    let exploit = cache.exploit_targets.first().map(|(a, _, _)| *a);
+    // Default: first from each selector-matched list, carrying the concrete ABI.
+    let prime = cache.prime_targets.first().map(|(a, _, abi)| (*a, Some(abi.clone())));
+    let exploit = cache.exploit_targets.first().map(|(a, _, abi)| (*a, Some(abi.clone())));
     if prime.is_some() && exploit.is_some() {
         return (prime, exploit);
     }
 
-    // Fallback: the selector allowlist didn't yield a full pair. Recognize a
-    // simple/novel single-contract fixture via name heuristics — use one generic
-    // target as BOTH prime and exploit (two steps on the same contract; the
-    // mutator resolves which functions to call, e.g. deposit then claimJackpot).
-    if let Some(addr) = cache.generic_targets.first() {
-        return (Some(*addr), Some(*addr));
+    // Fallback: name-heuristic single-contract target. Pin the trigger function as
+    // the exploit step (so the executor probe calls it, not the fallback) and a
+    // different function as the benign prime step.
+    if let Some((addr, prime_abi, exploit_abi)) = cache.generic_targets.first() {
+        return (
+            Some((*addr, prime_abi.clone())),
+            Some((*addr, exploit_abi.clone())),
+        );
     }
 
     (prime, exploit)
@@ -217,26 +221,37 @@ fn find_targets_by_selector(
 /// treated as campaignable. Recognizes simple/novel staking/vault/timelock fixtures
 /// the selector allowlist doesn't cover. NOT for production — see the const above.
 #[cfg(not(feature = "campaign_generic_fallback"))]
-fn find_generic_targets(_abi_map: &ABIAddressToInstanceMap) -> Vec<EVMAddress> {
+fn find_generic_targets(
+    _abi_map: &ABIAddressToInstanceMap,
+) -> Vec<(EVMAddress, Option<BoxedABI>, Option<BoxedABI>)> {
     Vec::new()
 }
 
 #[cfg(feature = "campaign_generic_fallback")]
-fn find_generic_targets(abi_map: &ABIAddressToInstanceMap) -> Vec<EVMAddress> {
+fn find_generic_targets(
+    abi_map: &ABIAddressToInstanceMap,
+) -> Vec<(EVMAddress, Option<BoxedABI>, Option<BoxedABI>)> {
     let mut out = Vec::new();
     for (addr, abis) in &abi_map.map {
-        let n_fns = abis.iter().filter(|a| a.function != [0u8; 4]).count();
-        if n_fns < 2 {
+        let fns: Vec<&BoxedABI> = abis.iter().filter(|a| a.function != [0u8; 4]).collect();
+        if fns.len() < 2 {
             continue;
         }
-        let has_trigger = abis.iter().any(|a| {
+        // Exploit = first trigger-named function (pinned so the probe calls it).
+        let exploit = fns.iter().find(|a| {
             fn_name_lc(a)
                 .map(|n| EXPLOIT_NAME_PATTERNS.iter().any(|p| n.contains(p)))
                 .unwrap_or(false)
         });
-        if has_trigger {
-            out.push(*addr);
-        }
+        let Some(exploit) = exploit else { continue };
+        let exploit_sel = exploit.function;
+        // Prime = first function that is NOT the exploit (benign setup step).
+        let prime = fns.iter().find(|a| a.function != exploit_sel);
+        out.push((
+            *addr,
+            prime.map(|a| (*a).clone()),
+            Some((*exploit).clone()),
+        ));
     }
     out
 }
@@ -327,7 +342,21 @@ mod tests {
 
         assert!(cache.prime_targets.is_empty(), "these selectors aren't in the allowlist");
         assert!(cache.exploit_targets.is_empty());
-        assert!(cache.generic_targets.contains(&addr), "recognized via name fallback");
+        assert!(
+            cache.generic_targets.iter().any(|(a, _, _)| *a == addr),
+            "recognized via name fallback"
+        );
+        // The exploit step is pinned to the trigger function (claimJackpot).
+        let (_, _, exploit_abi) = cache
+            .generic_targets
+            .iter()
+            .find(|(a, _, _)| *a == addr)
+            .unwrap();
+        assert_eq!(
+            exploit_abi.as_ref().map(|a| a.function),
+            Some(claim_sel),
+            "exploit step pinned to the trigger function's selector"
+        );
         assert!(cache.is_viable());
 
         let campaign =
@@ -449,14 +478,16 @@ mod tests {
     }
 }
 
-fn build_abi_step(target: EVMAddress) -> ConciseEVMInput {
-    // Construct a minimal ABI step. Parameter resolution happens during mutation
-    // via the existing `mutate_with_vm_slots` path.
+fn build_abi_step(target: EVMAddress, abi: Option<BoxedABI>) -> ConciseEVMInput {
+    // Pin the concrete function (`abi`) so the step calls it directly — required for
+    // the executor's controlled warp probe to exercise the time-gated function
+    // instead of hitting the fallback with empty calldata. Args are still mutated
+    // via the `mutate_with_vm_slots` path. `None` falls back to the contract.
     ConciseEVMInput {
         input_type: EVMInputTy::ABI,
         caller: EVMAddress::default(),
         contract: target,
-        data: None,
+        data: abi,
         txn_value: None,
         step: false,
         env: Default::default(),
