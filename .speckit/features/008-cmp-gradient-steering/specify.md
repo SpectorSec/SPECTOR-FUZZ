@@ -47,10 +47,32 @@ Three bugs were fixed in sequence to get there (all machine-truth, no name guess
    `block.number` it was measured at (`CMP_TEMPORAL_BN`); compute slope from the REAL
    block delta `rate=(d1-d2)/(bn2-bn1)`, `warp* = x2 + d2/rate`.
 
-**Live result** (`AccrualSelfPrimedMock`, reward = elapsed·7, THRESHOLD 35000 →
-true flip elapsed 5000): `warp*` values cluster tightly at **4890–5109, centered on
-5000** — exact. The secant predicts the precise warp to cross a time-gated accrual
-threshold with rate≠1, through the multiplication, live, end-to-end.
+**Live result (mutator bn-pairing)** (`AccrualSelfPrimedMock`, reward = elapsed·7,
+THRESHOLD 35000 → true flip elapsed 5000): `warp*` clustered at **4890–5109** with a
+few 1e6/76k outliers — close but noisy, because the two probes came from different
+uncontrolled fuzzer executions.
+
+## Controlled-probe in the executor — RESOLVED (2026-06-28), deterministic
+
+The noise above is gone. Moved the measurement to where execution is controlled:
+the **campaign executor** (`src/executor.rs run_target`). Before the exploit step it
+re-executes that step at `warp=base` and `base+δ` from the SAME prefix state (only the
+warp varies → a clean slope), computes `warp* = base + d1·δ/(d1−d2)` over the
+flip-directional temporal distance, and runs the final step at `warp*`.
+
+**Required data-handoff fix** (component-boundary enrichment): campaign steps were
+address-only (`data: None`) → the probe hit the fallback with empty calldata and never
+read the clock. Now `build_abi_step` carries the concrete function ABI; the planner
+pins the time-gated/trigger function into the exploit step (selector targets already
+had it; the generic fallback pins its trigger fn + a distinct benign prime). Also
+registered `CampaignIntermediateStates` serdeany (manual impl, register() was never
+called) — surfaced once campaigns ran to completion.
+
+**Live result:** `warp* = 5000 EXACTLY on every probe (37k+), zero outliers,
+deterministic` — from any base (e.g. base=110 → 5000 too). The executor probe is now
+the authoritative warp refinement; the mutator secant just supplies an exploration
+base it corrects. host.rs exposes `temporal_argmin/temporal_read/temporal_reset_all/
+evmu256_to_u128_sat` as the shared source of truth.
 
 Test races fixed along the way: `CMP_*` global-static tests serialized via mutex;
 `FUNCTION_SIG` write tests serialized too. `test_cmp_warp_secant_end_to_end` updated
