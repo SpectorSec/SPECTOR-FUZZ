@@ -73,8 +73,54 @@ pub static mut WRITE_MAP: [u8; MAP_SIZE] = [0; MAP_SIZE];
 // cmp
 pub static mut CMP_MAP: [EVMU256; MAP_SIZE] = [EVMU256::MAX; MAP_SIZE];
 
+// Ownership fingerprint of the PC that set the CURRENT minimum in each CMP_MAP
+// slot. Because CMP_MAP is keyed by `pc % MAP_SIZE`, two distinct comparison
+// sites (or a JUMPI write) can alias to one slot. The snapshot-secant pins a
+// slot AND its owner fingerprint, then validates ownership on every read; if a
+// colliding site has taken the slot, the secant aborts rather than computing a
+// slope from two different comparisons (closes Checkpoint 8.3). 0 = no owner.
+#[cfg(feature = "cmp")]
+pub static mut CMP_PC: [u64; MAP_SIZE] = [0u64; MAP_SIZE];
+
+/// Cheap per-(contract, pc) ownership fingerprint for CMP_PC. 0 is reserved as
+/// the "no owner" sentinel, so a real fingerprint of 0 is remapped to 1.
+#[cfg(feature = "cmp")]
+#[inline(always)]
+pub fn cmp_owner_fp(addr: EVMAddress, pc: usize) -> u64 {
+    let ab = addr.0 .0; // [u8; 20]
+    let addr_fp = u64::from_le_bytes([ab[0], ab[1], ab[2], ab[3], ab[4], ab[5], ab[6], ab[7]]);
+    let fp = (pc as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ addr_fp;
+    if fp == 0 {
+        1
+    } else {
+        fp
+    }
+}
+
 pub static mut ABI_MAX_SIZE: [usize; MAP_SIZE] = [0; MAP_SIZE];
 pub static mut STATE_CHANGE: bool = false;
+
+// Flip-directional distance for comparisons that executed AFTER the EVM read the
+// clock (TIMESTAMP/NUMBER) this execution. Unlike the coverage `CMP_MAP` abs_diff
+// (which is 0 for `x < THRESHOLD` and gives no gradient while accruing UP to a
+// `>=` threshold), this stores the TRUE absolute gap |v1-v2| — which shrinks
+// monotonically as a warp drives the operands toward the flip. The warp-secant
+// reads THIS map, so it has a usable gradient for time-gated thresholds. A slot
+// with value < MAX is, by construction, a clock-gated comparison (machine-truth:
+// observed opcode flow, not a name guess). CMP_TEMPORAL_PC owns the slot for
+// aliasing detection. TS_TOUCHED is per-execution (reset in clear_branch_status).
+#[cfg(feature = "cmp")]
+pub static mut CMP_TEMPORAL_DIST: [EVMU256; MAP_SIZE] = [EVMU256::MAX; MAP_SIZE];
+#[cfg(feature = "cmp")]
+pub static mut CMP_TEMPORAL_PC: [u64; MAP_SIZE] = [0u64; MAP_SIZE];
+// block.number at which each temporal flip-distance was recorded. The warp-secant
+// computes its slope from REAL block-number deltas (rate = Δgap / Δblock) instead
+// of the warps it *assumes* it applied — so the estimate is correct even though
+// the two probe measurements come from different (uncontrolled) fuzzer executions.
+#[cfg(feature = "cmp")]
+pub static mut CMP_TEMPORAL_BN: [u64; MAP_SIZE] = [0u64; MAP_SIZE];
+#[cfg(feature = "cmp")]
+pub static mut TS_TOUCHED: bool = false;
 
 pub const RW_SKIPPER_PERCT_IDX: usize = 100;
 pub const RW_SKIPPER_AMT: usize = MAP_SIZE - RW_SKIPPER_PERCT_IDX;
@@ -121,6 +167,13 @@ pub fn clear_branch_status() {
         ARBITRARY_CALL_TARGET = [0u8; 20];
         ARBITRARY_CALL_VALUE = EVMU256::ZERO;
         UNBOUNDED_STATIC_CALL_DETECTED = false;
+        #[cfg(feature = "cmp")]
+        {
+            // Per-execution: reset the "clock was read" flag. CMP_TEMPORAL_DIST
+            // is NOT cleared here — it's a monotonic-min map reset per-probe by the
+            // warp secant (cmp_t_reset_at), same model as CMP_MAP.
+            TS_TOUCHED = false;
+        }
     }
 }
 
@@ -479,6 +532,9 @@ where
                             {
                                 let idx = pc % MAP_SIZE;
                                 CMP_MAP[idx] = br;
+                                // JUMPI takes ownership of the slot so the secant
+                                // can detect (and skip) JUMPI-clobbered slots.
+                                CMP_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
                             }
 
                             add_branch((interp.input.target_address, pc, jump_dest != 1));
@@ -526,6 +582,13 @@ where
                             READ_MAP[process_rw_key!(key)] = true;
                         }
 
+                        #[cfg(feature = "cmp")]
+                        0x42 | 0x43 => {
+                            // TIMESTAMP | NUMBER read — mark the execution so any
+                            // comparison that follows is flagged time-dependent.
+                            TS_TOUCHED = true;
+                        }
+
                         // todo(shou): support signed checking
                         #[cfg(feature = "cmp")]
                         0x10 | 0x12 => {
@@ -540,6 +603,19 @@ where
                             let idx = pc % MAP_SIZE;
                             if abs_diff < CMP_MAP[idx] {
                                 CMP_MAP[idx] = abs_diff;
+                                CMP_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                            }
+                            // Flip-directional distance for the warp-secant: the TRUE
+                            // gap |v1-v2|, captured ONLY for clock-gated comparisons.
+                            // (Coverage abs_diff is 0 below a `>=` threshold and gives
+                            // no gradient; |v1-v2| shrinks monotonically toward the flip.)
+                            if TS_TOUCHED {
+                                let gap = if v1 >= v2 { v1 - v2 } else { v2 - v1 };
+                                if gap < CMP_TEMPORAL_DIST[idx] {
+                                    CMP_TEMPORAL_DIST[idx] = gap;
+                                    CMP_TEMPORAL_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                                    CMP_TEMPORAL_BN[idx] = crate::evm::types::as_u64(self.env.block.number);
+                                }
                             }
                         }
 
@@ -556,6 +632,19 @@ where
                             let idx = pc % MAP_SIZE;
                             if abs_diff < CMP_MAP[idx] {
                                 CMP_MAP[idx] = abs_diff;
+                                CMP_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                            }
+                            // Flip-directional distance for the warp-secant: the TRUE
+                            // gap |v1-v2|, captured ONLY for clock-gated comparisons.
+                            // (Coverage abs_diff is 0 below a `>=` threshold and gives
+                            // no gradient; |v1-v2| shrinks monotonically toward the flip.)
+                            if TS_TOUCHED {
+                                let gap = if v1 >= v2 { v1 - v2 } else { v2 - v1 };
+                                if gap < CMP_TEMPORAL_DIST[idx] {
+                                    CMP_TEMPORAL_DIST[idx] = gap;
+                                    CMP_TEMPORAL_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                                    CMP_TEMPORAL_BN[idx] = crate::evm::types::as_u64(self.env.block.number);
+                                }
                             }
                         }
 
@@ -572,6 +661,19 @@ where
                             let idx = pc % MAP_SIZE;
                             if abs_diff < CMP_MAP[idx] {
                                 CMP_MAP[idx] = abs_diff;
+                                CMP_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                            }
+                            // Flip-directional distance for the warp-secant: the TRUE
+                            // gap |v1-v2|, captured ONLY for clock-gated comparisons.
+                            // (Coverage abs_diff is 0 below a `>=` threshold and gives
+                            // no gradient; |v1-v2| shrinks monotonically toward the flip.)
+                            if TS_TOUCHED {
+                                let gap = if v1 >= v2 { v1 - v2 } else { v2 - v1 };
+                                if gap < CMP_TEMPORAL_DIST[idx] {
+                                    CMP_TEMPORAL_DIST[idx] = gap;
+                                    CMP_TEMPORAL_PC[idx] = cmp_owner_fp(interp.input.target_address, pc);
+                                    CMP_TEMPORAL_BN[idx] = crate::evm::types::as_u64(self.env.block.number);
+                                }
                             }
                         }
 
@@ -1327,7 +1429,14 @@ where
         // (get_memory_input_and_out_ranges already adds local_memory_offset).
         // Use global_slice_range (base=0) to avoid double-adding my_checkpoint.
         if let CallInput::SharedBuffer(ref range) = input.input {
-            let bytes = PrimBytes::copy_from_slice(&*interp.memory.global_slice_range(range.clone()));
+            // An empty calldata region (e.g. a low-level `.call("")`) can arrive as
+            // a degenerate range (usize::MAX..usize::MAX); slicing it OOBs revm 41's
+            // SharedMemory and panics. Treat any empty range as empty calldata.
+            let bytes = if range.start >= range.end {
+                PrimBytes::new()
+            } else {
+                PrimBytes::copy_from_slice(&*interp.memory.global_slice_range(range.clone()))
+            };
             input.input = CallInput::Bytes(bytes);
         }
 
@@ -1467,6 +1576,19 @@ where
             }
         }
         self.last_call_result = None;
+
+        // Sanitize the return-memory range. An EMPTY range at a non-zero / out-of-
+        // bounds offset (notably usize::MAX..usize::MAX, produced when the injected
+        // attacker bytecode handles a low-level `.call("")` with no return region)
+        // makes revm 41 slice the parent's SharedMemory OOB and hit
+        // `debug_unreachable!("slice OOB")`. Normalize any empty range to 0..0 —
+        // revm copies 0 bytes for an empty out-region regardless of offset, so this
+        // is behavior-preserving for legitimate calls AND keeps the intentional
+        // attacker-callback injection feature working.
+        if res.1.start >= res.1.end {
+            res.1 = 0..0;
+        }
+
         res
     }
 

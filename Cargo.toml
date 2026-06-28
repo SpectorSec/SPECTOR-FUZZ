@@ -38,6 +38,11 @@ z3_debug = []
 debug = []
 flashloan_debug = []
 no_etherscan = []
+# Name-heuristic campaign-target fallback. OFF by default on purpose: production /
+# bounty runs stay machine-truth-only (exact-selector matching). Enable ONLY for
+# fixture testing of simple/novel contracts the selector allowlist doesn't cover:
+#   cargo build/test --features campaign_generic_fallback
+campaign_generic_fallback = []
 
 
 [dependencies]

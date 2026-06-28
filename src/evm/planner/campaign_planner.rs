@@ -28,6 +28,25 @@ const EXPLOIT_SELECTORS: &[[u8; 4]] = &[
     [0x85, 0x38, 0x28, 0xb6], // donate
 ];
 
+/// Function-NAME substrings that indicate a trigger/exploit function. TESTING
+/// ONLY — gated behind `campaign_generic_fallback`, off by default. Name matching
+/// is NOT machine truth: substrings also hit getters (`claimable`, `withdrawable`)
+/// and miss attacker-renamed functions. Production stays on exact-selector truth.
+#[cfg(feature = "campaign_generic_fallback")]
+const EXPLOIT_NAME_PATTERNS: &[&str] = &[
+    "withdraw", "redeem", "claim", "harvest", "exit", "unstake", "unlock",
+    "collect", "skim", "sync", "liquidate", "drain", "payout", "sweep",
+    "borrow", "cashout", "release", "settle",
+];
+
+/// Lowercased function name (portion before `(`) from the global signature
+/// registry, if known. Returns `None` when signatures were not registered.
+#[cfg(feature = "campaign_generic_fallback")]
+fn fn_name_lc(abi: &BoxedABI) -> Option<String> {
+    abi.get_func_signature()
+        .map(|sig| sig.split('(').next().unwrap_or("").to_ascii_lowercase())
+}
+
 /// Pre-filtered campaign target cache, initialized once during corpus setup.
 /// Replaces the O(N) ABI registry scan with an O(1) read-only lookup.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -35,6 +54,10 @@ pub struct CampaignTargetCache {
     pub prime_targets: Vec<(EVMAddress, [u8; 4], BoxedABI)>,
     pub exploit_targets: Vec<(EVMAddress, [u8; 4], BoxedABI)>,
     pub borrowable_tokens: Vec<EVMAddress>,
+    /// Fallback campaign targets: contracts the selector allowlist didn't match
+    /// but that look campaignable (>= 2 functions incl. a trigger-named one).
+    /// A single such address forms a same-contract prime->exploit 2-step chain.
+    pub generic_targets: Vec<EVMAddress>,
 }
 
 impl_serdeany!(CampaignTargetCache);
@@ -46,12 +69,14 @@ impl CampaignTargetCache {
             prime_targets: find_targets_by_selector(abi_map, PRIME_SELECTORS),
             exploit_targets: find_targets_by_selector(abi_map, EXPLOIT_SELECTORS),
             borrowable_tokens,
+            generic_targets: find_generic_targets(abi_map),
         }
     }
 
     /// Returns true if this cache has enough targets to form at least a 2-step campaign.
     pub fn is_viable(&self) -> bool {
-        !self.prime_targets.is_empty() && !self.exploit_targets.is_empty()
+        (!self.prime_targets.is_empty() && !self.exploit_targets.is_empty())
+            || !self.generic_targets.is_empty()
     }
 }
 
@@ -146,11 +171,22 @@ fn pick_prime_and_exploit<'a>(
         }
     }
 
-    // Default: pick first from each list
-    (
-        cache.prime_targets.first().map(|(a, _, _)| *a),
-        cache.exploit_targets.first().map(|(a, _, _)| *a),
-    )
+    // Default: pick first from each selector-matched list.
+    let prime = cache.prime_targets.first().map(|(a, _, _)| *a);
+    let exploit = cache.exploit_targets.first().map(|(a, _, _)| *a);
+    if prime.is_some() && exploit.is_some() {
+        return (prime, exploit);
+    }
+
+    // Fallback: the selector allowlist didn't yield a full pair. Recognize a
+    // simple/novel single-contract fixture via name heuristics — use one generic
+    // target as BOTH prime and exploit (two steps on the same contract; the
+    // mutator resolves which functions to call, e.g. deposit then claimJackpot).
+    if let Some(addr) = cache.generic_targets.first() {
+        return (Some(*addr), Some(*addr));
+    }
+
+    (prime, exploit)
 }
 
 /// Find all contracts whose ABI list includes any of the given selectors.
@@ -170,6 +206,39 @@ fn find_targets_by_selector(
         }
     }
     results
+}
+
+/// TESTING-ONLY name-heuristic fallback (gated behind `campaign_generic_fallback`,
+/// off by default). When the feature is disabled this returns empty, so the
+/// `generic_targets` field, `is_viable`, and the `pick_prime_and_exploit` fallback
+/// all become no-ops and production stays exact-selector (machine-truth) only.
+///
+/// When enabled: a contract with >= 2 functions AND >= 1 trigger-NAMED function is
+/// treated as campaignable. Recognizes simple/novel staking/vault/timelock fixtures
+/// the selector allowlist doesn't cover. NOT for production — see the const above.
+#[cfg(not(feature = "campaign_generic_fallback"))]
+fn find_generic_targets(_abi_map: &ABIAddressToInstanceMap) -> Vec<EVMAddress> {
+    Vec::new()
+}
+
+#[cfg(feature = "campaign_generic_fallback")]
+fn find_generic_targets(abi_map: &ABIAddressToInstanceMap) -> Vec<EVMAddress> {
+    let mut out = Vec::new();
+    for (addr, abis) in &abi_map.map {
+        let n_fns = abis.iter().filter(|a| a.function != [0u8; 4]).count();
+        if n_fns < 2 {
+            continue;
+        }
+        let has_trigger = abis.iter().any(|a| {
+            fn_name_lc(a)
+                .map(|n| EXPLOIT_NAME_PATTERNS.iter().any(|p| n.contains(p)))
+                .unwrap_or(false)
+        });
+        if has_trigger {
+            out.push(*addr);
+        }
+    }
+    out
 }
 
 /// Build a Borrow step that acquires tokens via flashloan.
@@ -203,6 +272,11 @@ mod tests {
     use crate::evm::input::EVMInputTy;
     use std::collections::HashMap;
 
+    // Serializes tests that call `set_func_with_signature`, which writes the global
+    // `static mut FUNCTION_SIG` HashMap — concurrent writes are a data race (UB).
+    #[cfg(feature = "campaign_generic_fallback")]
+    static FUNCTION_SIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_abi(selector: [u8; 4]) -> BoxedABI {
         let mut abi = BoxedABI::new(Box::new(AUnknown {
             concrete: BoxedABI::new(Box::new(AEmpty {})),
@@ -229,6 +303,53 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
         assert!(!cache.is_viable());
         assert!(plan_campaign(&cache, None, false).is_none());
+    }
+
+    /// Simple/novel fixture (selectors NOT in the allowlist) is recognized via the
+    /// name-based generic fallback: a contract with >=2 functions incl. a
+    /// trigger-named one (`claimJackpot`) forms a same-contract 2-step campaign.
+    #[cfg(feature = "campaign_generic_fallback")]
+    #[test]
+    fn test_generic_target_recognized_by_name() {
+        let _g = FUNCTION_SIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = EVMAddress::repeat_byte(0x11);
+        let claim_sel = [0x11u8, 0x11, 0x11, 0x11];
+        let dep_sel = [0x22u8, 0x22, 0x22, 0x22];
+        let mut claim = make_abi(claim_sel);
+        claim.set_func_with_signature(claim_sel, "claimJackpot", "()");
+        let mut dep = make_abi(dep_sel);
+        dep.set_func_with_signature(dep_sel, "deposit", "(uint256)");
+
+        let mut map = HashMap::new();
+        map.insert(addr, vec![claim, dep]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        assert!(cache.prime_targets.is_empty(), "these selectors aren't in the allowlist");
+        assert!(cache.exploit_targets.is_empty());
+        assert!(cache.generic_targets.contains(&addr), "recognized via name fallback");
+        assert!(cache.is_viable());
+
+        let campaign =
+            plan_campaign(&cache, None, true).expect("generic fallback must yield a campaign");
+        assert_eq!(campaign.steps.len(), 2, "single-contract prime->exploit 2-step chain");
+        assert_eq!(campaign.warps.len(), 1, "temporal warp inserted before exploit step");
+    }
+
+    /// A contract with a trigger name but only ONE function is not campaignable.
+    #[cfg(feature = "campaign_generic_fallback")]
+    #[test]
+    fn test_generic_single_function_not_viable() {
+        let _g = FUNCTION_SIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = EVMAddress::repeat_byte(0x33);
+        let sel = [0x33u8, 0x33, 0x33, 0x33];
+        let mut claim = make_abi(sel);
+        claim.set_func_with_signature(sel, "claim", "()");
+        let mut map = HashMap::new();
+        map.insert(addr, vec![claim]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+        assert!(cache.generic_targets.is_empty(), "needs >= 2 functions");
     }
 
     #[test]

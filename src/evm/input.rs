@@ -110,6 +110,9 @@ pub trait EVMInputT {
     /// Set the transaction value in wei
     fn set_txn_value(&mut self, v: EVMU256);
 
+    /// Set the direct data (raw input bytes)
+    fn set_direct_data(&mut self, data: Bytes);
+
     /// Get input type
     fn get_input_type(&self) -> EVMInputTy;
 
@@ -721,6 +724,10 @@ impl EVMInputT for EVMInput {
 
     fn set_txn_value(&mut self, v: EVMU256) {
         self.txn_value = Some(v);
+    }
+
+    fn set_direct_data(&mut self, data: Bytes) {
+        self.direct_data = data;
     }
 
     fn get_input_type(&self) -> EVMInputTy {

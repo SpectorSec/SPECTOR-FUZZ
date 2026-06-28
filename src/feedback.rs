@@ -508,6 +508,36 @@ impl<'a, VS, Addr, Code, By, Loc, SlotTy, Out, I, S, SC, CI> Debug
     }
 }
 
+/// Scale vote weight inversely with the minimum CMP distance.
+/// Smaller distance = closer to flip = higher priority.
+/// Works generically for any SlotTy that supports PartialOrd + TryFrom<u128>.
+fn proportional_vote_weight<SlotTy>(dist: SlotTy) -> usize
+where
+    SlotTy: PartialOrd + Copy + TryFrom<u128>,
+    <SlotTy as TryFrom<u128>>::Error: std::fmt::Debug,
+{
+    let base = INFANT_STATE_INITIAL_VOTES;
+    let zero = SlotTy::try_from(0u128).expect("0 fits in SlotTy");
+    let ten = SlotTy::try_from(10u128).expect("10 fits in SlotTy");
+    let hundred = SlotTy::try_from(100u128).expect("100 fits in SlotTy");
+    let ten_thousand = SlotTy::try_from(10_000u128).expect("10k fits in SlotTy");
+    let million = SlotTy::try_from(1_000_000u128).expect("1M fits in SlotTy");
+
+    if dist == zero {
+        base * 10
+    } else if dist < ten {
+        base * 8
+    } else if dist < hundred {
+        base * 6
+    } else if dist < ten_thousand {
+        base * 4
+    } else if dist < million {
+        base * 2
+    } else {
+        base
+    }
+}
+
 #[cfg(feature = "cmp")]
 impl<'a, VS, Addr, Code, By, Loc, SlotTy, Out, I, S, I0, S0, SC, CI> Feedback<S0>
     for CmpFeedback<'a, VS, Addr, Code, By, Loc, SlotTy, Out, I, S, SC, CI>
@@ -520,11 +550,12 @@ where
         + UsesInput<Input = I0>,
     SC: Scheduler<State = InfantStateState<Loc, Addr, VS, CI>> + HasVote<InfantStateState<Loc, Addr, VS, CI>>,
     VS: Default + VMStateT + 'static,
-    SlotTy: PartialOrd + Copy,
+    SlotTy: PartialOrd + Copy + TryFrom<u128>,
     Addr: Serialize + DeserializeOwned + Debug + Clone,
     Loc: Serialize + DeserializeOwned + Debug + Clone,
     Out: Default + Into<Vec<u8>> + Clone,
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
+    <SlotTy as TryFrom<u128>>::Error: std::fmt::Debug,
 {
     fn init_state(&mut self, _state: &mut S0) -> Result<(), Error> {
         Ok(())
@@ -557,11 +588,23 @@ where
             state.metadata_map_mut().insert(metadata);
         }
 
+        // Track the closest new distance across all improved comparisons
+        let mut min_new_distance: Option<SlotTy> = None;
+
         // check if the current distance is smaller than the min_map
         for i in 0..MAP_SIZE {
             if self.current_map[i] < self.min_map[i] {
-                self.min_map[i] = self.current_map[i];
+                let new_dist = self.current_map[i];
+                self.min_map[i] = new_dist;
                 cmp_interesting = true;
+                match min_new_distance {
+                    None => min_new_distance = Some(new_dist),
+                    Some(old) => {
+                        if new_dist < old {
+                            min_new_distance = Some(new_dist);
+                        }
+                    }
+                }
             }
         }
 
@@ -575,12 +618,17 @@ where
         }
 
         // if the current distance is smaller than the min_map, vote for the state
+        // with weight proportional to closeness to flip
         if cmp_interesting {
-            debug!("Voted for {} because of CMP", input.get_state_idx());
+            let vote_weight = match min_new_distance {
+                Some(dist) => proportional_vote_weight(dist),
+                None => INFANT_STATE_INITIAL_VOTES,
+            };
+            debug!("Voted for {} because of CMP (weight={})", input.get_state_idx(), vote_weight);
             self.scheduler.vote(
                 state.get_infant_state_state(),
                 input.get_state_idx(),
-                INFANT_STATE_INITIAL_VOTES,
+                vote_weight,
             );
         }
 
@@ -632,3 +680,82 @@ impl CmpMetadata {
 }
 
 impl_serdeany!(CmpMetadata);
+
+/// Phase of the snapshot-secant probe across campaign iterations.
+///
+/// THREE phases, not two. The secant needs two INDEPENDENT distance
+/// measurements at the SAME pinned comparison index. CMP_MAP is a global
+/// monotonic min-map that never resets, so reading it twice without an
+/// intervening reset does not measure df/dinput — it measures campaign-wide
+/// drift. Each measurement therefore runs as its own execution with the pinned
+/// index reset to MAX beforehand:
+///   Idle   → set input to x1, reset pinned idx           → exec measures D1@x1
+///   Probe1 → read D1, set input to x1+δ, reset pinned idx → exec measures D2@x1+δ
+///   Probe2 → read D2, slope=(D1−D2)/δ, apply x* = x1 + D1/slope
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub enum SecantPhase {
+    /// No active probe — ready to start one.
+    #[default]
+    Idle,
+    /// x1 issued; next execution yields D1 at the pinned index.
+    Probe1,
+    /// x1+δ issued; next execution yields D2 at the pinned index.
+    Probe2,
+}
+
+/// Secant probe state for campaign warp aiming (Application C).
+///
+/// `pin_idx` pins ONE comparison (the argmin of CMP_MAP at full 256-bit width)
+/// for the whole episode so both probes measure the same check. `d1` is u128,
+/// not u64, because accrual distances are wei-scale and `as_u64` would truncate
+/// exactly the case Application C exists for.
+/// `pin_pc` is the ownership fingerprint of the pinned comparison; reads validate
+/// against it to detect slot aliasing. `cooldown` rate-limits episodes (see the
+/// throughput gate in the mutator) so probing cannot run back-to-back forever.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct CmpSecantState {
+    pub phase: SecantPhase,
+    pub pin_idx: usize,
+    pub pin_pc: u64,
+    pub x1: u64,
+    pub d1: u128,
+    pub bn1: u64, // block.number at the D1 measurement (for real-delta slope)
+    pub cooldown: u32,
+}
+
+impl_serdeany!(CmpSecantState);
+
+/// Secant probe state for txn_value / msg.value aiming (Application E).
+/// `x1` is u128 (wei-scale values overflow u64).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ValueSecantState {
+    pub phase: SecantPhase,
+    pub pin_idx: usize,
+    pub pin_pc: u64,
+    pub x1: u128,
+    pub d1: u128,
+    pub cooldown: u32,
+}
+
+impl_serdeany!(ValueSecantState);
+
+/// Calldata secant state stored on fuzzer state metadata (Application B).
+///
+/// Probes ONE argument per episode (rotated by `cursor`) so the distance change
+/// is attributable to a single argument — probing all args simultaneously and
+/// reading one global distance cannot attribute the change to any one arg.
+/// `pin_idx` pins the comparison; `cursor` rotates through accessed args across
+/// episodes.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct CalldataSecantState {
+    pub phase: SecantPhase,
+    pub pin_idx: usize,
+    pub pin_pc: u64,
+    pub arg_idx: usize,
+    pub cursor: usize,
+    pub x1: u128,
+    pub d1: u128,
+    pub cooldown: u32,
+}
+
+impl_serdeany!(CalldataSecantState);

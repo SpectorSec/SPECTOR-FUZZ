@@ -9,3 +9,11 @@ corpus
 .vscode
 *.code-workspace
 /findings
+
+# fuzz/test run artifacts (regenerated)
+/build/
+/build_*/
+/findings_*/
+/traces_*/
+/work_dir/
+*.output
