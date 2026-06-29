@@ -50,7 +50,9 @@ pub fn generate_girlfriend_poc(state: &impl HasMetadata, work_dir: &str) {
     let sender = alloy_primitives::hex::encode_prefixed(sender_addr.as_ref() as &[u8]);
 
     let output_dir = format!("{}/vulnerabilities", work_dir);
-    match gen_from_call_tree(calls, &sender, selector_override, &output_dir) {
+    // Active fork chain + block so the PoC emits a valid vm.createSelectFork(chain, block).
+    let (chain, block) = crate::evm::solution::cli_chain_and_block();
+    match gen_from_call_tree(calls, &sender, selector_override, &output_dir, chain, block) {
         Ok(_) => tracing::debug!("[girlfriend] PoC written under {}/ (sender {})", output_dir, sender),
         Err(e) => tracing::warn!("Girlfriend PoC generation failed: {e}"),
     }

@@ -31,6 +31,16 @@ handlebars_helper!(is_buy: |ty: String| ty == "buy");
 handlebars_helper!(is_withdraw: |ty: String| ty == "withdraw");
 handlebars_helper!(is_sell: |ty: String| ty == "sell");
 
+/// Read the active fork's (chain_name, block_number) from CLI_ARGS, e.g.
+/// ("eth", "25420000"). Used by the Girlfriend bridge to render a valid
+/// `vm.createSelectFork(chain, block)` line. Returns ("","") if unset.
+pub fn cli_chain_and_block() -> (String, String) {
+    CLI_ARGS
+        .get()
+        .map(|a| (a.chain.clone(), a.block_number.clone()))
+        .unwrap_or_default()
+}
+
 /// Initialize CLI_ARGS.
 pub fn init_cli_args(target: String, work_dir: String, onchain: &Option<OnChainConfig>) {
     let (chain, block_number) = match onchain {

@@ -39,6 +39,9 @@ pub struct Girlfriend {
     pub nonce: usize,
     /// selector_hex → full_fn_signature (e.g. "0xa9059cbb" → "transfer(address,uint256)")
     pub selector_override: HashMap<String, String>,
+    /// Fork chain alias + block for `vm.createSelectFork(chain, block)`.
+    pub chain: String,
+    pub block: String,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -69,11 +72,19 @@ impl Girlfriend {
             abi: Abi::new(),
             nonce: 0,
             selector_override: HashMap::new(),
+            chain: String::new(),
+            block: String::new(),
         }
     }
 
     pub fn with_selector_override(mut self, map: HashMap<String, String>) -> Self {
         self.selector_override = map;
+        self
+    }
+
+    pub fn with_fork(mut self, chain: String, block: String) -> Self {
+        self.chain = chain;
+        self.block = block;
         self
     }
 
@@ -148,7 +159,7 @@ impl Girlfriend {
             file_name,
             receiver_name,
             last_txhash: last_tx_hash,
-            chain_name: String::new(),
+            chain_name: self.chain.clone(),
             sender: sender.to_string(),
             sender_scan_url: String::new(),
             struct_defs,
@@ -316,6 +327,19 @@ impl Girlfriend {
         }
     }
 
+    /// Build the fork VmState from the active chain/block so createSelectFork renders
+    /// `vm.createSelectFork("eth", 25420000)` instead of the broken `("", )`.
+    fn fork_vm_state(&self) -> Option<VmState> {
+        if self.chain.is_empty() && self.block.is_empty() {
+            return None;
+        }
+        Some(VmState {
+            forked_rpc: self.chain.clone(),
+            block_number: self.block.clone(),
+            ..Default::default()
+        })
+    }
+
     fn parse_pre_call(&mut self, sender: &str, receiver: &str, tx_hash: &str) -> ParsedCall {
         let fn_sig = format!("{}()", &tx_hash[..8.min(tx_hash.len())]);
         ParsedCall {
@@ -326,6 +350,7 @@ impl Girlfriend {
             fn_call: format!("{};", fn_sig),
             fn_signature: fn_sig,
             target_is_contract: true,
+            vm_state: self.fork_vm_state(),
             ..Default::default()
         }
     }
@@ -337,21 +362,42 @@ impl Girlfriend {
         let parsed_input = self.parse_input(call);
         let sender_var = hash_to_name(sender);
         let ty = ParsedCallType::Interface;
-        let (fn_signature, fn_name, args) = match parsed_input {
+        // When the selector resolves (the common case) render the typed interface call.
+        // When it doesn't, fall back to a raw low-level call that replays the EXACT
+        // calldata — mirrors the sub-call path's call_with_rawdata. Previously the Err
+        // branch dropped the args and emitted an empty `0x..()` no-op (the call silently
+        // did nothing), so an unresolved root selector meant the PoC didn't reproduce.
+        let (fn_signature, fn_call) = match parsed_input {
             Ok(ref input) => {
                 let rv = HashMap::new();
-                let fa = format_fn_args(&input.args, &sender_var, &call.target_var, &rv, &ty);
-                (input.fn_signature.clone(), input.fn_name.clone(), fa)
+                let args = format_fn_args(&input.args, &sender_var, &call.target_var, &rv, &ty);
+                let fn_call = if call.value != U256::ZERO {
+                    format!("this.{}{{value: {}}}({});", input.fn_name, call.value, args)
+                } else {
+                    format!("{}({});", input.fn_name, args)
+                };
+                (input.fn_signature.clone(), fn_call)
             }
             Err(_) => {
-                let sig = format!("{}()", &call.input[1..10.min(call.input.len())]);
-                (sig.clone(), call.input[1..10.min(call.input.len())].to_string(), String::new())
+                let calldata = if call.input.len() <= 2 {
+                    "\"\"".to_string()
+                } else {
+                    format!("hex\"{}\"", &call.input[2..])
+                };
+                let value = if call.value != U256::ZERO {
+                    format!("{{value: {}}}", call.value)
+                } else {
+                    String::new()
+                };
+                // Raw call against the real target address; preserves the full calldata.
+                let fn_call = format!("address({}).call{}({});", call.target, value, calldata);
+                let sig = if call.input.len() >= 10 {
+                    format!("rawcall_{}()", &call.input[2..10])
+                } else {
+                    "rawcall()".to_string()
+                };
+                (sig, fn_call)
             }
-        };
-        let fn_call = if call.value != U256::ZERO {
-            format!("this.{}{{value: {}}}({});", fn_name, call.value, args)
-        } else {
-            format!("{}({});", fn_name, args)
         };
         ParsedCall {
             ty,
@@ -364,6 +410,7 @@ impl Girlfriend {
             raw_input: call.input.clone(),
             raw_output: call.output.clone(),
             value: call.value,
+            vm_state: self.fork_vm_state(),
             memory_vars: self.take_memory_vars(&sender_var, &call.target_var),
             named_addresses: self.abi.take_addresses(),
             struct_defs: self.abi.take_struct_defs(),

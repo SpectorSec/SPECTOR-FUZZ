@@ -19,8 +19,11 @@ pub fn gen_from_call_tree(
     sender: &str,
     selector_override: std::collections::HashMap<String, String>,
     output_dir: &str,
+    chain: String,
+    block: String,
 ) -> Result<(String, String), anyhow::Error> {
     let mut gf = girl::Girlfriend::new(output_dir.to_string())
-        .with_selector_override(selector_override);
+        .with_selector_override(selector_override)
+        .with_fork(chain, block);
     gf.gen_from_calls(calls, sender)
 }
