@@ -1576,6 +1576,29 @@ where
 
         self.call_depth += 1;
 
+        // EVM call-depth limit. revm's own Handler enforces the 1024-frame cap and returns
+        // a failed call (not a crash) when exceeded — but ityfuzz dispatches CALLs through
+        // its own recursive `run_inspect`, which bypassed that check entirely. With the
+        // NestedAction/attacker-callback features generating deep/cyclic call chains (and
+        // fatter Rust frames from the taint/call-tree middlewares), unbounded recursion
+        // overflowed the native stack and SIGABRT-crashed the whole campaign. Enforce the
+        // EVM-spec limit here: a too-deep call reverts (parent continues), matching mainnet.
+        const CALL_DEPTH_LIMIT: u64 = 1024;
+        if self.call_depth > CALL_DEPTH_LIMIT {
+            self.call_depth -= 1;
+            // Pop call tree frame (reverted — call too deep)
+            if let Some(mut frame) = self.call_tree_stack.pop() {
+                frame.output = Bytes::new();
+                frame.success = false;
+                if let Some(parent) = self.call_tree_stack.last_mut() {
+                    parent.sub_frames.push(frame);
+                } else {
+                    self.completed_call_trees.push(frame);
+                }
+            }
+            return (InstructionResult::CallTooDeep, input.return_memory_offset, Bytes::new());
+        }
+
         let value = match input.value {
             CallValue::Transfer(v) => v,
             _ => EVMU256::ZERO,
