@@ -28,6 +28,7 @@ pub enum MiddlewareType {
     BranchCoverage,
     Sha3Bypass,
     Sha3TaintAnalysis,
+    CmpLinearity,
     CallPrinter,
     Reentrancy,
     IntegerOverflow,

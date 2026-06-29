@@ -3,7 +3,7 @@
 import json, os, re, sys
 
 DEFIHACKLABS = "/workspace/_global/DeFiHackLabs/src/test"
-OUTPUT = "/workspace/_global/ityfuzz-src/scripts/benchmark_manifest.json"
+OUTPUT = "/workspace/_global/spectorfuzz/scripts/benchmark_manifest.json"
 
 CHAIN_MAP = {
     "mainnet":   {"chain": "eth",       "id": 1,     "explorer": "https://api.etherscan.io/v2/api?chainid=1"},

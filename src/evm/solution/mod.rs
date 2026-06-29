@@ -1,4 +1,6 @@
 mod abi;
+pub mod girlfriend;
+pub mod girlfriend_bridge;
 
 use std::{
     collections::{HashMap, HashSet},

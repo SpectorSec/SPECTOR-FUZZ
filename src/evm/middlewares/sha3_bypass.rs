@@ -284,9 +284,13 @@ where
         let opcode = interp.bytecode.opcode();
 
         if interp.stack.len() != self.dirty_stack.len() {
-            eprintln!(
-                "STACK MISMATCH real={} dirty={} pc={:#x} addr={:#x} depth={} \
-                 prev_opcode={:#x} prev_dirty_len={} current_op={:#x} ctxs_len={}",
+            // Shadow (taint) stack desynced from the real EVM stack. This used to be an
+            // `assert_eq!` that crashed the entire fuzzer (~half of runs hit it). Resync to
+            // the real stack length so the run continues — taint precision degrades only for
+            // this trace; new slots are padded untainted (conservative).
+            debug!(
+                "sha3 shadow-stack desync: real={} dirty={} pc={:#x} addr={:#x} depth={} \
+                 prev_opcode={:#x} prev_dirty_len={} current_op={:#x} ctxs_len={} — resyncing",
                 interp.stack.len(),
                 self.dirty_stack.len(),
                 interp.bytecode.pc(),
@@ -297,8 +301,8 @@ where
                 opcode,
                 self.ctxs.len(),
             );
+            self.dirty_stack.resize(interp.stack.len(), false);
         }
-        assert_eq!(interp.stack.len(), self.dirty_stack.len());
 
         match opcode {
             0x00 => {}

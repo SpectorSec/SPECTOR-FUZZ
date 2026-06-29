@@ -565,7 +565,7 @@ where
                     .map(|ci| String::from_utf8(ci.serialize_concise()).expect("utf-8 failed"))
                     .join("\n");
 
-                println!("\n\n\n😊😊 Found vulnerabilities! \n\n");
+                println!("\n\n\n👿🤑 Found money! \n\n");
                 let cur_report =
                     format!(
                     "================ Description ================\n{}\n================ Trace ================\n{}\n",
@@ -577,6 +577,7 @@ where
                 println!("{}", cur_report);
 
                 solution::generate_test(cur_report.clone(), minimized);
+                solution::girlfriend_bridge::generate_girlfriend_poc(state, &self.work_dir);
 
                 let vuln_file = format!("{}/vuln_info.jsonl", self.work_dir.as_str());
                 let mut f = OpenOptions::new()
@@ -618,6 +619,16 @@ where
                         replayable_file.write_all(txn_json.as_bytes()).unwrap();
                     }
                     // dump_file!(state, vulns_dir, false);
+                }
+
+                // Feature 010: wire the found bug into LibAFL's objective counter so the
+                // live board reflects reality (it previously sat at 0 — bugs were reported
+                // only via ORACLE_OUTPUT/vuln_info.jsonl, never add_solution/Event::Objective).
+                {
+                    let sol_tc = Testcase::new(input.clone());
+                    state.solutions_mut().add(sol_tc)?;
+                    let objective_size = state.solutions().count();
+                    manager.fire(state, Event::Objective { objective_size })?;
                 }
 
                 if !unsafe { RUN_FOREVER } {

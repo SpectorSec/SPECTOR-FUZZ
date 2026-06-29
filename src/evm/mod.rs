@@ -184,7 +184,8 @@ pub struct EvmArgs {
     /// Despite the legacy `--flashloan` name, this flag controls the entire
     /// fund-loss detection layer: synthetic-capital injection so the fuzzer's
     /// attacker can attempt drains, owed/earned accounting per call frame, and
-    /// portfolio valuation via registered Uniswap pairs. The `Fund Loss`
+    /// portfolio valuation via registered swap routes (Uniswap V2/V3, Curve, ERC-4626,
+    /// Compound cTokens, Aave aTokens, Lido wstETH, Sudoswap — not Uniswap-only). The `Fund Loss`
     /// finding in oracles/erc20.rs ONLY fires when this is enabled — without it
     /// the entire balance-based outcome detection is dormant regardless of any
     /// `-d` selection. Default-on in this fork; pass `--flashloan=false` to

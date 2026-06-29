@@ -6,7 +6,7 @@ use libafl::{
     mutators::MutationResult,
     prelude::{HasMaxSize, HasRand, Mutator, State},
     schedulers::Scheduler,
-    state::HasMetadata,
+    state::{HasCorpus, HasMetadata},
     Error,
 };
 use alloy_sol_types::SolCall;
@@ -214,6 +214,37 @@ fn secant_step(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     Some(x1.saturating_add(step))
 }
 
+/// Feature 009 §5.3 stall→requeue fallback.
+///
+/// When the secant definitively gives up on a comparison (flat gradient,
+/// `secant_step == None`), hand the CURRENT corpus input back to the concolic
+/// queue. Without this, a gate that the dispatch triage routed AWAY from concolic
+/// (classified linear) but the secant can't flip would be a LOST branch. Pushing
+/// it onto `ConcolicPrioritizationMetadata.interesting_idx` guarantees concolic
+/// still gets it → the linear/non-linear mis-route can never cost a branch.
+///
+/// Over-requeue is safe (concolic just runs on a few inputs the secant might have
+/// solved later); under-requeue is not (regression). So this errs toward safety.
+#[cfg(all(feature = "cmp", feature = "concolic_secant_dispatch"))]
+fn requeue_for_concolic<S>(state: &mut S)
+where
+    S: HasCorpus + HasMetadata,
+{
+    use libafl::corpus::Corpus;
+    if let Some(cur) = *state.corpus().current() {
+        if let Some(meta) = state
+            .metadata_map_mut()
+            .get_mut::<crate::evm::concolic::concolic_stage::ConcolicPrioritizationMetadata>()
+        {
+            let idx: usize = usize::from(cur);
+            if !meta.interesting_idx.contains(&idx) {
+                meta.interesting_idx.push(idx);
+                crate::evm::middlewares::cmp_linearity::lin_bump_requeued();
+            }
+        }
+    }
+}
+
 
 /// [`FuzzMutator`] is a mutator that mutates the input based on the ABI and
 /// access pattern
@@ -336,7 +367,7 @@ where
     fn apply_value_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
     where
         I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
-        S: HasMetadata,
+        S: HasMetadata + HasCorpus,
     {
         // Gate (b): only probe when call_value was actually accessed this run.
         let ap = input.get_access_pattern().borrow().clone();
@@ -408,6 +439,9 @@ where
                 secant.cooldown = COOLDOWN;
                 match secant_step(secant.x1, secant.d1, d2, PROBE_DELTA) {
                     None => {
+                        // 009 §5.3: secant can't flip this gate — hand back to concolic.
+                        #[cfg(feature = "concolic_secant_dispatch")]
+                        requeue_for_concolic(state);
                         state.metadata_map_mut().insert(secant);
                         false
                     }
@@ -430,7 +464,7 @@ where
     fn apply_calldata_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
     where
         I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
-        S: HasMetadata,
+        S: HasMetadata + HasCorpus,
     {
         if !self.campaign_orchestrator {
             // Only run in campaign mode where ABI is known and we can mutate args
@@ -511,6 +545,11 @@ where
                 match secant_step(secant.x1, secant.d1, d2, PROBE_DELTA) {
                     None => {
                         // This argument is not the lever for the pinned comparison.
+                        // 009 §5.3 (conservative): requeue for concolic. Over-requeue
+                        // here (another arg may be the lever) is safe — never a
+                        // regression; full-rotation gating is a future refinement.
+                        #[cfg(feature = "concolic_secant_dispatch")]
+                        requeue_for_concolic(state);
                         state.metadata_map_mut().insert(secant);
                         false
                     }
@@ -572,7 +611,7 @@ where
 impl<VS, Loc, Addr, I, S, SC, CI> Mutator<I, S> for FuzzMutator<VS, Loc, Addr, SC, CI>
 where
     I: VMInputT<VS, Loc, Addr, CI> + Input + EVMInputT,
-    S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<Addr> + HasCaller<EVMAddress> + HasMetadata + HasPresets,
+    S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<Addr> + HasCaller<EVMAddress> + HasMetadata + HasPresets + HasCorpus,
     SC: Scheduler<State = InfantStateState<Loc, Addr, VS, CI>>,
     VS: Default + VMStateT + EVMStateT,
     Addr: PartialEq + Debug + Serialize + DeserializeOwned + Clone,

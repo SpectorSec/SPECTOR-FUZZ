@@ -33,7 +33,10 @@ use revm_interpreter::{
 };
 use revm_interpreter::bytecode::Bytecode;
 use revm_primitives::{hardfork::SpecId, Address, Bytes as PrimBytes, Log, B256, KECCAK_EMPTY, U256};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
+
+use libafl_bolts::impl_serdeany;
 
 use super::types::EVMFuzzState;
 use crate::evm::vm::{IS_FAST_CALL, MEM_LIMIT, SETCODE_ONLY};
@@ -277,6 +280,46 @@ pub fn is_precompile(address: EVMAddress, num_of_precompiles: usize) -> bool {
 }
 
 #[allow(clippy::type_complexity)]
+/// A single frame in the call tree recorded during fuzzer execution.
+/// Nesting is implicit — sub_frames contains child calls.
+/// This is read by the Girlfriend bridge at vulnerability-report time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CallTreeFrame {
+    pub ty: String,
+    pub caller: EVMAddress,
+    pub target: EVMAddress,
+    pub value: EVMU256,
+    pub input: Bytes,
+    pub output: Bytes,
+    pub success: bool,
+    pub sub_frames: Vec<CallTreeFrame>,
+}
+
+/// Stored in EVMFuzzState metadata so the Girlfriend bridge can read the
+/// call tree at vulnerability-report time without depending on the executor.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CallTreeMetadata {
+    pub frames: Vec<CallTreeFrame>,
+}
+impl_serdeany!(CallTreeMetadata);
+
+/// Global toggle for call-tree recording. Kept OFF during fuzzing: recording on the
+/// every-call hot path (alloc per CALL + unbounded `completed_call_trees`) collapses
+/// throughput ~64x and starves the economic loot path. The minimizer flips it ON for a
+/// single replay of the *minimized* solution, so the Girlfriend bridge gets exactly that
+/// solution's tree at zero fuzzing cost. See [[project_multiroute_valuation]].
+pub static RECORD_CALL_TREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn set_call_tree_recording(on: bool) {
+    RECORD_CALL_TREE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn call_tree_recording() -> bool {
+    RECORD_CALL_TREE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct FuzzHost<SC>
 where
     SC: Scheduler<State = EVMFuzzState> + Clone,
@@ -356,6 +399,13 @@ where
 
     /// Depth of call stack
     pub call_depth: u64,
+
+    /// Call tree recording for Girlfriend PoC generation.
+    /// Push at call_internal entry, pop at exit. Nested automatically.
+    pub call_tree_stack: Vec<CallTreeFrame>,
+    /// Completed root frames from the current testcase execution(s).
+    /// Cleared at start of each process_input in the fuzzer.
+    pub completed_call_trees: Vec<CallTreeFrame>,
 
     /// Assert failed message for the cheatcode
     pub assert_msg: Option<String>,
@@ -450,6 +500,8 @@ where
             expected_calls: self.expected_calls.clone(),
             initial_block_timestamp: self.initial_block_timestamp,
             is_staleness_test: self.is_staleness_test,
+            call_tree_stack: Vec::new(),
+            completed_call_trees: Vec::new(),
         }
     }
 }
@@ -536,12 +588,19 @@ where
             expected_calls: ExpectedCallTracker::new(),
             initial_block_timestamp: None,
             is_staleness_test: false,
+            call_tree_stack: Vec::new(),
+            completed_call_trees: Vec::new(),
         }
     }
 
     pub fn set_spec_id(&mut self, spec_id: String) {
         self.spec_id = spec_id.parse::<SpecId>().unwrap_or(SpecId::PRAGUE);
         self.gas_params = GasParams::new_spec(self.spec_id);
+    }
+
+    pub fn reset_call_tree(&mut self) {
+        self.call_tree_stack.clear();
+        self.completed_call_trees.clear();
     }
 
     /// Execute bytecode with coverage tracking and sub-frame dispatch.
@@ -1495,12 +1554,36 @@ where
 
         let caller_addr = input.caller;
         self.apply_prank(&caller_addr, &mut input);
+
+        // Record call tree frame (before depth increment so balance-check early return
+        // can pop cleanly).
+        // Recording is gated by the global flag (OFF during fuzzing — it costs an alloc per
+        // CALL and the recorder collapsed throughput ~64x; the minimizer turns it on for a
+        // single replay of the minimized solution). Pops below are safe no-ops on an empty
+        // stack while recording is off.
+        if call_tree_recording() {
+            let scheme_str = format!("{:?}", input.scheme).to_lowercase();
+            let input_bytes_for_tree = Self::get_input_bytes(&input.input);
+            self.call_tree_stack.push(CallTreeFrame {
+                ty: scheme_str,
+                caller: caller_addr,
+                target: input.target_address,
+                value: EVMU256::ZERO, // set below after value extraction
+                input: input_bytes_for_tree,
+                ..Default::default()
+            });
+        }
+
         self.call_depth += 1;
 
         let value = match input.value {
             CallValue::Transfer(v) => v,
             _ => EVMU256::ZERO,
         };
+        // Update the frame's value now that we've computed it
+        if let Some(frame) = self.call_tree_stack.last_mut() {
+            frame.value = value;
+        }
         if cfg!(feature = "real_balance") && value != EVMU256::ZERO {
             let sender = input.transfer_from();
             debug!("call sender: {:?}", sender);
@@ -1512,6 +1595,16 @@ where
             };
             if current < value {
                 self.call_depth -= 1;
+                // Pop call tree frame (reverted)
+                if let Some(mut frame) = self.call_tree_stack.pop() {
+                    frame.output = Bytes::new();
+                    frame.success = false;
+                    if let Some(parent) = self.call_tree_stack.last_mut() {
+                        parent.sub_frames.push(frame);
+                    } else {
+                        self.completed_call_trees.push(frame);
+                    }
+                }
                 return (InstructionResult::Revert, input.return_memory_offset, Bytes::new());
             }
             self.evmstate.set_balance(sender, current - value);
@@ -1609,6 +1702,18 @@ where
         let ret_buffer = res.2.clone();
         let was_cheatcode = input.target_address == CHEATCODE_ADDRESS;
 
+        // Pop call tree frame (normal return)
+        if !was_cheatcode {
+            if let Some(mut frame) = self.call_tree_stack.pop() {
+                frame.output = res.2.clone();
+                frame.success = res.0 == InstructionResult::Return;
+                if let Some(parent) = self.call_tree_stack.last_mut() {
+                    parent.sub_frames.push(frame);
+                } else {
+                    self.completed_call_trees.push(frame);
+                }
+            }
+        }
         self.call_depth -= 1;
         if !was_cheatcode {
             res = self.check_expected(&input, res);

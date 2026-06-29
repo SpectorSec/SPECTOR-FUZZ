@@ -261,6 +261,20 @@ where
             });
         }
 
+        // Feature 009: concolic/secant dispatch triage. If this input's tainted
+        // frontier is purely LINEAR (cmp_linearity verdict from the reexecution in
+        // Sha3WrappedFeedback::is_interesting), the secant lane solves it cheaper —
+        // do NOT queue it for concolic. Default OFF; experimental until the secant
+        // stall→requeue fallback (spec 009 §5.3) lands + runtime validation.
+        #[cfg(feature = "concolic_secant_dispatch")]
+        {
+            if crate::evm::middlewares::cmp_linearity::lin_route_to_secant() {
+                crate::evm::middlewares::cmp_linearity::lin_tick(true);
+                return self.inner.append_metadata(state, observers, testcase);
+            }
+            crate::evm::middlewares::cmp_linearity::lin_tick(false);
+        }
+
         let idx = state.corpus().count();
         let meta = state
             .metadata_map_mut()

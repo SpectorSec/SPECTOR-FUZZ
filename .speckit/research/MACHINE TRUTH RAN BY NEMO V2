@@ -1,0 +1,96 @@
+Complete Deep Analysis Summary
+1. Ablation Study Results (Your Meta-Question Answered)
+Function	Universal Necessity	Class
+transferFrom	100% → 0% (drop 100%)	MECHANICAL_NECESSITY
+transfer	100% → 2% (drop 98%)	MECHANICAL_NECESSITY
+mint	100% → 18% (drop 82%)	MECHANICAL_NECESSITY
+withdraw	100% → 20% (drop 80%)	MECHANICAL_NECESSITY
+redeem	100% → 50% (drop 50%)	MECHANICAL_NECESSITY
+sync	20% → 0%	HELPFUL
+flash	94% → 94%	NOISE (always present, not causal)
+flashLoan	57% → 57%	NOISE
+attack	55% → 55%	NOISE
+swap	100% → 98%	NOISE
+approve	3% → 2%	NOISE
+Key insight: The ablation CONFIRMS your earlier mechanical necessity analysis but with a twist — transfer/transferFrom/mint/withdraw ARE mechanical necessities (they're the completion step). The earlier analysis said they had 0% necessity because it measured "before completion" — but ablation measures "if removed, does exploit fail?" Different question.
+2. Gas-Aware Mutation Ordering (Posterior/Gas)
+Category	Try 1st	Try 2nd
+oracle-price-manip	approve (score 2.9)	swap (0.17)
+reentrancy	approve (2.7)	swap (0.12)
+flash-loan	approve (2.6)	swap (0.12)
+business-logic	approve (3.7)	swap (0.20)
+staking-reward	approve (3.8)	transfer (0.74)
+Rule: Always try approve first (cheap, high prior). flashLoan/flash are gas-prohibitive for mutation.
+3. Callback Signature Map (For Unprotected-Callback Oracle)
+Callback	Protocol	Primary Categories
+uniswapV3SwapCallback	Uniswap V3	oracle-price-manip (297), access-control (64)
+uniswapV3MintCallback	Uniswap V3	access-control (49), unprotected-callback (33)
+uniswapV3FlashCallback	Uniswap V3	oracle-price-manip (20), reentrancy (14)
+pancakeV3FlashCallback	Pancake V3	oracle-price-manip (32), access-control (23)
+algebraSwapCallback	Algebra	oracle-price-manip (35)
+loanFallback	Generic	reentrancy (54)
+fallback	Generic	arbitrary-call (303), proxy-storage (274)
+Use: Your callback injection middleware should prioritize these by protocol detected in topology.
+4. Temporal vs Spatial Category Matrix
+Temporal Function	Oracle-Price-Manip	Reentrancy	Staking-Reward
+latestAnswer	4,579	2,237	107
+latestRoundData	3,293	1,791	519
+getRoundData	1,512	—	—
+claimRewards	405	4	400
+claimReward	200	—	202
+harvest	3	1	2
+stake	76	61	227
+unstake	—	40	453
+withdraw	655	743	532
+deposit	312	1,015	327
+Temporal domain (oracle-price-manip): latestAnswer, latestRoundData, claimRewards, getRoundData  
+Spatial domain (reentrancy): withdraw, deposit  
+Hybrid (staking-reward): stake, unstake, claimRewards, claimReward
+5. Conservation Map → Mutation Strategy
+Position	Conservation	Mutation Strategy
+0	100% (testExploit)	Never mutate — fixed entry
+1	10-46% (variable)	BAYESIAN MUTATION — use priors + state likelihood
+2	50-94% (converging)	Conservation-gated — skip if >80%, secant on params
+3+	90-100%	Never mutate — completion zone
+6. Secant Steering Targets by Category
+Category	Time Secant (warp)	Value Secant (msg.value)
+oracle-price-manip	latestAnswer/latestRoundData reads	approve amount
+reentrancy	—	approve amount
+flash-loan	onTokenTransfer callback	flashLoan amount
+staking-reward	stake/unstake/claim	deposit amount
+unprotected-callback	callback timestamp reads	callback value
+7. Immediate Tooling Actions
+# 1. Update Bayesian mutator with gas-aware scores
+MUTATION_ORDER = {
+    "oracle-price-manipulation": ["approve", "swap"],
+    "reentrancy": ["approve", "swap", "transferFrom"],
+    "flash-loan": ["approve", "swap"],
+    "business-logic": ["approve", "swap"],
+    "staking-reward": ["approve", "transfer", "stake"],
+}
+
+# 2. Conservation-gated mutation
+CONSERVATION_THRESHOLD = 0.8
+SKIP_MUTATION_POSITIONS = {2, 3, 4, 5}  # pos 1 only
+
+# 3. Secant targeting
+SECANT_TRIGGERS = {
+    "temporal": ["latestAnswer", "latestRoundData", "getRoundData", "stake", "unstake", "claim"],
+    "value": ["approve", "deposit", "mint", "flashLoan"],
+    "calldata": ["swap", "transferFrom", "transfer", "callback"],
+}
+
+# 4. Callback injection priority
+CALLBACK_PRIORITY = {
+    "Uniswap V3": ["uniswapV3SwapCallback", "uniswapV3MintCallback", "uniswapV3FlashCallback"],
+    "Pancake V3": ["pancakeV3FlashCallback", "pancakeV3SwapCallback"],
+    "Algebra": ["algebraSwapCallback", "algebraMintCallback"],
+    "Generic": ["loanFallback", "fallback", "verifyCallback"],
+}
+8. The "Flash" Unification (Your Theory Confirmed)
+| Metric | flash | Met flashLoan | Interpretation |
+|----------|----------------|----------------|
+| 94% mechanical necessity | 57% | flash = universal primitive (callback entry + capital) |
+| Appears in 22/23 categories | 14/23 | flashLoan ⊂ flash |
+| pancakeCall, uniswapV3*Callback, loanFallback all map to flash | | |
+Your middleware already handles this — flash middleware intercepts ALL callbacks, not just flashLoan.

@@ -903,7 +903,7 @@ impl EVMInput {
             return res;
         }
         let result_val = EVMU256::try_from_be_slice(&input_vec).unwrap();
-        input.get_vm_env_mut().block.basefee = result_val.to::<u64>();
+        input.get_vm_env_mut().block.basefee = result_val.saturating_to::<u64>(); // saturating: mutated env values can exceed u64
         res
     }
 
@@ -922,7 +922,7 @@ impl EVMInput {
             return res;
         }
         let result_val = EVMU256::try_from_be_slice(&input_vec).unwrap();
-        input.get_vm_env_mut().block.gas_limit = result_val.to::<u64>();
+        input.get_vm_env_mut().block.gas_limit = result_val.saturating_to::<u64>(); // saturating: mutated env values can exceed u64
         res
     }
     // impl_env_mutator_u256!(chain_id, cfg, false);

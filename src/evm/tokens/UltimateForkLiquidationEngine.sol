@@ -211,6 +211,24 @@ contract UltimateForkLiquidationEngine {
         return 0;
     }
 
+    /// Caller-aware liquidation. The caller has already transferred `amount` of
+    /// `asset` to this engine; this converts it to ETH via any supported route
+    /// (4626/Compound/Aave/Lido/Curve/V2/V3) and forwards the realized ETH to
+    /// `recipient`. Returns the ETH sent. Needed because the fuzzer's earned/owed
+    /// accounting tracks the ATTACKER's balance — resolveToEth alone leaves the
+    /// ETH in the engine, so multi-route loot would never be counted.
+    function liquidateAndSend(address asset, uint256 amount, address recipient)
+        external
+        returns (uint256)
+    {
+        uint256 eth = this.resolveToEth(asset, amount);
+        if (eth > 0 && recipient != address(0)) {
+            (bool ok, ) = payable(recipient).call{value: eth}("");
+            if (!ok) return 0;
+        }
+        return eth;
+    }
+
     function resolveNftToEth(
         address nftContract,
         uint256[] calldata nftIds,

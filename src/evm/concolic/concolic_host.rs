@@ -722,13 +722,20 @@ impl ConcolicHost {
 
     pub fn get_input_slice_from_ctx(&self, idx: usize, length: usize) -> Box<Expr> {
         let data = self.ctxs.last().expect("no ctx").input_bytes.clone();
-        let mut bytes = data[idx].clone();
-        for i in idx + 1..idx + length {
+        // EVM calldata reads at/beyond the input length return zero-padded bytes.
+        // The original code zero-padded inside the loop but indexed `data[idx]`
+        // unguarded, panicking when idx >= len (real contracts hit this — calldata
+        // access past the provided input). Guard the first byte the same way.
+        let byte_at = |i: usize| {
             if i >= data.len() {
-                bytes = bytes.concat(Expr::const_byte(0));
+                Expr::const_byte(0)
             } else {
-                bytes = bytes.concat(data[i].clone());
+                data[i].clone()
             }
+        };
+        let mut bytes = byte_at(idx);
+        for i in idx + 1..idx + length {
+            bytes = bytes.concat(byte_at(i));
         }
         simplify(bytes)
     }

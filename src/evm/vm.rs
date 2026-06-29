@@ -537,6 +537,126 @@ where
         (Bytes::from(interp.return_data.buffer().to_vec()), ret)
     }
 
+    /// Liquidate `amount` of `token` (held by `caller`) to native ETH via the
+    /// deployed multi-route engine (`liquidateAndSend` → ERC-4626 / Compound /
+    /// Aave / Lido / Curve / Uniswap V2 / V3), forwarding the realized ETH to
+    /// `caller` so the flashloan earned/owed accounting (which tracks the
+    /// attacker's balance) counts it. This is the multi-route valuation path; the
+    /// `PairContextTy::sell` path (Uniswap-only) is the caller's fallback.
+    ///
+    /// Returns `Some(())` on success, `None` if the engine isn't available/loaded
+    /// or either call fails (→ caller should fall back to `sell`). Accounting note:
+    /// the loot `transfer` to the engine is a zero-value CALL (neutral to
+    /// owed/earned); `liquidateAndSend` sends native ETH to `caller` via a value
+    /// CALL, which the flashloan middleware credits as `earned`.
+    pub fn liquidate_via_engine(
+        &mut self,
+        caller: EVMAddress,
+        token: EVMAddress,
+        amount: EVMU256,
+        state: &mut EVMFuzzState,
+    ) -> Option<()> {
+        use revm_interpreter::InstructionResult;
+        if amount == EVMU256::ZERO {
+            return None;
+        }
+        debug!("[liq-engine] try token={:?} amount={}", token, amount);
+        // Resolve the deployed liquidation-engine address from the OnChain middleware.
+        let engine = {
+            let mws = self.host.middlewares.read().unwrap();
+            mws.iter().find_map(|mw| {
+                mw.borrow()
+                    .as_any()
+                    .downcast_ref::<crate::evm::onchain::OnChain>()
+                    .and_then(|oc| oc.endpoint.liqsim_addr)
+            })
+        };
+        let engine = match engine {
+            Some(e) => e,
+            None => {
+                debug!("[liq-engine] BAIL: no engine addr (liqsim_addr None)");
+                return None;
+            }
+        };
+        // The engine is deployed on the fork, but the OnChain middleware only loads code
+        // lazily on CALL — nothing calls the engine in normal execution, so its bytecode
+        // isn't in host.code yet. Fetch it on demand from the fork (same as Gap-C).
+        if !self.host.code.contains_key(&engine) {
+            let onchain_rc = {
+                let mws = self.host.middlewares.read().unwrap();
+                mws.iter()
+                    .find(|mw| mw.borrow().get_type() == MiddlewareType::OnChain)
+                    .cloned()
+            };
+            match onchain_rc {
+                Some(rc) => {
+                    let fetched = rc
+                        .borrow_mut()
+                        .as_any_mut()
+                        .downcast_mut::<crate::evm::onchain::OnChain>()
+                        .map(|oc| oc.endpoint.get_contract_code_analyzed(engine, false));
+                    match fetched {
+                        Some(code) => {
+                            debug!("[liq-engine] fetched engine code bytes={}", code.original_bytes().len());
+                            // set_code (not set_codedata) — fast_call_ reads host.code, which
+                            // set_code populates; set_codedata only stages into setcode_data.
+                            self.host.set_code(engine, code, state);
+                        }
+                        None => debug!("[liq-engine] downcast OnChain failed"),
+                    }
+                }
+                None => debug!("[liq-engine] no OnChain middleware for fetch"),
+            }
+        }
+        if !self.host.code.contains_key(&engine) {
+            debug!("[liq-engine] BAIL: engine code not loaded {:?}", engine);
+            return None;
+        }
+        if !self.host.code.contains_key(&token) {
+            debug!("[liq-engine] BAIL: token code not loaded {:?}", token);
+            return None;
+        }
+        let ok = |r: InstructionResult| {
+            matches!(
+                r,
+                InstructionResult::Return | InstructionResult::Stop | InstructionResult::SelfDestruct
+            )
+        };
+        let enc_a = |a: EVMAddress| {
+            let mut o = [0u8; 32];
+            o[12..].copy_from_slice(a.as_slice());
+            o
+        };
+        let enc_u = |v: EVMU256| v.to_be_bytes::<32>();
+
+        let mut working = self.host.evmstate.clone();
+
+        // 1. token.transfer(engine, amount) FROM caller — zero-value CALL, neutral.
+        let mut td = vec![0xa9u8, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+        td.extend_from_slice(&enc_a(engine));
+        td.extend_from_slice(&enc_u(amount));
+        let (_, r1) = self.fast_call_(token, Bytes::from(td), &mut working, state, EVMU256::ZERO, caller);
+        if !ok(r1) {
+            debug!("[liq-engine] BAIL: loot transfer→engine failed {:?}", r1);
+            return None;
+        }
+
+        // 2. engine.liquidateAndSend(token, amount, caller) — sends ETH to caller → earned.
+        let mut ld = crate::evm::liquidation::LIQENGINE_LIQ_SEND_SEL.to_vec();
+        ld.extend_from_slice(&enc_a(token));
+        ld.extend_from_slice(&enc_u(amount));
+        ld.extend_from_slice(&enc_a(caller));
+        let (_, r2) = self.fast_call_(engine, Bytes::from(ld), &mut working, state, EVMU256::ZERO, caller);
+        if !ok(r2) {
+            debug!("[liq-engine] BAIL: liquidateAndSend failed {:?}", r2);
+            return None;
+        }
+
+        self.host.evmstate = working;
+        debug!("[liq-engine] multi-route liquidation: {:?} amount={} → ETH to {:?}", token, amount, caller);
+        Some(())
+    }
+
     /// Create a new EVM executor given a host and deployer address
     pub fn new(fuzz_host: FuzzHost<SC>, deployer: EVMAddress) -> Self {
         Self {
@@ -1064,12 +1184,102 @@ where
                 let token_ctx = {
                     let flashloan_mid = self.host.flashloan_middleware.as_ref().unwrap().deref().borrow();
                     let flashloan_oracle = flashloan_mid.flashloan_oracle.deref().borrow();
-                    flashloan_oracle
-                        .known_tokens
-                        .borrow()
-                        .get(&token)
-                        .unwrap_or_else(|| panic!("unknown token : {:?}", token))
-                        .clone()
+                    flashloan_oracle.known_tokens.borrow().get(&token).cloned()
+                };
+                // Gap C — on-demand token discovery from the fork. If the token isn't in
+                // known_tokens yet, ask the fork: is it an ERC20 (balanceOf + transfer +
+                // totalSupply selectors, fingerprinted via EVMole on the already-loaded
+                // fork bytecode)? If so, register it so it is tracked (no panic; integrated
+                // into value accounting; borrowable once a pair is discovered) and proceed.
+                // If it is not an ERC20 (or has no code), gracefully skip the borrow
+                // (reverted no-op). Never panic on an unknown token.
+                let token_ctx = match token_ctx {
+                    Some(ctx) => ctx,
+                    None => {
+                        use std::str::FromStr;
+                        // On-demand fetch (memo step 1): if the token's bytecode isn't cached
+                        // locally, pull it from the fork via the OnChain middleware's endpoint
+                        // (eth_getCode), so discovery fires even for tokens the fuzzer hasn't
+                        // executed yet — not only ones already in host.code.
+                        if !self.host.code.contains_key(&token) {
+                            let onchain_rc = {
+                                let mws = self.host.middlewares.read().unwrap();
+                                mws.iter()
+                                    .find(|mw| mw.borrow().get_type() == MiddlewareType::OnChain)
+                                    .cloned()
+                            };
+                            if let Some(rc) = onchain_rc {
+                                let fetched = rc
+                                    .borrow_mut()
+                                    .as_any_mut()
+                                    .downcast_mut::<crate::evm::onchain::OnChain>()
+                                    .map(|oc| oc.endpoint.get_contract_code_analyzed(token, false));
+                                if let Some(code) = fetched {
+                                    self.host.set_codedata(token, code);
+                                }
+                            }
+                        }
+                        // Bind the bytecode first so the &host.code borrow ends here.
+                        let raw = self.host.code.get(&token).map(|c| c.original_bytes());
+                        let discovered = raw.and_then(|raw| {
+                            let sels: std::collections::HashSet<[u8; 4]> =
+                                crate::evm::onchain::abi_decompiler::fetch_abi_evmole(raw.as_ref())
+                                    .iter()
+                                    .map(|a| a.function)
+                                    .collect();
+                            // ERC20 fingerprint: balanceOf / transfer / totalSupply.
+                            let is_erc20 = sels.contains(&[0x70, 0xa0, 0x82, 0x31])
+                                && sels.contains(&[0xa9, 0x05, 0x9c, 0xbb])
+                                && sels.contains(&[0x18, 0x16, 0x0d, 0xdd]);
+                            if !is_erc20 {
+                                return None;
+                            }
+                            let weth_addr = self
+                                .host
+                                .flashloan_middleware
+                                .as_ref()
+                                .and_then(|m| m.borrow().chain_cfg.as_ref().map(|c| c.get_weth()))
+                                .and_then(|w| EVMAddress::from_str(w.as_str()).ok())
+                                .unwrap_or_else(|| {
+                                    EVMAddress::from_str("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap()
+                                });
+                            let ctx = crate::evm::tokens::TokenContext {
+                                // Empty now; the token becomes borrowable once the liquidation
+                                // engine discovers ANY swap route for it — Uniswap V2/V3, Curve,
+                                // ERC-4626, Compound cToken, Aave aToken, Lido wstETH, Sudoswap —
+                                // not Uniswap-only.
+                                swaps: vec![],
+                                is_weth: token == weth_addr,
+                                weth_address: weth_addr,
+                            };
+                            if let Some(m) = self.host.flashloan_middleware.as_ref() {
+                                m.borrow()
+                                    .flashloan_oracle
+                                    .borrow()
+                                    .known_tokens
+                                    .borrow_mut()
+                                    .insert(token, ctx.clone());
+                            }
+                            println!("[GapC] discovered ERC20 {:?} from fork — registered, continuing", token);
+                            Some(ctx)
+                        });
+                        match discovered {
+                            Some(ctx) => ctx,
+                            None => {
+                                return ExecutionResult {
+                                    output: vec![],
+                                    reverted: true,
+                                    new_state: StagedVMState::new_with_state(
+                                        VMStateT::as_any(input.get_state())
+                                            .downcast_ref::<VS>()
+                                            .unwrap()
+                                            .clone(),
+                                    ),
+                                    additional_info: None,
+                                };
+                            }
+                        }
+                    }
                 };
                 self.host.evmstate = VMStateT::as_any(input.get_state())
                     .downcast_ref::<EVMState>()

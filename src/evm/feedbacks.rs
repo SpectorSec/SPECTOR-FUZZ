@@ -71,6 +71,11 @@ where
                 .is_interesting(state, manager, input, observers, exit_kind)
             {
                 Ok(true) => {
+                    // Feature 009a: clear last input's linearity verdict so the
+                    // concolic-dispatch triage never reads a stale value (step
+                    // inputs get no reexecution → must default to "keep concolic").
+                    #[cfg(feature = "concolic_secant_dispatch")]
+                    crate::evm::middlewares::cmp_linearity::lin_reset_verdict();
                     if !input.is_step() {
                         // reexecute with sha3 taint analysis
                         // Use full_reset (not cleanup) so ctxs / prev_opcode /
@@ -87,6 +92,20 @@ where
                             state,
                             self.sha3_taints.clone(),
                         );
+
+                        // Feature 009a: classify this input's tainted comparisons
+                        // (linear vs non-linear) for the concolic-dispatch triage.
+                        // Only when concolic is enabled (it manages concolic budget) —
+                        // verdict lands in cmp_linearity globals, read in
+                        // ConcolicFeedbackWrapper::append_metadata.
+                        #[cfg(feature = "concolic_secant_dispatch")]
+                        if crate::evm::middlewares::cmp_linearity::lin_concolic_enabled() {
+                            let lin = std::rc::Rc::new(std::cell::RefCell::new(
+                                crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
+                            ));
+                            (self.evm_executor.deref().borrow_mut())
+                                .reexecute_with_middleware(input, state, lin);
+                        }
                     }
                     Ok(true)
                 }

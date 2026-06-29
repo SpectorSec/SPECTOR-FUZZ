@@ -217,7 +217,7 @@ impl
                         let known_tokens = self.known_tokens.borrow();
                         let token_info = known_tokens.get(token).unwrap();
                         let liq_amount = *new_balance * liquidation_percent / EVMU256::from(10);
-                        liquidations_earned.push((*caller, token_info.clone(), liq_amount));
+                        liquidations_earned.push((*caller, *token, token_info.clone(), liq_amount));
                     }
                 }
             }
@@ -228,18 +228,30 @@ impl
                 ctx.executor.deref().borrow_mut().host.evmstate = ctx.post_state.clone();
             }
             let mut failed = false;
-            for (caller, _token_info, _amount) in liquidations_earned {
+            for (caller, token_addr, _token_info, _amount) in liquidations_earned {
                 let backup = ctx.executor.deref().borrow_mut().host.evmstate.clone();
-                if _token_info
-                    .sell(
-                        _amount,
-                        caller,
-                        ctx.fuzz_state,
-                        &mut *ctx.executor.deref().borrow_mut(),
-                        ctx.input.get_randomness().as_slice(),
-                    )
-                    .is_none()
+                // Primary: deployed multi-route engine (ERC-4626/Compound/Aave/Lido/Curve/
+                // Uniswap V2/V3). Forwards realized ETH to the attacker so earned/owed counts
+                // it — this is what lets vault-share / receipt loot be valued, not just
+                // Uniswap-liquid tokens.
+                let via_engine = ctx
+                    .executor
+                    .deref()
+                    .borrow_mut()
+                    .liquidate_via_engine(caller, token_addr, _amount, ctx.fuzz_state)
+                    .is_some();
+                if !via_engine
+                    && _token_info
+                        .sell(
+                            _amount,
+                            caller,
+                            ctx.fuzz_state,
+                            &mut *ctx.executor.deref().borrow_mut(),
+                            ctx.input.get_randomness().as_slice(),
+                        )
+                        .is_none()
                 {
+                    // Neither the engine nor the Uniswap fallback could liquidate — revert.
                     ctx.executor.deref().borrow_mut().host.evmstate = backup;
                     continue;
                 }

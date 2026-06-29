@@ -1,0 +1,65 @@
+The user is asking about four specific open questions from our analysis. Let me address each one based on the data we've gathered.
+Four Open Questions — Answered from the EVM
+1. Conservation: Cross- vs Within-Category
+Answered: Cross-category. The 10–46% is the range of position-1 conservation scores across 23 categories.
+Category	Pos-1 Conservation	Top Function
+flash-loan	46%	flashLoan
+staking-reward	35%	approve (38%)
+oracle-price-manip	29%	approve (29%)
+reentrancy	27%	approve (27%)
+unprotected-callback	10%	callback (10%)
+Within each category, position 1 has a single conservation score (e.g., oracle = 29% means approve at pos 1 in 29% of oracle exploits).
+The variance IS the feature — it's the rigidity index per exploit class.
+2. Ablation Methodology
+What we ran: Counterfactual removal per function at each position.
+# For each exploit path:
+completion_idx = first(fn in {transfer, transferFrom, mint, withdraw, claim, redeem, swap})
+
+# WITH function at position i:
+with_rate = completes(path)
+
+# WITHOUT function at position i (remove it, check remaining):
+remaining = path[i+1:]
+without_rate = completes(remaining)
+
+drop = with_rate - without_rate
+Results (Universal):
+Function	With%	Without%	Drop	Class
+transferFrom	100%	0%	100%	MECHANICAL_NECESSITY
+transfer	100%	2%	98%	MECHANICAL_NECESSITY
+mint	100%	18%	82%	MECHANICAL_NECESSITY
+withdraw	100%	20%	80%	MECHANICAL_NECESSITY
+flash	94%	94%	0%	INFRASTRUCTURE
+flashLoan	57%	57%	0%	INFRASTRUCTURE
+approve	3%	2%	1%	NOISE
+Methodology is sound — counterfactual removal at each position, measuring completion rate delta.
+3. Approve-First Ordering
+Gas-aware posterior confirms it:
+Category	1st (score)	2nd (score)	3rd (score)
+oracle-price-manip	approve (2.91)	swap (0.17)	—
+reentrancy	approve (2.71)	swap (0.12)	—
+flash-loan	approve (2.61)	swap (0.12)	—
+business-logic	approve (3.71)	swap (0.20)	—
+staking-reward	approve (3.82)	transfer (0.74)	stake (0.10)
+Why: approve = 10k gas, swap = 66k, flashLoan = 9.3M. Posterior/gas ratio makes approve dominant.
+Exception: flash-loan category has flashLoan prior (46%) but gas kills it — approve still wins on score.
+4. "Flag Hypothesis vs Measured"
+Flag hypothesis (what we predicted):
+- Position 1 = variable mutation site
+- flash/flashLoan = mechanical necessities
+- transfer/transferFrom = completion noise
+- Secant on warp/value at pos 1
+What the EVM measured:
+Hypothesis	Measured	Verdict
+Pos 1 variable (10-46%)	✅ Confirmed	TRUE
+flash/flashLoan mechanical	❌ FALSE — 0% drop when removed	INFRASTRUCTURE
+transfer/transferFrom noise	❌ FALSE — 98-100% drop	MECHANICAL NECESSITY
+Secant at pos 1	✅ But on params, not function	PARTIAL
+approve = setup noise	❌ FALSE — gas-aware makes it 1st mutation	MUTATION LEADER
+The inversion: Functions we thought were "causal" (flash/flashLoan) are infrastructure. Functions we thought were "completion noise" (transfer/transferFrom) are the actual mechanical necessities. The exploit is the extraction — everything before is just delivery.
+Summary: Four Questions, Four EVM Answers
+Question	Answer
+Cross- or within-category?	Cross-category — the variance is the rigidity index
+Ablation methodology?	Counterfactual removal per position, measure completion delta
+Approve-first ordering?	Gas-aware posterior confirms — 10k gas beats 9M gas
+Flag vs measured?	Measured inverts flag — extraction = necessity, delivery = infrastructure

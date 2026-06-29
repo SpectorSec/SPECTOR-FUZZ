@@ -330,6 +330,9 @@ pub fn evm_fuzzer(
     // let calibration = CalibrationStage::new(&feedback);
     if config.concolic {
         unsafe { CONCOLIC_TIMEOUT = config.concolic_timeout };
+        // Feature 009: the linearity reexecution / dispatch triage only matters when
+        // concolic is on (it manages the concolic budget). Gate it on this flag.
+        crate::evm::middlewares::cmp_linearity::lin_set_concolic_enabled(true);
     }
 
     let concolic_stage = ConcolicStage::new(

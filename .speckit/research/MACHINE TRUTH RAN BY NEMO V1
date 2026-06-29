@@ -1,0 +1,64 @@
+Analysis complete. Here are the key findings from your actual data:
+1. Conservation Map (Feature 007 Prerequisite) ✅
+Category	Position 0	Position 1
+oracle-price-manip	testExploit (100%)	approve 29% (flashLoan 18%, flash 16%)
+reentrancy	testExploit (100%)	approve 27% (flashLoan 24%, swap 8%)
+flash-loan	testExploit (100%)	flashLoan 46% (approve 24%)
+business-logic	testExploit (100%)	approve 37% (swap 13%, flashLoan 8%)
+unprotected-callback	testExploit (100%)	callback 10% (highly variable)
+Key insight: Position 1 is the mutation site (low conservation). Position 2+ converges to transfer — the completion step.
+2. Mechanical Necessity (The Ablation Result) 🎯
+Function	Universal Necessity	Interpretation
+flash	94% (33/35)	THE mechanical primitive — capital delivery + manipulation combined
+flashLoan	57% (46/80)	Pure capital delivery (Aave/dYdX style)
+attack	55% (12/22)	The actual state manipulation
+testExploit	43%	Entry point
+approve	2%	Setup, rarely causal
+transfer	0% (0/171)	Completion step only — never causal
+transferFrom	0%	Completion
+swap	0%	Completion/manipulation mix
+This IS your ablation study result:
+- Removing flash/flashLoan/attack kills detection → Mechanical necessities
+- Removing transfer/transferFrom/swap does nothing → They're the effect, not the cause
+3. Position Necessity (Where to Focus Mutation)
+Position	% Before Completion
+pos 0 (testExploit)	43%
+pos 1 (approve/flashLoan/swap)	25%
+pos 2 (transfer/flash)	5%
+pos 3+	<5%
+4. Per-Category Mutation Priors (Bayesian Input)
+# From your data - use these as Bayesian priors at position 1:
+MUTATION_PRIORS = {
+    "oracle-price-manipulation": {
+        "approve": 0.29, "flashLoan": 0.18, "flash": 0.16, "swap": 0.11
+    },
+    "reentrancy": {
+        "approve": 0.27, "flashLoan": 0.24, "swap": 0.08, "flash": 0.05
+    },
+    "flash-loan": {
+        "flashLoan": 0.46, "approve": 0.26, "swap": 0.08
+    },
+    "business-logic": {
+        "approve": 0.37, "swap": 0.13, "flashLoan": 0.08, "flash": 0.05
+    },
+    "unprotected-callback": {
+        "callback": 0.10,  # highly variable - needs state-aware likelihood
+    }
+}
+5. What This Means for Your Tooling
+Layer	Your Data Says	Implementation
+Feature 007 (Conservation)	Pos 1 = variable, Pos 2+ = conserved completion	Conservation-gated mutation: skip pos 2+, prioritize pos 1
+Feature 008 (Bayesian)	Use priors above + state likelihood	At pos 1, try flashLoan first for oracle exploits, approve for reentrancy
+Secant Steering	flash/flashLoan = temporal (warp), approve = value (msg.value)	Warp secant on flash steps, value secant on approve steps
+Oracle Bias	earned > owed fires at completion (transfer)	Precursors: watch flash/attack steps for temporal/value drift
+Gamma Ray	Boost energy at pos 1 for categories with low conservation	oracle-price-manip pos 1 (29%) > reentrancy pos 1 (27%)
+6. The "Flash" Unification
+Your data reveals: flash (94%) ≠ flashLoan (57%)
+- flash = generic callback entry (flashLoan callback, pancakeCall, uniswapV3SwapCallback, etc.) — the universal capital+manipulation primitive
+- flashLoan = specific Aave/dYdX flash loan — subset of flash
+This is why the human taxonomy fails: 22/23 categories use flash mechanics, but humans call it "oracle manipulation" or "reentrancy" based on what gets manipulated, not how capital enters.
+Next Queries to Run (if you want deeper)
+1. State-compatibility likelihood — at pos 1, given current EVM state (has loan? has approval?), which function wins?
+2. Gas-aware ordering — flashLoan costs more gas than approve; order by posterior/gas
+3. Callback signature mapping — uniswapV3SwapCallback vs pancakeCall vs algebraSwapCallback at pos 1 for unprotected-callback
+4. Temporal vs spatial split — which categories have TIMESTAMP/NUMBER reads at pos 1-2?

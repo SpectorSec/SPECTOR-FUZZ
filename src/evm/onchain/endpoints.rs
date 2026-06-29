@@ -1403,7 +1403,28 @@ impl OnChainConfig {
             std::thread::sleep(std::time::Duration::from_millis(500));
         };
 
-        EVMAddress::from_str(&contract_addr).ok()
+        let addr = EVMAddress::from_str(&contract_addr).ok();
+        // The engine is mined AFTER the pinned fork block, so get_contract_code (which
+        // queries eth_getCode at self.block_number) can't see it and returns empty. Fetch
+        // the runtime code at "latest" now and seed both code caches so later lookups
+        // (e.g. liquidate_via_engine's on-demand fetch) resolve it.
+        if let Some(a) = addr {
+            let code_hex = match self._request(
+                "eth_getCode".to_string(),
+                format!(r#"["0x{:x}", "latest"]"#, a),
+            ) {
+                Some(resp) => resp.as_str().unwrap_or("").trim_start_matches("0x").to_string(),
+                None => String::new(),
+            };
+            if !code_hex.is_empty() {
+                if let Ok(bytes) = hex::decode(&code_hex) {
+                    self.code_cache.insert(a, code_hex);
+                    self.code_cache_analyzed
+                        .insert(a, Bytecode::new_legacy(PrimBytes::from(bytes)));
+                }
+            }
+        }
+        addr
     }
 
     /// Call acquire(token, recipient) on the AcquisitionEngine with `eth_wei` ETH.

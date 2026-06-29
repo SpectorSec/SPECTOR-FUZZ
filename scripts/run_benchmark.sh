@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Benchmark runner for SpecterFuzz against DeFiHackLabs dataset.
+# Benchmark runner for SpectorFuzz against DeFiHackLabs dataset.
 # Usage: ./run_benchmark.sh [--manifest manifest.json] [--timeout 300] [--filter NAME]
 #        ./run_benchmark.sh --list                     # list available targets
 #        ./run_benchmark.sh --run BarleyFinance        # run single target
@@ -85,7 +85,7 @@ fi
 mkdir -p "$RESULTS_DIR"
 
 # Build once up front
-echo "Building SpecterFuzz..."
+echo "Building SpectorFuzz..."
 cargo build --manifest-path "$PROJECT_DIR/Cargo.toml" --release 2>&1 | tail -5
 
 # Select targets

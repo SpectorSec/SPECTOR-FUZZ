@@ -1,5 +1,5 @@
 [package]
-name = "ityfuzz"
+name = "spectorfuzz"
 version = "0.1.0"
 edition = "2024"
 build = "src/build.rs"
@@ -42,6 +42,7 @@ no_etherscan = []
 # bounty runs stay machine-truth-only (exact-selector matching). Enable ONLY for
 # fixture testing of simple/novel contracts the selector allowlist doesn't cover:
 #   cargo build/test --features campaign_generic_fallback
+concolic_secant_dispatch = []
 campaign_generic_fallback = []
 
 

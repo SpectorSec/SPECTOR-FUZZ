@@ -11,7 +11,7 @@ use revm_interpreter::bytecode::Bytecode;
 use super::types::EVMStagedVMState;
 use crate::{
     evm::{
-        host::CALL_UNTIL,
+        host::{CALL_UNTIL, CallTreeMetadata},
         input::{ConciseEVMInput, EVMInput},
         types::{EVMAddress, EVMFuzzState, EVMQueueExecutor},
         vm::EVMState,
@@ -167,6 +167,51 @@ impl<E: libafl::executors::HasObservers>
                     break;
                 }
             }
+        }
+
+        // Record the call tree for EXACTLY the minimized solution: recording is off during
+        // fuzzing (hot-path cost), so enable it, reset, replay the minimized sequence once,
+        // then disable. This populates completed_call_trees with just this solution's tree.
+        {
+            crate::evm::host::set_call_tree_recording(true);
+            {
+                let mut executor = self.evm_executor_ref.deref().borrow_mut();
+                executor.host.reset_call_tree();
+            }
+            let mut current_state = initial_state.clone();
+            for (item, call_leak) in txs.iter() {
+                if item.is_step() && !current_state.state.has_post_execution() {
+                    break;
+                }
+                let mut tx = item.clone();
+                unsafe {
+                    CALL_UNTIL = *call_leak;
+                }
+                tx.sstate = current_state.clone();
+                let res = {
+                    let mut executor = self.evm_executor_ref.deref().borrow_mut();
+                    executor.execute(&tx, state)
+                };
+                state.set_execution_result(res.clone());
+                current_state = state.get_execution_result().new_state.clone();
+                if state.get_execution_result().reverted {
+                    break;
+                }
+            }
+            crate::evm::host::set_call_tree_recording(false);
+        }
+
+        // Persist call tree to state metadata for the Girlfriend bridge
+        {
+            let executor = self.evm_executor_ref.borrow();
+            tracing::debug!(
+                "[minimizer] captured {} call trees from solution replay",
+                executor.host.completed_call_trees.len()
+            );
+            let meta = CallTreeMetadata {
+                frames: executor.host.completed_call_trees.clone(),
+            };
+            state.metadata_map_mut().insert(meta);
         }
 
         txs.into_iter()
