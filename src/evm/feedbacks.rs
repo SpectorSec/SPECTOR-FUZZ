@@ -227,6 +227,27 @@ impl<SC> TokenBalanceFeedback<SC> {
     }
 }
 
+/// Feature 011 (Part A) test seam: sum the realized-ETH value of a set of
+/// per-(attacker, token) inflows, valuing each via the injected `value_one`.
+///
+/// In production `value_one` calls the liquidation engine
+/// (`EVMExecutor::value_token_inflow_eth`); in tests it is a fake rate table, so the
+/// value-inversion decision (expensive-small pile out-ranks cheap-large pile) is
+/// unit-testable without a live engine or an `EVMFuzzState`. Inflows the valuator
+/// cannot price (`None`) are skipped.
+fn aggregate_eth_inflow(
+    inflow_pairs: &HashMap<(EVMAddress, EVMAddress), EVMU256>,
+    mut value_one: impl FnMut(EVMAddress, EVMAddress, EVMU256) -> Option<EVMU512>,
+) -> EVMU512 {
+    let mut total = EVMU512::ZERO;
+    for ((attacker, token), amount) in inflow_pairs {
+        if let Some(delta) = value_one(*attacker, *token, *amount) {
+            total = total.saturating_add(delta);
+        }
+    }
+    total
+}
+
 impl<SC> Debug for TokenBalanceFeedback<SC> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenBalanceFeedback")
@@ -339,20 +360,20 @@ where
         // Value each inflow against THIS execution's outcome, then restore the shared
         // executor exactly as found — valuation must be side-effect free
         // (`value_token_inflow_eth` snapshots/restores internally per call; we also
-        // restore the post-state we install here).
+        // restore the post-state we install here). The aggregation itself lives in the
+        // pure `aggregate_eth_inflow` seam so the value-inversion logic is unit-testable
+        // without a live engine (the closure is the injection point).
         let post_state = state.get_execution_result().new_state.state.clone();
-        let mut eth_total = EVMU512::ZERO;
-        {
+        let eth_total = {
             let mut exec = executor.deref().borrow_mut();
             let original = exec.host.evmstate.clone();
             exec.host.evmstate = post_state;
-            for ((attacker, token), amount) in &inflow_pairs {
-                if let Some(delta) = exec.value_token_inflow_eth(*attacker, *token, *amount, state) {
-                    eth_total = eth_total.saturating_add(delta);
-                }
-            }
+            let total = aggregate_eth_inflow(&inflow_pairs, |attacker, token, amount| {
+                exec.value_token_inflow_eth(attacker, token, amount, state)
+            });
             exec.host.evmstate = original;
-        }
+            total
+        };
 
         // Interesting iff a new realized-ETH ceiling. This is what makes the gradient
         // value-aware: a small pile of an expensive token now out-ranks a large pile
@@ -367,5 +388,77 @@ where
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod impact_011_tests {
+    use super::*;
+
+    fn addr(b: u8) -> EVMAddress {
+        EVMAddress::from([b; 20])
+    }
+
+    /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed inert —
+    /// no engine ref is held, so `is_interesting` takes the original early-return path
+    /// and the new code is unreachable. (Full byte-for-byte e2e regression is the
+    /// Lane-A run, T8.)
+    #[test]
+    fn eth_gradient_off_is_inert() {
+        let fb = TokenBalanceFeedback::<()>::new(HashSet::new(), (), false, None);
+        assert!(!fb.eth_gradient, "flag must default off");
+        assert!(fb.evm_executor.is_none(), "no engine ref when flag off");
+        assert_eq!(fb.best_eth_total, EVMU512::ZERO);
+    }
+
+    /// T7 / SC-2: the gradient must rank by realized ETH, not raw token units. A large
+    /// pile of a cheap token has more *units* but a small pile of an expensive token has
+    /// more *ETH* — the ETH valuation must invert the raw-unit ranking.
+    #[test]
+    fn eth_value_beats_token_units() {
+        let attacker = addr(1);
+        let cheap = addr(0xC); // 1 wei/unit
+        let expensive = addr(0xE); // 1_000_000 wei/unit
+
+        let cheap_large: HashMap<(EVMAddress, EVMAddress), EVMU256> =
+            [((attacker, cheap), EVMU256::from(1_000_000u64))].into_iter().collect();
+        let expensive_small: HashMap<(EVMAddress, EVMAddress), EVMU256> =
+            [((attacker, expensive), EVMU256::from(10u64))].into_iter().collect();
+
+        // Fake valuator: ETH = rate(token) * amount. No engine, no EVMFuzzState.
+        let mut value_one = |_a: EVMAddress, token: EVMAddress, amount: EVMU256| -> Option<EVMU512> {
+            let amt = amount.to::<u64>() as u128;
+            let rate: u128 = if token == cheap {
+                1
+            } else if token == expensive {
+                1_000_000
+            } else {
+                0
+            };
+            Some(EVMU512::from(rate * amt))
+        };
+
+        let eth_cheap = aggregate_eth_inflow(&cheap_large, &mut value_one);
+        let eth_expensive = aggregate_eth_inflow(&expensive_small, &mut value_one);
+
+        // Raw token units would rank the cheap pile higher...
+        assert!(
+            EVMU256::from(1_000_000u64) > EVMU256::from(10u64),
+            "cheap pile has more raw units"
+        );
+        // ...but realized ETH inverts it — which is the whole point of the feature.
+        assert!(
+            eth_expensive > eth_cheap,
+            "expensive-small pile ({eth_expensive}) must out-rank cheap-large pile ({eth_cheap}) in ETH"
+        );
+    }
+
+    /// Inflows the valuator cannot price are skipped, not counted as zero-blocking.
+    #[test]
+    fn unpriceable_inflows_are_skipped() {
+        let pairs: HashMap<(EVMAddress, EVMAddress), EVMU256> =
+            [((addr(1), addr(2)), EVMU256::from(5u64))].into_iter().collect();
+        let total = aggregate_eth_inflow(&pairs, |_, _, _| None);
+        assert_eq!(total, EVMU512::ZERO);
     }
 }

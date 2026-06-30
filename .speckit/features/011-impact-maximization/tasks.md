@@ -1,6 +1,6 @@
 # Feature 011 — Impact Maximization · Tasks (Phase 1: Part A — ETH-value gradient)
 
-**Status:** In Progress — T1 ✅ (commit df1c3f9), T2–T5 ✅ (build green), T6–T7 (tests) + T8 (fork measure) remaining
+**Status:** In Progress — T1 ✅ (df1c3f9) · T2–T5 ✅ (af07921) · T6–T7 ✅ (tests green via `aggregate_eth_inflow` seam) · T8 (Lane-A Yearn measure) remaining — Skyler's deploy step
 **Owner:** Skyler
 **Last updated:** 2026-06-30
 **Plan:** [`plan.md`](./plan.md) §2, §5, §7 · **Spec:** [`specify.md`](./specify.md) (SC-2, SC-3)
