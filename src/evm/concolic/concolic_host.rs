@@ -754,16 +754,32 @@ where
 
         macro_rules! stack_bv {
             ($idx:expr) => {{
-                let real_loc_sym = self.symbolic_stack.len() - 1 - $idx;
-                match self.symbolic_stack[real_loc_sym].borrow() {
-                    Some(bv) => bv.clone(),
-                    None => {
-                        let u256 = fast_peek!($idx);
-                        Box::new(Expr {
-                            lhs: None,
-                            rhs: None,
-                            op: ConcolicOp::EVMU256(u256),
-                        })
+                // The symbolic stack can drift shorter than revm's concrete stack when a
+                // push isn't mirrored symbolically (a desync). Without this guard,
+                // `len() - 1 - idx` underflows usize and indexes with usize::MAX → panic
+                // ("index out of bounds: the len is 0 but the index is 1844...615").
+                // Degrade gracefully to the concrete operand — identical to the `None`
+                // branch below for a present-but-unset slot. `fast_peek!` reads revm's
+                // concrete stack, which always holds the operand a valid opcode needs.
+                if self.symbolic_stack.len() <= $idx {
+                    let u256 = fast_peek!($idx);
+                    Box::new(Expr {
+                        lhs: None,
+                        rhs: None,
+                        op: ConcolicOp::EVMU256(u256),
+                    })
+                } else {
+                    let real_loc_sym = self.symbolic_stack.len() - 1 - $idx;
+                    match self.symbolic_stack[real_loc_sym].borrow() {
+                        Some(bv) => bv.clone(),
+                        None => {
+                            let u256 = fast_peek!($idx);
+                            Box::new(Expr {
+                                lhs: None,
+                                rhs: None,
+                                op: ConcolicOp::EVMU256(u256),
+                            })
+                        }
                     }
                 }
             }};

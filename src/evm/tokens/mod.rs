@@ -267,8 +267,7 @@ impl TokenContext {
                         assert!(current_sender.is_none());
                         ctx.deref()
                             .borrow_mut()
-                            .transform(&to, &next, amount_in, state, vm, true)
-                            .expect("Weth failed");
+                            .transform(&to, &next, amount_in, state, vm, true)?;
                         current_sender = Some(to);
                     }
                 }
@@ -423,8 +422,7 @@ impl TokenContext {
                         }
                         ctx.deref()
                             .borrow_mut()
-                            .transform(&current_sender, &next, current_amount_in, state, vm, false)
-                            .expect("Weth failed");
+                            .transform(&current_sender, &next, current_amount_in, state, vm, false)?;
                     }
                 }
             }

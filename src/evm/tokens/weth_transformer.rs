@@ -98,14 +98,17 @@ impl PairContext for WethContext {
         );
         let ir = vm.host.run_inspect(&mut interp, state);
         if !is_call_success!(ir) {
-            println!(
-                "call: {:?} => {:?} {:?}",
+            // A WETH wrap/unwrap can legitimately revert during fuzzing (e.g. an
+            // absurd amount exceeding balance). The transform simply doesn't apply —
+            // return None and let the caller fall back, rather than crashing the whole
+            // fuzzer with a panic. (Was a leftover debug panic in front of this return.)
+            tracing::debug!(
+                "[weth] transform call reverted: {:?} => {:?} {:?} ({:?})",
                 caller,
                 addr,
-                hex::encode(calldata.as_ref())
+                hex::encode(calldata.as_ref()),
+                ir
             );
-            panic!("Weth call failed: {:?}", ir);
-            #[allow(unreachable_code)]
             return None;
         }
 
