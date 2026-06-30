@@ -364,7 +364,14 @@ where
         // pure `aggregate_eth_inflow` seam so the value-inversion logic is unit-testable
         // without a live engine (the closure is the injection point).
         let post_state = state.get_execution_result().new_state.state.clone();
-        let eth_total = {
+        // Cost/credit already accrued this execution (same scale!() units the engine
+        // credits, so directly comparable to the gross inflow value below):
+        //   owed   = ETH the attacker spent/borrowed (msg.value, flashloan principal)
+        //   earned = native ETH already returned to the attacker
+        let owed = post_state.flashloan_data.owed;
+        let prior_earned = post_state.flashloan_data.earned;
+
+        let gross_eth = {
             let mut exec = executor.deref().borrow_mut();
             let original = exec.host.evmstate.clone();
             exec.host.evmstate = post_state;
@@ -375,11 +382,17 @@ where
             total
         };
 
-        // Interesting iff a new realized-ETH ceiling. This is what makes the gradient
-        // value-aware: a small pile of an expensive token now out-ranks a large pile
-        // of a thin-liquidity token (SC-2).
-        if eth_total > self.best_eth_total {
-            self.best_eth_total = eth_total;
+        // NET realized value, not gross. Ranking by gross inflow chases flashloan-funded
+        // swaps (e.g. borrow 4722 ETH → buy USDC) that look enormous but net ~0 after
+        // the spend — observed live on the Yearn fork. Subtracting `owed` makes the
+        // gradient climb actual profit: the mirage collapses to 0, a real drain stands.
+        let net_eth = net_realized(gross_eth, prior_earned, owed);
+
+        // Interesting iff a new realized-NET-ETH ceiling. This is what makes the gradient
+        // value-aware: a small pile of an expensive token out-ranks a large pile of a
+        // thin-liquidity token (SC-2), and a big-but-unprofitable swap out-ranks nothing.
+        if net_eth > self.best_eth_total {
+            self.best_eth_total = net_eth;
             self.scheduler.vote(
                 state.get_infant_state_state(),
                 input.get_state_idx(),
@@ -389,6 +402,17 @@ where
         }
         Ok(false)
     }
+}
+
+/// Feature 011 (Part A) — net realized value of an execution, in `scale!()` units.
+///
+/// `gross` = ETH value of attacker token inflows (liquidated via the engine),
+/// `earned` = native ETH already returned to the attacker, `owed` = ETH the attacker
+/// spent/borrowed. Net = (gross + earned) − owed, saturating at 0: a position that
+/// cost more than it returned is not profit and must not advance the gradient.
+/// Pure and unit-tested so the gross-vs-net decision is pinned independent of the engine.
+fn net_realized(gross: EVMU512, earned: EVMU512, owed: EVMU512) -> EVMU512 {
+    gross.saturating_add(earned).saturating_sub(owed)
 }
 
 #[cfg(test)]
@@ -460,5 +484,33 @@ mod impact_011_tests {
             [((addr(1), addr(2)), EVMU256::from(5u64))].into_iter().collect();
         let total = aggregate_eth_inflow(&pairs, |_, _, _| None);
         assert_eq!(total, EVMU512::ZERO);
+    }
+
+    /// The gross-inflow mirage: a flashloan-funded swap acquires a huge gross inflow
+    /// but spends just as much (owed). Net must collapse to 0 so it does NOT advance
+    /// the gradient — this is the live Yearn finding (4722 ETH swap, ~0 net) encoded.
+    #[test]
+    fn gross_mirage_nets_zero() {
+        let huge = EVMU512::from(4_722_000_000_000_000_000_000u128); // ~4722 ETH gross
+        let owed = EVMU512::from(4_722_000_000_000_000_000_000u128); // spent the same
+        assert_eq!(net_realized(huge, EVMU512::ZERO, owed), EVMU512::ZERO);
+
+        // A position that cost MORE than it returned is a loss → saturates to 0, never negative.
+        let loss = net_realized(EVMU512::from(100u64), EVMU512::ZERO, EVMU512::from(150u64));
+        assert_eq!(loss, EVMU512::ZERO);
+    }
+
+    /// A real drain (little spent, much extracted) yields positive net and out-ranks
+    /// the mirage — the gradient now climbs profit, not gross.
+    #[test]
+    fn real_profit_beats_mirage() {
+        let real = net_realized(EVMU512::from(6u64), EVMU512::ZERO, EVMU512::from(1u64)); // drain
+        let mirage = net_realized(
+            EVMU512::from(4_722_000u64),
+            EVMU512::ZERO,
+            EVMU512::from(4_722_000u64),
+        ); // big swap, ~0 net
+        assert!(real > mirage, "real profit ({real}) must out-rank gross mirage ({mirage})");
+        assert_eq!(mirage, EVMU512::ZERO);
     }
 }

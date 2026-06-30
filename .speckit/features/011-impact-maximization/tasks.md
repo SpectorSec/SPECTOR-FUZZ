@@ -1,9 +1,22 @@
 # Feature 011 — Impact Maximization · Tasks (Phase 1: Part A — ETH-value gradient)
 
-**Status:** In Progress — T1 ✅ (df1c3f9) · T2–T5 ✅ (af07921) · T6–T7 ✅ (tests green via `aggregate_eth_inflow` seam) · T8 (Lane-A Yearn measure) remaining — Skyler's deploy step
+**Status:** In Progress — T1 ✅ (df1c3f9) · T2–T5 ✅ (af07921) · T6–T7 ✅ (00e3bad) · **T8 fork run done → drove a GROSS→NET pivot** (below) · T8 re-validation of net version pending
 **Owner:** Skyler
 **Last updated:** 2026-06-30
 **Plan:** [`plan.md`](./plan.md) §2, §5, §7 · **Spec:** [`specify.md`](./specify.md) (SC-2, SC-3)
+
+> ### T8 fork validation finding (2026-06-30) — GROSS→NET pivot
+> First Yearn-fork run of the gradient (all features on, `--run-forever`) was **stable for
+> ~20 min / testcase #953** once three robustness panics were fixed (committed fe17b39:
+> concolic `stack_bv!` underflow, weth_transformer panic, two `.expect("Weth failed")`).
+> **But loot plateaued at 0.024 ETH** while the fuzzer chased ever-larger flashloan-funded
+> swaps (up to **4722 ETH** `msg.value`) that net ~0 after slippage. Root cause: the gradient
+> (original raw-units AND the first ETH version) ranked **GROSS** inflow — a flashloan-funded
+> buy looks enormous but isn't profit. **Fix:** Part A now ranks **NET = (gross + earned) −
+> owed** (saturating) via `net_realized()`; the mirage collapses to 0, a real drain stands.
+> Unit-tested (`gross_mirage_nets_zero`, `real_profit_beats_mirage`). This directly answers the
+> original question "is the mechanism pushing maximum impact?" — gross ranking was not.
+> Net re-validation on a CLEAN work_dir (no gross-corpus seed bias) is the open T8 step.
 
 > Scope: **Phase 1 only** — the realized-ETH extraction gradient (Part A). The amplifier
 > (Part B), `AmplifyHint`, and `ImpactAmplifierStage` are **not** in this phase; Part A's
