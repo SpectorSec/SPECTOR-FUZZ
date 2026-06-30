@@ -657,6 +657,53 @@ where
         Some(())
     }
 
+    /// Feature 011 (Part A) — measure, without committing, the realized value of liquidating
+    /// `amount` of `token` to `caller`, expressed as the resulting `flashloan_data.earned`
+    /// delta.
+    ///
+    /// This is the *valuation* counterpart to [`liquidate_via_engine`]: the engine method
+    /// performs the swap and keeps the resulting state; this method snapshots, runs the same
+    /// engine path, reads the realized-value delta, and **always restores** the snapshot so the
+    /// caller's state is untouched. It is the shared valuation path (constitution rule 3) used
+    /// by the ETH-value extraction gradient — it does not duplicate the swap logic, it wraps it.
+    ///
+    /// Returns the raw `EVMU512` earned-delta (scaled by `scale!()`, same as the loot oracle's
+    /// own accounting). The value is for *ranking* inflows across tokens, so the consistent
+    /// internal scale is what matters, not de-scaled wei. `None` if `amount` is zero or the
+    /// engine could not liquidate the token (no route / code not loaded).
+    pub fn value_token_inflow_eth(
+        &mut self,
+        caller: EVMAddress,
+        token: EVMAddress,
+        amount: EVMU256,
+        state: &mut EVMFuzzState,
+    ) -> Option<EVMU512> {
+        if amount == EVMU256::ZERO {
+            return None;
+        }
+        // Snapshot — this is measurement-only and must not commit the liquidation
+        // (mirrors the loot oracle's per-liquidation backup at oracles/erc20.rs:232).
+        let backup = self.host.evmstate.clone();
+        let before = self.host.evmstate.flashloan_data.earned;
+
+        let realized = self.liquidate_via_engine(caller, token, amount, state).is_some();
+
+        let delta = if realized {
+            // Read the same observable field the loot oracle trusts post-liquidation.
+            self.host
+                .evmstate
+                .flashloan_data
+                .earned
+                .checked_sub(before)
+        } else {
+            None
+        };
+
+        // Always restore — measurement must leave the caller's state exactly as found.
+        self.host.evmstate = backup;
+        delta
+    }
+
     /// Create a new EVM executor given a host and deployer address
     pub fn new(fuzz_host: FuzzHost<SC>, deployer: EVMAddress) -> Self {
         Self {
