@@ -131,6 +131,14 @@ impl
 
         let mut res = vec![];
         for (i, (vault, _)) in self.vaults.iter().enumerate() {
+            // A failed/empty convertTo* static call parses as 0; pairing a real pre with
+            // a failed (→0) post would manufacture a phantom drain or zero-share
+            // "inflation". Unmeasurable ≠ 0 — skip the vault if any of its 4 reads failed.
+            if pre_results[2 * i].is_empty() || post_results[2 * i].is_empty()
+                || pre_results[2 * i + 1].is_empty() || post_results[2 * i + 1].is_empty()
+            {
+                continue;
+            }
             let price_pre   = read(&pre_results,  2 * i);
             let price_post  = read(&post_results, 2 * i);
             let shares_pre  = read(&pre_results,  2 * i + 1);

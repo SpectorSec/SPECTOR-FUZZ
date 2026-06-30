@@ -137,6 +137,12 @@ impl
 
         let mut res = vec![];
         for (i, (token, addr)) in pairs.iter().enumerate() {
+            // Failed/empty balanceOf static call parses as 0; pairing a real pre with a
+            // failed (→0) post fakes a balance_delta that won't match the event flow →
+            // phantom "rebasing mismatch". Unmeasurable ≠ 0 — skip if either read failed.
+            if pre_results[i].is_empty() || post_results[i].is_empty() {
+                continue;
+            }
             let pre  = EVMU256::try_from_be_slice(pre_results[i].as_slice()).unwrap_or(EVMU256::ZERO);
             let post = EVMU256::try_from_be_slice(post_results[i].as_slice()).unwrap_or(EVMU256::ZERO);
 

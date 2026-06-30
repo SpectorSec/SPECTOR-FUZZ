@@ -1287,7 +1287,11 @@ where
             );
             let ret = self.run_inspect(&mut sub_interp, state);
             let output = sub_interp.return_data.buffer().clone().0;
-            println!(
+            // Gated behind debug! — was an unconditional println! firing on EVERY CALL
+            // opcode, which on a deep/wide call tree wrote hundreds of MB of log and paid
+            // hex::encode on every call. debug! evaluates its args only when enabled, so
+            // production runs pay nothing. (Enable with RUST_LOG=debug if you need it.)
+            tracing::debug!(
                 "[ityfuzz debug] CALL from {:?} to {:?} with input {} returned {:?}, output: {}",
                 input.caller,
                 input.target_address,

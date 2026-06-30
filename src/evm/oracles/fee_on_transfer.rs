@@ -136,6 +136,13 @@ impl
 
         let mut res = vec![];
         for (i, (token, to)) in recipients.iter().enumerate() {
+            // A failed/empty balanceOf static call (token code not loaded, or the call
+            // reverted — common under a runaway call tree / resource pressure) returns
+            // empty bytes, which parse as 0 and manufacture a phantom "fee=full amount"
+            // (actual=0). Unmeasurable is NOT a zero balance — skip this recipient.
+            if pre_balances[i].is_empty() || post_balances[i].is_empty() {
+                continue;
+            }
             let pre  = EVMU256::try_from_be_slice(pre_balances[i].as_slice()).unwrap_or(EVMU256::ZERO);
             let post = EVMU256::try_from_be_slice(post_balances[i].as_slice()).unwrap_or(EVMU256::ZERO);
 
