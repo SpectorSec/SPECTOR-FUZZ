@@ -179,6 +179,12 @@ pub struct EvmArgs {
     #[arg(long, default_value = "0")]
     concolic_num_threads: usize,
 
+    /// Feature 011 (Part A): rank the fund-extraction gradient by realized ETH
+    /// value (via the liquidation engine) instead of raw token units. Opt-in;
+    /// off by default the gradient behaves exactly as before.
+    #[arg(long, default_value = "false")]
+    impact_eth_gradient: bool,
+
     /// Enable the economic outcome detection subsystem.
     ///
     /// Despite the legacy `--flashloan` name, this flag controls the entire
@@ -820,6 +826,7 @@ pub fn evm_main(mut args: EvmArgs) {
                 args.concolic_num_threads
             }
         },
+        impact_eth_gradient: args.impact_eth_gradient,
         oracle: oracles,
         producers,
         flashloan: args.flashloan,
@@ -1020,6 +1027,7 @@ fn test_evm_offchain_setup() {
                 args.concolic_num_threads
             }
         },
+        impact_eth_gradient: args.impact_eth_gradient,
         oracle: oracles,
         producers,
         flashloan: args.flashloan,

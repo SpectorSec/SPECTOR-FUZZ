@@ -25,7 +25,7 @@ use crate::{
     r#const::INFANT_STATE_INITIAL_VOTES,
     scheduler::HasVote,
     state::{HasExecutionResult, HasInfantStateState, InfantStateState},
-    evm::{types::EVMAddress, vm::EVMState},
+    evm::{types::{EVMAddress, EVMQueueExecutor, EVMU512}, vm::EVMState},
 };
 
 use revm_primitives::ruint::Uint;
@@ -195,14 +195,34 @@ pub struct TokenBalanceFeedback<SC> {
     /// Monotonically increasing — a new max means a new interesting state.
     best_inflow: HashMap<EVMAddress, EVMU256>,
     scheduler: SC,
+    /// Feature 011 (Part A): when true, interestingness is gated on a new
+    /// *realized-ETH* ceiling rather than the raw token-unit ceiling. When false
+    /// the executor ref is `None` and this struct behaves exactly as before.
+    eth_gradient: bool,
+    /// Liquidation engine, used only when `eth_gradient` is on, to value token
+    /// inflows in ETH via `EVMExecutor::value_token_inflow_eth`. Concrete
+    /// `EVMQueueExecutor` (same ref the executor/concolic stage hold) so no extra
+    /// generic param is threaded through the feedback tuple.
+    evm_executor: Option<Rc<RefCell<EVMQueueExecutor>>>,
+    /// Feature 011 (Part A): best realized-ETH total (raw `earned`-delta scale)
+    /// seen across executions. A new max is the ETH-denominated interesting event.
+    best_eth_total: EVMU512,
 }
 
 impl<SC> TokenBalanceFeedback<SC> {
-    pub fn new(attackers: HashSet<EVMAddress>, scheduler: SC) -> Self {
+    pub fn new(
+        attackers: HashSet<EVMAddress>,
+        scheduler: SC,
+        eth_gradient: bool,
+        evm_executor: Option<Rc<RefCell<EVMQueueExecutor>>>,
+    ) -> Self {
         Self {
             attackers,
             best_inflow: HashMap::new(),
             scheduler,
+            eth_gradient,
+            evm_executor,
+            best_eth_total: EVMU512::ZERO,
         }
     }
 }
@@ -274,17 +294,78 @@ where
             }
         }
 
-        if new_ceiling {
-            // Vote aggressively for this VM snapshot so the fuzzer prioritizes
-            // exploring further from this state. 5x base votes — profitable
-            // states deserve far more attention than coverage-only states.
+        // --- Original token-unit gradient (default, unchanged when flag off) ---
+        if !self.eth_gradient {
+            if new_ceiling {
+                // Vote aggressively for this VM snapshot so the fuzzer prioritizes
+                // exploring further from this state. 5x base votes — profitable
+                // states deserve far more attention than coverage-only states.
+                self.scheduler.vote(
+                    state.get_infant_state_state(),
+                    input.get_state_idx(),
+                    INFANT_STATE_INITIAL_VOTES * 5,
+                );
+            }
+            return Ok(new_ceiling);
+        }
+
+        // --- Feature 011 (Part A): realized-ETH gradient ---
+        // Pre-filter: a token's raw inflow ceiling rising is a necessary condition
+        // for more realized ETH, so only pay for engine valuation when it does.
+        // (`best_inflow` was already updated above.)
+        if !new_ceiling {
+            return Ok(false);
+        }
+        let Some(executor) = self.evm_executor.clone() else {
+            // Flag on but no engine ref wired: degrade to raw behavior rather than
+            // silently dropping the signal.
             self.scheduler.vote(
                 state.get_infant_state_state(),
                 input.get_state_idx(),
                 INFANT_STATE_INITIAL_VOTES * 5,
             );
+            return Ok(true);
+        };
+
+        // Per-(attacker, token) inflows — the engine liquidates `amount` of `token`
+        // transferred FROM the holder, so we must keep the holder, not collapse it.
+        let mut inflow_pairs: HashMap<(EVMAddress, EVMAddress), EVMU256> = HashMap::new();
+        for (token, _from, to, value) in &transfers {
+            if self.attackers.contains(to) && *value > EVMU256::ZERO {
+                *inflow_pairs.entry((*to, *token)).or_insert(EVMU256::ZERO) += *value;
+            }
         }
 
-        Ok(new_ceiling)
+        // Value each inflow against THIS execution's outcome, then restore the shared
+        // executor exactly as found — valuation must be side-effect free
+        // (`value_token_inflow_eth` snapshots/restores internally per call; we also
+        // restore the post-state we install here).
+        let post_state = state.get_execution_result().new_state.state.clone();
+        let mut eth_total = EVMU512::ZERO;
+        {
+            let mut exec = executor.deref().borrow_mut();
+            let original = exec.host.evmstate.clone();
+            exec.host.evmstate = post_state;
+            for ((attacker, token), amount) in &inflow_pairs {
+                if let Some(delta) = exec.value_token_inflow_eth(*attacker, *token, *amount, state) {
+                    eth_total = eth_total.saturating_add(delta);
+                }
+            }
+            exec.host.evmstate = original;
+        }
+
+        // Interesting iff a new realized-ETH ceiling. This is what makes the gradient
+        // value-aware: a small pile of an expensive token now out-ranks a large pile
+        // of a thin-liquidity token (SC-2).
+        if eth_total > self.best_eth_total {
+            self.best_eth_total = eth_total;
+            self.scheduler.vote(
+                state.get_infant_state_state(),
+                input.get_state_idx(),
+                INFANT_STATE_INITIAL_VOTES * 5,
+            );
+            return Ok(true);
+        }
+        Ok(false)
     }
 }

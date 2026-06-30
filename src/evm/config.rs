@@ -64,6 +64,9 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub concolic_caller: bool,
     pub concolic_timeout: u32,
     pub concolic_num_threads: usize,
+    /// Feature 011 (Part A): rank the extraction gradient by realized ETH value
+    /// instead of raw token units. Off ⇒ original token-unit gradient (unchanged).
+    pub impact_eth_gradient: bool,
     pub contract_loader: ContractLoader,
     pub oracle: Vec<Rc<RefCell<dyn Oracle<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E>>>>,
     pub producers: Vec<Rc<RefCell<dyn Producer<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E>>>>,

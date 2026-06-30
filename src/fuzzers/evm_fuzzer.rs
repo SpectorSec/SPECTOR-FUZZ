@@ -381,7 +381,15 @@ pub fn evm_fuzzer(
     // Build attacker set for TokenBalanceFeedback from callers_pool.
     let attackers: std::collections::HashSet<EVMAddress> =
         state.callers_pool.iter().cloned().collect();
-    let balance_feedback = TokenBalanceFeedback::new(attackers, infant_scheduler.clone());
+    // Feature 011 (Part A): hand the gradient the liquidation engine only when the
+    // ETH-value mode is on; otherwise `None` ⇒ original token-unit gradient.
+    let eth_engine_ref = config.impact_eth_gradient.then(|| evm_executor_ref.clone());
+    let balance_feedback = TokenBalanceFeedback::new(
+        attackers,
+        infant_scheduler.clone(),
+        config.impact_eth_gradient,
+        eth_engine_ref,
+    );
 
     // Combine: any new coverage ceiling OR any new fund-extraction ceiling
     // makes the state interesting and gets added to infant corpus.

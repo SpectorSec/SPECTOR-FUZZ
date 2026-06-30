@@ -1,8 +1,8 @@
 # Feature 011 — Impact Maximization · Tasks (Phase 1: Part A — ETH-value gradient)
 
-**Status:** Awaiting sign-off → implementation
+**Status:** In Progress — T1 ✅ (commit df1c3f9), T2–T5 ✅ (build green), T6–T7 (tests) + T8 (fork measure) remaining
 **Owner:** Skyler
-**Last updated:** 2026-06-29
+**Last updated:** 2026-06-30
 **Plan:** [`plan.md`](./plan.md) §2, §5, §7 · **Spec:** [`specify.md`](./specify.md) (SC-2, SC-3)
 
 > Scope: **Phase 1 only** — the realized-ETH extraction gradient (Part A). The amplifier
