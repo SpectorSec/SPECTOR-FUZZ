@@ -1361,12 +1361,21 @@ where
             // SWAP
             0x90..=0x9f => {
                 let _n = opcode - 0x90 + 1;
-                let swapper = stack_bv!(usize::from(_n));
-                let swappee = stack_bv!(0);
                 let symbolic_stack_len = self.symbolic_stack.len();
-                self.symbolic_stack[symbolic_stack_len - 1] = Some(swapper);
-                self.symbolic_stack[symbolic_stack_len - usize::from(_n) - 1] = Some(swappee);
-                vec![]
+                // The symbolic stack can be shorter than revm's concrete stack (a push
+                // not mirrored symbolically). A SWAP_n needs at least n+1 symbolic slots;
+                // if they aren't there, skip the symbolic swap rather than underflow the
+                // index (`len - 1` / `len - n - 1` wrap to usize::MAX → panic). Concrete
+                // execution is unaffected. Mirrors the stack_bv! graceful degradation.
+                if symbolic_stack_len <= usize::from(_n) {
+                    vec![]
+                } else {
+                    let swapper = stack_bv!(usize::from(_n));
+                    let swappee = stack_bv!(0);
+                    self.symbolic_stack[symbolic_stack_len - 1] = Some(swapper);
+                    self.symbolic_stack[symbolic_stack_len - usize::from(_n) - 1] = Some(swappee);
+                    vec![]
+                }
             }
             // LOG
             0xa0..=0xa4 => {
