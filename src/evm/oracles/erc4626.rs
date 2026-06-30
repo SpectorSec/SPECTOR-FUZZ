@@ -16,13 +16,18 @@ use crate::{
     state::HasExecutionResult,
 };
 
-/// Detects ERC-4626 share-price manipulation.
+/// Detects ERC-4626 share-price manipulation, in BOTH directions:
 ///
-/// The share price is `convertToAssets(1e18)`. It should never decrease
-/// between transactions — a decrease means either:
-///   - A donation attack (attacker donated underlying to inflate then deflate)
-///   - An accounting bug (totalAssets diverged from expected)
-///   - A share-price inflation attack (classic Cream/Hundred pattern)
+///   - DRAIN — `convertToAssets(1e18)` (share price) *decreases* by more than a
+///     rounding tolerance: value left the vault disproportionately.
+///   - INFLATION — `convertToShares(1e18)` (shares a depositor would mint) goes from
+///     >0 to *zero*: the classic Cream/Hundred donation/inflation attack, where the
+///     attacker inflates the price so a victim's deposit rounds to zero shares.
+///     The decrease-only check used to MISS this entirely (inflation moves the price
+///     UP, hitting the `post >= pre` skip), so the documented attack went undetected.
+///
+/// Both are measured pre→post of this execution, so we only flag a transition this
+/// execution *caused*, not a pre-existing vault state.
 ///
 /// Auto-activated by the corpus initializer when `convertToAssets` (0x07a2d13a)
 /// is found in the ABI — no user configuration needed.
@@ -31,21 +36,42 @@ pub struct ERC4626Oracle {
     pub vaults: HashMap<EVMAddress, EVMU256>,
     pub address_to_name: HashMap<EVMAddress, String>,
     convert_to_assets_calldata: Bytes,
+    convert_to_shares_calldata: Bytes,
+}
+
+/// `convertToAssets(1e18)` decreased by more than a 1bp rounding tolerance → drain.
+/// A 1-wei dip is integer-division dust, not a manipulation.
+fn share_price_drained(pre: EVMU256, post: EVMU256) -> bool {
+    if pre == EVMU256::ZERO || post == EVMU256::ZERO || post >= pre {
+        return false;
+    }
+    let drop = pre - post;
+    drop.saturating_mul(EVMU256::from(10000u64)) >= pre // >= 1bp
+}
+
+/// A probe deposit that used to mint shares now mints ZERO — the victim outcome of
+/// an inflation attack. Only fires on a pre>0 → post==0 transition this execution
+/// caused (a vault already inflated before the tx is not flagged here).
+fn became_zero_share(pre_shares: EVMU256, post_shares: EVMU256) -> bool {
+    pre_shares > EVMU256::ZERO && post_shares == EVMU256::ZERO
 }
 
 impl ERC4626Oracle {
     /// `vaults` = list of contract addresses confirmed to be ERC-4626 vaults.
     pub fn new(vaults: Vec<EVMAddress>, address_to_name: HashMap<EVMAddress, String>) -> Self {
-        // convertToAssets(1e18) — query one share's worth
-        let mut calldata = vec![0x07u8, 0xa2, 0xd1, 0x3a];
-        // 1e18 = 0xde0b6b3a7640000 left-padded to 32 bytes
-        calldata.extend_from_slice(&[0u8; 24]);
-        calldata.extend_from_slice(&[0x0d, 0xe0, 0xb6, 0xb3, 0xa7, 0x64, 0x00, 0x00]);
+        // 1e18 = 0x0de0b6b3a7640000, left-padded to 32 bytes.
+        let arg_1e18 = |selector: [u8; 4]| -> Bytes {
+            let mut cd = selector.to_vec();
+            cd.extend_from_slice(&[0u8; 24]);
+            cd.extend_from_slice(&[0x0d, 0xe0, 0xb6, 0xb3, 0xa7, 0x64, 0x00, 0x00]);
+            Bytes::from(cd)
+        };
 
         Self {
             vaults: vaults.into_iter().map(|a| (a, EVMU256::ZERO)).collect(),
             address_to_name,
-            convert_to_assets_calldata: Bytes::from(calldata),
+            convert_to_assets_calldata: arg_1e18([0x07, 0xa2, 0xd1, 0x3a]), // convertToAssets(1e18)
+            convert_to_shares_calldata: arg_1e18([0xc6, 0xe6, 0xf5, 0x92]), // convertToShares(1e18)
         }
     }
 }
@@ -90,28 +116,29 @@ impl
             return vec![];
         }
 
-        // Query convertToAssets(1e18) in pre and post state for each vault.
-        let queries: Vec<(EVMAddress, Bytes)> = self
-            .vaults
-            .keys()
-            .map(|addr| (*addr, self.convert_to_assets_calldata.clone()))
-            .collect();
+        // Two probes per vault: convertToAssets(1e18) (share price, for drain) and
+        // convertToShares(1e18) (shares a depositor mints, for inflation). Index 2i / 2i+1.
+        let mut queries: Vec<(EVMAddress, Bytes)> = Vec::with_capacity(self.vaults.len() * 2);
+        for addr in self.vaults.keys() {
+            queries.push((*addr, self.convert_to_assets_calldata.clone()));
+            queries.push((*addr, self.convert_to_shares_calldata.clone()));
+        }
 
         let pre_results  = ctx.call_pre_batch(&queries);
         let post_results = ctx.call_post_batch(&queries);
 
+        let read = |v: &[Vec<u8>], idx: usize| EVMU256::try_from_be_slice(v[idx].as_slice()).unwrap_or(EVMU256::ZERO);
+
         let mut res = vec![];
         for (i, (vault, _)) in self.vaults.iter().enumerate() {
-            let pre  = EVMU256::try_from_be_slice(pre_results[i].as_slice()).unwrap_or(EVMU256::ZERO);
-            let post = EVMU256::try_from_be_slice(post_results[i].as_slice()).unwrap_or(EVMU256::ZERO);
+            let price_pre   = read(&pre_results,  2 * i);
+            let price_post  = read(&post_results, 2 * i);
+            let shares_pre  = read(&pre_results,  2 * i + 1);
+            let shares_post = read(&post_results, 2 * i + 1);
 
-            // Share price of zero means the vault reverted or isn't initialized — skip.
-            if pre == EVMU256::ZERO || post == EVMU256::ZERO {
-                continue;
-            }
-
-            // Flag if share price DECREASED — unexpected in a healthy vault.
-            if post >= pre {
+            let drained   = share_price_drained(price_pre, price_post);
+            let inflated  = became_zero_share(shares_pre, shares_post);
+            if !drained && !inflated {
                 continue;
             }
 
@@ -125,14 +152,23 @@ impl
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
 
+            let detail = if inflated {
+                format!(
+                    "Vault {} INFLATED: a 1e18-asset deposit minted {} shares before, 0 after \
+                     (donation/inflation attack — victim deposits round to zero shares)",
+                    name, shares_pre,
+                )
+            } else {
+                format!(
+                    "Vault {} share price DRAINED: {} → {} (>1bp drop)",
+                    name, price_pre, price_post,
+                )
+            };
+
             EVMBugResult::new(
                 "ERC-4626 Share Price Manipulation".to_string(),
                 bug_idx,
-                format!(
-                    "Vault {} share price decreased: {} → {} \
-                     (possible donation/inflation attack)",
-                    name, pre, post,
-                ),
+                detail,
                 ConciseEVMInput::from_input(ctx.input, ctx.fuzz_state.get_execution_result()),
                 None,
                 Some(name.to_string()),
@@ -141,5 +177,32 @@ impl
             res.push(bug_idx);
         }
         res
+    }
+}
+
+#[cfg(test)]
+mod erc4626_tests {
+    use super::*;
+
+    #[test]
+    fn drain_needs_to_exceed_rounding() {
+        let p = EVMU256::from(1_000_000_000_000_000_000u64);
+        // 1-wei dip: below 1bp → not a drain.
+        assert!(!share_price_drained(p, p - EVMU256::from(1u64)));
+        // 1% drop → drain.
+        assert!(share_price_drained(p, p - p / EVMU256::from(100u64)));
+        // increase or zero → never a drain (that's the inflation path).
+        assert!(!share_price_drained(p, p + EVMU256::from(1u64)));
+        assert!(!share_price_drained(EVMU256::ZERO, p));
+    }
+
+    #[test]
+    fn inflation_is_the_zero_share_transition() {
+        // used to mint shares, now mints zero → inflation attack.
+        assert!(became_zero_share(EVMU256::from(500u64), EVMU256::ZERO));
+        // already zero before the tx → pre-existing state, not flagged here.
+        assert!(!became_zero_share(EVMU256::ZERO, EVMU256::ZERO));
+        // still mints shares → fine.
+        assert!(!became_zero_share(EVMU256::from(500u64), EVMU256::from(490u64)));
     }
 }
