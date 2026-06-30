@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use libafl::prelude::HasMetadata;
@@ -13,11 +13,24 @@ use crate::{
         vm::EVMState,
     },
     oracle::{Oracle, OracleCtx},
-    state::HasExecutionResult,
+    state::{HasCaller, HasExecutionResult},
 };
 
 fn snapshot_key(token: &EVMAddress, account: &EVMAddress) -> String {
     format!("0x{:?}_0x{:?}", token, account)
+}
+
+/// A post-warp balance gain is a *skim* (unearned, time-extracted value) only if:
+///   - the account is attacker-controlled (`is_attacker`) — we don't care that a
+///     protocol or third party accrued yield, only what the attacker extracted; and
+///   - the account never paid anything in (`!made_outflow`) — a legitimate yield
+///     earner deposits first (shows up as a sender), so a pure receiver that gained
+///     value purely from a time-warp got it for free; and
+///   - the gain clears the dust threshold.
+/// This is what separates a real skim from normal yield accrual, which the old
+/// "flag any balance increase" logic conflated.
+fn is_skim(is_attacker: bool, made_outflow: bool, delta: EVMU256, min_delta: EVMU256) -> bool {
+    is_attacker && !made_outflow && delta >= min_delta
 }
 
 pub struct TemporalSkimOracle {
@@ -123,6 +136,18 @@ impl
             return vec![];
         }
 
+        // Accounts that sent ANY token this execution = they paid something in, so a
+        // balance gain is plausibly earned yield, not a free skim. (Built from post
+        // transfers' `from` field.)
+        let senders: HashSet<EVMAddress> = ctx
+            .post_state
+            .erc20_transfers
+            .iter()
+            .map(|(_token, from, _to, _value)| *from)
+            .collect();
+
+        let min_delta = EVMU256::from(1000000000000000u64); // 0.001 token dust floor
+
         let pairs = &snapshot.pairs;
         let queries: Vec<(EVMAddress, Bytes)> = pairs
             .iter()
@@ -138,7 +163,12 @@ impl
                 continue;
             }
             let delta = post - pre;
-            if delta < EVMU256::from(1000000000000000u64) {
+
+            // Scope to a real skim: attacker-controlled account, no outflow, over dust.
+            // Without this it flagged every yield-bearing position as "theft".
+            let is_attacker = ctx.fuzz_state.has_caller(account);
+            let made_outflow = senders.contains(account);
+            if !is_skim(is_attacker, made_outflow, delta, min_delta) {
                 continue;
             }
 
@@ -160,5 +190,35 @@ impl
             res.push(TEMPORAL_SKIM_BUG_IDX);
         }
         res
+    }
+}
+
+#[cfg(test)]
+mod temporal_skim_tests {
+    use super::*;
+
+    fn big() -> EVMU256 { EVMU256::from(1000000000000000u64) } // dust floor
+
+    #[test]
+    fn attacker_free_gain_is_a_skim() {
+        // attacker, no outflow, over threshold → skim.
+        assert!(is_skim(true, false, big(), big()));
+    }
+
+    #[test]
+    fn earned_yield_is_not_a_skim() {
+        // attacker that PAID IN (made an outflow) → plausibly earned yield, not flagged.
+        assert!(!is_skim(true, true, big() * EVMU256::from(100u64), big()));
+    }
+
+    #[test]
+    fn non_attacker_gain_is_ignored() {
+        // a protocol/third party accruing yield is not the attacker's exploit.
+        assert!(!is_skim(false, false, big() * EVMU256::from(100u64), big()));
+    }
+
+    #[test]
+    fn dust_gain_is_ignored() {
+        assert!(!is_skim(true, false, big() - EVMU256::from(1u64), big()));
     }
 }

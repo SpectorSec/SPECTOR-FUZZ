@@ -167,23 +167,17 @@ impl
             let mut hasher = DefaultHasher::new();
             oracle_addr.hash(&mut hasher);
 
-            // Condition 1: oracle never updated
+            // Condition 1: oracle never updated (updatedAt == 0).
+            // DEMOTED to informational. On a fork this is almost always an artifact —
+            // the oracle contract wasn't initialized at/after the fork block — not an
+            // exploit the fuzzer induced. Emitting it as a bug produced noise findings.
+            // We still skip the other checks (staleness against updatedAt==0 is
+            // meaningless: age would be block_ts - 0 = "infinitely stale").
             if updated_at == EVMU256::ZERO {
-                let bug_idx = (hasher.finish() << 8) + FRESHNESS_BUG_IDX;
-                EVMBugResult::new(
-                    "Stale Oracle — Never Updated".to_string(),
-                    bug_idx,
-                    format!(
-                        "Oracle {} updatedAt == 0: data was never set. \
-                         Consuming protocol accepted it without reverting.",
-                        oracle_name,
-                    ),
-                    ConciseEVMInput::from_input(ctx.input, result),
-                    None,
-                    Some(oracle_name.to_string()),
-                )
-                .push_to_output();
-                res.push(bug_idx);
+                tracing::debug!(
+                    "[freshness] {} updatedAt==0 (uninitialized on fork) — informational, not flagged",
+                    oracle_name,
+                );
                 continue;
             }
 
