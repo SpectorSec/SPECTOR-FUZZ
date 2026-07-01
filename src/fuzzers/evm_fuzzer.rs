@@ -263,7 +263,7 @@ pub fn evm_fuzzer(
         // The README's "80% of previous hacks" claim depends on these
         // templates being matched against the target's deployed contracts.
         let mut exploit_templates = ExploitTemplate::baked_in();
-        debug!("loaded {} baked-in exploit templates", exploit_templates.len());
+        info!("[presets] loaded {} baked-in exploit templates", exploit_templates.len());
 
         // If the user passed --preset-file-path, layer those templates ON TOP
         // of the baked-in set (additive, never replacing). Keeps power-user
@@ -299,7 +299,7 @@ pub fn evm_fuzzer(
             }
         }
         let has_preset_match = !matched_templates.is_empty();
-        debug!("has_preset_match: {} {}", has_preset_match, matched_templates.len());
+        info!("[presets] has_preset_match: {} ({} template(s) fully matched this target)", has_preset_match, matched_templates.len());
 
         state.init_presets(has_preset_match, matched_templates.clone(), sig_to_addr_abi_map);
     }

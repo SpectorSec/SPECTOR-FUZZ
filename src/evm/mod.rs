@@ -191,12 +191,14 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     no_topology: bool,
 
-    /// Topology mutator-bias strength in [0.0, 1.0]. Scales how hard topology confidence
-    /// steers the mutator (campaign spawn rate + power scheduling): multiplier = 1 +
-    /// (conf/100) * bias. 1.0 = full floodlight (legacy), 0.3 = nudge (default), 0.0 =
-    /// topology intelligence + oracle gap-filling stay ON but the mutator runs unbiased.
-    /// Distinct from --no-topology (which turns the whole layer off).
-    #[arg(long, default_value = "0.3")]
+    /// Topology FORCING strength in [0.0, 1.0]. Topology is feedback (it reads the ABI and
+    /// gives the fuzzer the system's shape) and always INFORMS — oracle activation, campaign
+    /// shape, gap-filling stay on regardless. This knob only controls whether topology
+    /// confidence also FORCES the mutator: it scales the campaign spawn-rate and scheduler
+    /// power (multiplier = 1 + (conf/100) * bias). DEFAULT 0.0 = inform only, no forcing
+    /// (coherent: don't override coverage-gravity with our prior). 1.0 = legacy floodlight.
+    /// Distinct from --no-topology, which throws out the shape *feedback* too.
+    #[arg(long, default_value = "0.0")]
     topology_bias: f64,
 
     /// Enable the economic outcome detection subsystem.

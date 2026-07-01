@@ -642,9 +642,9 @@ where
             // and mutator's campaign probability can consume them.
             if let Some(ref report) = artifacts.topology {
                 use crate::evm::topology::TopologyHints;
-                // bias defaults to 0.3 here; the fuzzer (evm_fuzzer.rs) re-injects with the
-                // actual --topology-bias value right after initialize() and overwrites this.
-                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, 0.3);
+                // bias defaults to 0.0 (inform-only, no forcing); the fuzzer (evm_fuzzer.rs)
+                // re-injects with the actual --topology-bias value right after initialize().
+                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, 0.0);
                 self.state.add_metadata(hints);
                 // Store the full TopologyReport so campaign planners can
                 // prioritize exploit targets by ranked class.

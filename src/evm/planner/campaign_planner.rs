@@ -101,6 +101,22 @@ pub fn plan_campaign(
     topology_report: Option<&TopologyReport>,
     temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
+    // No observed value-flow supplied → falls back to topology-shape + defaults.
+    plan_campaign_with_value_flow(cache, topology_report, temporal_skimming, &HashSet::new())
+}
+
+/// Value-flow-aware campaign planner. `value_producing` is the set of function
+/// selectors the LIVE target was observed (via value-capture) to return a value —
+/// the "blood in the water." The prime step is preferentially anchored on such a
+/// producer, so the campaign chains FROM where value actually flows on *this* target
+/// (adaptable feedback), not only from a historical/topology shape (formalized
+/// feedback). Both signals INFORM the sequence; neither FORCES the mutator's aim.
+pub fn plan_campaign_with_value_flow(
+    cache: &CampaignTargetCache,
+    topology_report: Option<&TopologyReport>,
+    temporal_skimming: bool,
+    value_producing: &HashSet<[u8; 4]>,
+) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
 
     // Step 0 (optional): Borrow step — acquire capital via flashloan
@@ -109,7 +125,7 @@ pub fn plan_campaign(
     }
 
     // Populate prime + exploit steps (with concrete function ABIs), respecting hints
-    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report);
+    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, value_producing);
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
     }
@@ -148,7 +164,33 @@ type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
 fn pick_prime_and_exploit<'a>(
     cache: &'a CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
+    value_producing: &HashSet<[u8; 4]>,
 ) -> (PickedStep, PickedStep) {
+    // ── Value-flow feedback (primary): chain FROM where the target reveals value ──
+    // If value-capture observed a prime function actually returning a value on THIS
+    // target, anchor the prime there — that's the blood in the water. Pair with a
+    // same-contract exploit if one exists (tight deposit→exploit chain), else the
+    // first exploit target. This makes the campaign adaptive to the live target,
+    // not just its historical/topology shape.
+    if !value_producing.is_empty() {
+        for (addr, sel, p_abi) in &cache.prime_targets {
+            if value_producing.contains(sel) {
+                if let Some((_, _, e_abi)) = cache.exploit_targets.iter().find(|(a, _, _)| a == addr) {
+                    return (
+                        Some((*addr, Some(p_abi.clone()))),
+                        Some((*addr, Some(e_abi.clone()))),
+                    );
+                }
+                if let Some((e_addr, _, e_abi)) = cache.exploit_targets.first() {
+                    return (
+                        Some((*addr, Some(p_abi.clone()))),
+                        Some((*e_addr, Some(e_abi.clone()))),
+                    );
+                }
+            }
+        }
+    }
+
     let prefer_same_contract = topology_report
         .and_then(|r| r.ranked.first())
         .map(|(cls, _)| {

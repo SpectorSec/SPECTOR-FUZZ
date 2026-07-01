@@ -18,8 +18,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{CampaignSequence, EVMInputT, NestedAction};
-use crate::evm::oracles::{OracleTargetMetadata, TrustedCallerMetadata, WhaleAddressMetadata};
-use crate::evm::planner::{plan_campaign, CampaignTargetCache};
+use crate::evm::oracles::{TrustedCallerMetadata, WhaleAddressMetadata};
+use crate::evm::planner::{plan_campaign_with_value_flow, CampaignTargetCache};
 use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
     evm::{
@@ -657,7 +657,30 @@ where
             if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
                 if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
                     let topology_report = state.metadata_map().get::<TopologyReport>();
-                    if let Some(campaign) = plan_campaign(cache, topology_report, self.temporal_skimming) {
+                    // Value-flow feedback: selectors the LIVE target was observed to return
+                    // a value from (value-capture "blood in the water"), parsed from
+                    // observed_values keys "{addr}_{selectorhex}_return". Drives adaptive,
+                    // in-the-now prime-step selection alongside the topology shape.
+                    let value_producing: std::collections::HashSet<[u8; 4]> = input
+                        .get_state()
+                        .as_any()
+                        .downcast_ref::<EVMState>()
+                        .map(|s| {
+                            s.observed_values
+                                .keys()
+                                .filter_map(|k| {
+                                    let sel_hex = k.strip_suffix("_return")?.rsplit('_').next()?;
+                                    if sel_hex.len() == 8 {
+                                        let bytes = hex::decode(sel_hex).ok()?;
+                                        <[u8; 4]>::try_from(bytes.as_slice()).ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(campaign) = plan_campaign_with_value_flow(cache, topology_report, self.temporal_skimming, &value_producing) {
                         // Warp refinement is done by the campaign EXECUTOR via
                         // controlled probes (src/executor.rs) — clean, deterministic.
                         // The planner's base warp flows through unchanged here.
@@ -724,23 +747,42 @@ where
 
             // Mutate nested actions (with 15% probability)
             if state.rand_mut().below(100) < 15 {
-                // Check oracle-flagged targets first (80% bias)
-                let oracle_targets = state.metadata_map()
-                    .get::<OracleTargetMetadata>()
-                    .map(|m| m.targets.keys().cloned().collect::<Vec<[u8; 20]>>())
+                // Aim the re-entry by VALUE FLOW + CONTEXT (feedback), not oracle-flag
+                // (forcing). The nested action is a re-entry/callback payload; we point it at:
+                //   (1) contracts the LIVE target revealed value from (value-capture — where
+                //       the money is actually moving), and
+                //   (2) the contract we're currently interacting with (the natural reentrancy
+                //       re-entry — you re-enter what you're calling),
+                // falling back to the full contract set. This informs the aim from what the
+                // program shows, instead of forcing it toward oracle-flagged addresses (which
+                // include false positives). Oracle findings no longer steer the mutator here.
+                let all_contracts: Vec<EVMAddress> = state
+                    .metadata_map()
+                    .get::<ABIAddressToInstanceMap>()
+                    .map(|m| m.map.keys().cloned().collect())
                     .unwrap_or_default();
 
-                let use_oracle_target = !oracle_targets.is_empty() && state.rand_mut().below(100) < 80;
-
-                if use_oracle_target {
-                    eprintln!("[FeedbackLoop] using {} oracle-flagged targets for NestedAction", oracle_targets.len());
+                let mut informed: Vec<EVMAddress> = Vec::new();
+                // (1) value-flow: known contracts that produced observed return values.
+                //     Match by the value_capture key prefix ("{addr:?}_...") — format-agnostic.
+                if let Some(evm) = input.get_state().as_any().downcast_ref::<EVMState>() {
+                    for addr in &all_contracts {
+                        let prefix = format!("{:?}", addr);
+                        if evm.observed_values.keys().any(|k| k.starts_with(&prefix)) {
+                            informed.push(*addr);
+                        }
+                    }
                 }
+                // (Context — the contract being called — is already captured here: you call
+                // it, it returns a value, so it lands in observed_values and thus in `informed`.
+                // That's the natural reentrancy re-entry, arrived at via value flow.)
 
-                let keys: Option<Vec<EVMAddress>> = if use_oracle_target {
-                    Some(oracle_targets.into_iter().map(EVMAddress::from).collect())
+                let keys: Option<Vec<EVMAddress>> = if !informed.is_empty() {
+                    Some(informed)
+                } else if !all_contracts.is_empty() {
+                    Some(all_contracts)
                 } else {
-                    let abis = state.metadata_map().get::<ABIAddressToInstanceMap>();
-                    abis.map(|m| m.map.keys().cloned().collect::<Vec<EVMAddress>>())
+                    None
                 };
 
                 if let Some(keys) = keys {
@@ -871,21 +913,35 @@ where
             }
 
             // Re-sample function selector with 10% probability
-            // Prevents getting stuck on a single function (e.g. deposit())
-            // Biases toward oracle-flagged targets (same 80% pattern as NestedAction)
+            // Prevents getting stuck on a single function (e.g. deposit()).
+            // Prefers contracts where value flows (value-capture feedback), not oracle-flagged
+            // targets — informs the re-sample from the program, doesn't force it from our prior.
             if state.rand_mut().below(100) < 10 {
                 let abi_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
-                let oracle_targets: Vec<EVMAddress> = state.metadata_map()
-                    .get::<OracleTargetMetadata>()
-                    .map(|m| m.targets.keys().cloned().map(EVMAddress::from).collect())
-                    .unwrap_or_default();
-
-                let use_oracle_bias = !oracle_targets.is_empty() && state.rand_mut().below(100) < 80;
 
                 if let Some(abi_map) = abi_map {
+                    // Contracts the LIVE target revealed value from (value-capture). When any
+                    // exist, prefer them; otherwise consider all. No oracle-flag forcing.
+                    let value_flow: std::collections::HashSet<EVMAddress> = input
+                        .get_state()
+                        .as_any()
+                        .downcast_ref::<EVMState>()
+                        .map(|s| {
+                            abi_map
+                                .map
+                                .keys()
+                                .filter(|addr| {
+                                    let prefix = format!("{:?}", addr);
+                                    s.observed_values.keys().any(|k| k.starts_with(&prefix))
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     let mut candidates: Vec<(EVMAddress, BoxedABI)> = Vec::new();
                     for (addr, abis) in &abi_map.map {
-                        if use_oracle_bias && !oracle_targets.contains(addr) {
+                        if !value_flow.is_empty() && !value_flow.contains(addr) {
                             continue;
                         }
                         for abi in abis {
