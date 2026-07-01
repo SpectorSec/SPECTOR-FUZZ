@@ -34,6 +34,7 @@ pub enum MiddlewareType {
     IntegerOverflow,
     Cheatcode,
     ValueCapture,
+    FeeOnTransferDetector,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Copy)]

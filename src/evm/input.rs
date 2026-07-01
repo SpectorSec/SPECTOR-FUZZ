@@ -513,13 +513,16 @@ impl ConciseEVMInput {
         ))
     }
 
-    #[allow(dead_code)]
     #[inline]
     fn as_borrow(&self) -> Option<String> {
+        // Borrows execute through the deployed fork acquisition engine (System 2):
+        // acquire() routes ETH → token via the best available on-chain path (Uniswap
+        // V2/V3, Curve, ERC-4626, Compound, Aave, Lido) — NOT the retired in-process
+        // Uniswap sim. Render the real path so the emitted PoC matches what ran.
         Some(format!(
-            "{}.{}{}(0, path:(WETH → {}), address(this), block.timestamp);",
-            colored_address("Router"),
-            self.colored_fn_name("swapExactETHForTokens"),
+            "{}.{}{}({}, address(this)); // acquire token for ETH via best on-chain route",
+            colored_address("AcquisitionEngine"),
+            self.colored_fn_name("acquire"),
             self.colored_value(),
             colored_address(&self.contract())
         ))

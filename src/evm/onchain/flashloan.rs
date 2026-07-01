@@ -440,6 +440,13 @@ pub struct FlashloanData {
     pub prev_reserves: HashMap<EVMAddress, (EVMU256, EVMU256)>,
     pub unliquidated_tokens: HashMap<EVMAddress, EVMU256>,
     pub extra_info: String,
+    /// Whole-campaign baseline: caller -> token -> balance BEFORE the attack sequence
+    /// began. Captured once (insert-if-absent, first sighting) by `ERC20Producer` and
+    /// persisted across steps via the sstate. The loot oracle liquidates only
+    /// `post_balance - initial`, so pre-existing/seeded holdings net to zero and
+    /// `earned - owed` becomes a true closed portfolio ledger (real adversary P&L)
+    /// instead of counting balances the attacker never acquired.
+    pub initial_token_holdings: HashMap<EVMAddress, HashMap<EVMAddress, EVMU256>>,
 }
 
 impl FlashloanData {
@@ -452,6 +459,7 @@ impl FlashloanData {
             prev_reserves: Default::default(),
             unliquidated_tokens: Default::default(),
             extra_info: Default::default(),
+            initial_token_holdings: Default::default(),
         }
     }
 }

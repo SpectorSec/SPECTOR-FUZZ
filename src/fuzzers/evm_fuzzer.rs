@@ -42,6 +42,7 @@ use crate::{
             call_printer::CallPrinter,
             cheatcode::Cheatcode,
             coverage::{Coverage, EVAL_COVERAGE},
+            fee_on_transfer_detector::FeeOnTransferDetector,
             middleware::Middleware,
             reentrancy::ReentrancyTracer,
             sha3_bypass::{Sha3Bypass, Sha3TaintAnalysis},
@@ -208,6 +209,13 @@ pub fn evm_fuzzer(
         fuzz_host.add_middlewares(Rc::new(RefCell::new(ValueCaptureMiddleware::new())));
     }
 
+    if config.fee_on_transfer_oracle {
+        // Inline per-transfer fee measurement feeds FeeOnTransferOracle's evidence
+        // (EVMState::fee_observations). Without it the oracle sees nothing.
+        debug!("fee-on-transfer inline detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(FeeOnTransferDetector::new())));
+    }
+
     let mut evm_executor: EVMQueueExecutor = EVMExecutor::new(fuzz_host, deployer);
 
     if config.replay_file.is_some() {
@@ -234,9 +242,12 @@ pub fn evm_fuzzer(
 
     // Store topology hints in state metadata so CorpusPowerABITestcaseScore
     // can boost mutation energy toward topology-predicted exploit sequences.
-    if let Some(ref report) = artifacts.topology {
-        use crate::evm::topology::TopologyHints;
-        state.add_metadata(TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi));
+    // Skipped under --no-topology so the mutator runs unbiased (the "Gamma Ray" off).
+    if !config.no_topology {
+        if let Some(ref report) = artifacts.topology {
+            use crate::evm::topology::TopologyHints;
+            state.add_metadata(TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, config.topology_bias));
+        }
     }
 
     let mut instance_map = ABIAddressToInstanceMap::new();
@@ -612,7 +623,8 @@ pub fn evm_fuzzer(
     // Note: InvariantOracle is Echidna-specific (needs invariant_* named functions).
     // For invariant-leak exploit classes we use ReentrancyOracle + ArbitraryCallOracle
     // which observe the execution trace and catch the state violation at runtime.
-    if let Some(ref topo) = artifacts.topology {
+    // Skipped under --no-topology so detectors run without topology-driven activation.
+    if let Some(topo) = artifacts.topology.as_ref().filter(|_| !config.no_topology) {
         use crate::evm::topology::ExploitClass;
         use crate::evm::oracles::rebasing::RebasingOracle;
 

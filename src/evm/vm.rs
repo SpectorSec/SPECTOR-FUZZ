@@ -275,6 +275,17 @@ pub struct EVMState {
     /// ERC-20 Approval events: (token_contract, owner, spender, value)
     #[serde(skip)]
     pub erc20_approvals: Vec<(EVMAddress, EVMAddress, EVMAddress, EVMU256)>,
+    /// Inline fee-on-transfer measurements: (token_contract, recipient, claimed, actual).
+    /// Recorded by `FeeOnTransferDetector` middleware, which brackets a single
+    /// `transfer`/`transferFrom` CALL — snapshotting the recipient's balance slot at
+    /// the CALL opcode and re-reading it when that frame returns. `claimed` is the
+    /// amount in the calldata; `actual` is the real balance delta. A genuine fee-on-
+    /// transfer token delivers `actual < claimed`. Unlike the old whole-tx balance
+    /// diff, a transit/pass-through recipient (received-then-forwarded in a *later*
+    /// call) cannot be confused with a 100%-fee token here, because the measurement
+    /// is scoped to one transfer's call frame.
+    #[serde(skip)]
+    pub fee_observations: Vec<(EVMAddress, EVMAddress, EVMU256, EVMU256)>,
 }
 
 pub trait EVMStateT {
@@ -655,6 +666,117 @@ where
         self.host.evmstate = working;
         debug!("[liq-engine] multi-route liquidation: {:?} amount={} → ETH to {:?}", token, amount, caller);
         Some(())
+    }
+
+    /// Acquire `token` for `caller` by spending `eth_amount` ETH through the deployed
+    /// `UniversalAcquisitionEngine` (`acquire` → WETH / wstETH / ERC-4626 / Compound /
+    /// Aave / Uniswap V2 / V3 / Curve). The symmetric twin of [`liquidate_via_engine`]:
+    /// both legs of the attacker's round-trip now price through the SAME real on-chain
+    /// engine on the fork, so `earned − owed` is a single closed loop — no buy-on-one-
+    /// system / sell-on-another asymmetry (the phantom-ETH root cause).
+    ///
+    /// `fast_call_` sets `msg.value` but does NOT move balance (it builds the interpreter
+    /// directly), so the engine is pre-funded with `eth_amount` to execute its payable
+    /// path; that capital is booked as `owed` — the "infinite ETH, owed = deployed
+    /// capital" borrow model, mirroring how the legacy `buy()` booked owed via WethContext.
+    ///
+    /// Returns `Some(acquired)` when the engine bought and forwarded tokens to `caller`,
+    /// `None` if the engine is unavailable or found no route (caller falls back).
+    pub fn acquire_via_engine(
+        &mut self,
+        caller: EVMAddress,
+        token: EVMAddress,
+        eth_amount: EVMU256,
+        state: &mut EVMFuzzState,
+    ) -> Option<EVMU256> {
+        use revm_interpreter::InstructionResult;
+        if eth_amount == EVMU256::ZERO {
+            return None;
+        }
+        tracing::info!("[acq-engine] CALLED token={:?} eth={}", token, eth_amount);
+        // Resolve the deployed acquisition-engine address from the OnChain middleware.
+        let engine = {
+            let mws = self.host.middlewares.read().unwrap();
+            mws.iter().find_map(|mw| {
+                mw.borrow()
+                    .as_any()
+                    .downcast_ref::<crate::evm::onchain::OnChain>()
+                    .and_then(|oc| oc.endpoint.acqengine_addr)
+            })
+        };
+        let engine = match engine {
+            Some(e) => e,
+            None => {
+                tracing::info!("[acq-engine] BAIL: no engine addr (acqengine_addr None)");
+                return None;
+            }
+        };
+        // Fetch engine code on demand from the fork (same as liquidate_via_engine / Gap-C).
+        if !self.host.code.contains_key(&engine) {
+            let onchain_rc = {
+                let mws = self.host.middlewares.read().unwrap();
+                mws.iter()
+                    .find(|mw| mw.borrow().get_type() == MiddlewareType::OnChain)
+                    .cloned()
+            };
+            if let Some(rc) = onchain_rc {
+                let fetched = rc
+                    .borrow_mut()
+                    .as_any_mut()
+                    .downcast_mut::<crate::evm::onchain::OnChain>()
+                    .map(|oc| oc.endpoint.get_contract_code_analyzed(engine, false));
+                if let Some(code) = fetched {
+                    self.host.set_code(engine, code, state);
+                }
+            }
+        }
+        if !self.host.code.contains_key(&engine) {
+            tracing::info!("[acq-engine] BAIL: engine code not loaded {:?}", engine);
+            return None;
+        }
+
+        let ok = |r: InstructionResult| {
+            matches!(
+                r,
+                InstructionResult::Return | InstructionResult::Stop | InstructionResult::SelfDestruct
+            )
+        };
+        let enc_a = |a: EVMAddress| {
+            let mut o = [0u8; 32];
+            o[12..].copy_from_slice(a.as_slice());
+            o
+        };
+
+        let mut working = self.host.evmstate.clone();
+        // Pre-fund the engine with the ETH it will spend (fast_call_ doesn't transfer value).
+        working.set_balance(engine, eth_amount);
+
+        // engine.acquire(token, caller){value: eth_amount} FROM caller
+        let mut ad = crate::evm::liquidation::ACQENGINE_ACQUIRE_SEL.to_vec();
+        ad.extend_from_slice(&enc_a(token));
+        ad.extend_from_slice(&enc_a(caller));
+        let (ret, r) = self.fast_call_(engine, Bytes::from(ad), &mut working, state, eth_amount, caller);
+        if !ok(r) {
+            tracing::info!("[acq-engine] BAIL: acquire failed {:?}", r);
+            return None;
+        }
+        let acquired = EVMU256::try_from_be_slice(ret.as_ref()).unwrap_or(EVMU256::ZERO);
+        if acquired == EVMU256::ZERO {
+            tracing::info!("[acq-engine] acquire returned 0 (no route) for {:?}", token);
+            return None;
+        }
+
+        self.host.evmstate = working;
+        // Book the deployed capital as owed so earned − owed stays a closed loop.
+        self.host.evmstate.flashloan_data.owed += EVMU512::from(eth_amount) * crate::scale!();
+        // A successful engine acquisition proves the round-trip is liquidatable — enable
+        // the liquidation machinery (CAN_LIQUIDATE gates liquidation_percent mutation and
+        // the loot oracle). Formerly bootstrapped by the System-1 token discovery.
+        unsafe {
+            crate::evm::onchain::flashloan::CAN_LIQUIDATE = true;
+        }
+        tracing::info!("[acq-engine] acquired {} of {:?} for {:?}", acquired, token, caller);
+        Some(acquired)
     }
 
     /// Feature 011 (Part A) — measure, without committing, the realized value of liquidating
@@ -1332,14 +1454,17 @@ where
                     .downcast_ref::<EVMState>()
                     .unwrap()
                     .clone();
-                match token_ctx.buy(
-                    input.get_txn_value().unwrap(),
-                    input.get_caller(),
-                    state,
-                    self,
-                    input.get_randomness().as_slice(),
-                ) {
-                    Some(()) => ExecutionResult {
+                let txn_value = input.get_txn_value().unwrap();
+                let caller = input.get_caller();
+                let _ = &token_ctx; // System 1 retired: buy() no longer used (Phase 2)
+                // One controlled loop: acquire through the SAME fork engine that
+                // liquidation uses, so both legs of the round-trip price through one
+                // on-chain source (closes the buy-on-one-system / sell-on-another
+                // asymmetry — the phantom-ETH root cause). Engine-only: no in-process
+                // Uniswap-sim fallback.
+                let acquired = self.acquire_via_engine(caller, token, txn_value, state).is_some();
+                if acquired {
+                    ExecutionResult {
                         output: vec![],
                         reverted: false,
                         new_state: StagedVMState::new_with_state(
@@ -1349,9 +1474,10 @@ where
                                 .clone(),
                         ),
                         additional_info: None,
-                    },
-                    None => ExecutionResult {
-                        // we don't have enough liquidity to buy the token
+                    }
+                } else {
+                    // neither the fork acquisition engine nor the Uniswap fallback had a route
+                    ExecutionResult {
                         output: vec![],
                         reverted: true,
                         new_state: StagedVMState::new_with_state(
@@ -1361,7 +1487,7 @@ where
                                 .clone(),
                         ),
                         additional_info: None,
-                    },
+                    }
                 }
             }
             EVMInputTy::Liquidate => {

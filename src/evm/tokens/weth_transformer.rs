@@ -73,9 +73,12 @@ impl PairContext for WethContext {
                 .insert(self.weth_address);
         }
 
-        // todo: fix real balance
-        vm.host.evmstate.balance.insert(self.weth_address, EVMU256::MAX);
-
+        // WETH's own ETH balance is never consumed by this transform — the buy leg
+        // wraps via call_value (debited from the caller, not WETH) and the sell leg does
+        // transfer(dead, amount) (a token move, no ETH withdrawal). The previous
+        // `balance.insert(weth, MAX)` "fix real balance" hack just falsified the
+        // simulated state; removed so the OnChain middleware supplies WETH's real
+        // (fully-backed) balance on demand.
         let addr = self.weth_address;
         let code = get_code_tokens!(addr, vm, state);
         let calldata = if reverse { Bytes::from(vec![]) } else { withdraw_bytes(amount) };

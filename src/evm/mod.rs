@@ -185,6 +185,20 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     impact_eth_gradient: bool,
 
+    /// Disable the topology auto-layer: no TopologyHints mutation bias ("Gamma Ray")
+    /// and no topology-driven oracle auto-activation. For a truly bare/unbiased
+    /// baseline to isolate detector behaviour and per-component performance.
+    #[arg(long, default_value = "false")]
+    no_topology: bool,
+
+    /// Topology mutator-bias strength in [0.0, 1.0]. Scales how hard topology confidence
+    /// steers the mutator (campaign spawn rate + power scheduling): multiplier = 1 +
+    /// (conf/100) * bias. 1.0 = full floodlight (legacy), 0.3 = nudge (default), 0.0 =
+    /// topology intelligence + oracle gap-filling stay ON but the mutator runs unbiased.
+    /// Distinct from --no-topology (which turns the whole layer off).
+    #[arg(long, default_value = "0.3")]
+    topology_bias: f64,
+
     /// Enable the economic outcome detection subsystem.
     ///
     /// Despite the legacy `--flashloan` name, this flag controls the entire
@@ -196,7 +210,7 @@ pub struct EvmArgs {
     /// the entire balance-based outcome detection is dormant regardless of any
     /// `-d` selection. Default-on in this fork; pass `--flashloan=false` to
     /// disable. Long-form alias `--economic-oracle` is preferred for new scripts.
-    #[arg(short, long, alias = "economic-oracle", default_value = "true")]
+    #[arg(short, long, alias = "economic-oracle", default_value = "false")]
     flashloan: bool,
 
     /// Panic when a typed_bug() is called (Default: false)
@@ -234,7 +248,7 @@ pub struct EvmArgs {
 
     /// Whether bypass all SHA3 comparisons, this may break original logic of
     /// contracts  (Experimental)
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "false")]
     sha3_bypass: bool,
 
     /// Enable Value Capture Middleware (Phase 1)
@@ -254,6 +268,16 @@ pub struct EvmArgs {
     /// between prime and exploit steps to detect cross-round state divergence.
     #[arg(long, default_value = "false")]
     temporal_skimming: bool,
+
+    /// Bounty/production profile: enable the full attacker-REACH set as a unit —
+    /// flashloan (economic capital: borrow → acquire → liquidate + fund-loss accounting),
+    /// value-capture, campaign-orchestrator, ghost-identities, temporal-skimming. Three
+    /// clean tiers: `-d` = what we DETECT, `--bounty` = how far the attacker REACHES,
+    /// `--concolic` = how hard we SOLVE (kept separate/opt-in — heaviest, a search
+    /// strategy, not reach). Individual flags still work and are OR'd with this. NOTE
+    /// heavy: the full reach set is memory-intensive and can MEM_ABORT a ~3.5GB box.
+    #[arg(long, default_value = "false")]
+    bounty: bool,
 
     /// Only fuzz contracts with the addresses provided, separated by comma
     #[arg(long, default_value = "")]
@@ -827,9 +851,11 @@ pub fn evm_main(mut args: EvmArgs) {
             }
         },
         impact_eth_gradient: args.impact_eth_gradient,
+        no_topology: args.no_topology,
+        topology_bias: args.topology_bias,
         oracle: oracles,
         producers,
-        flashloan: args.flashloan,
+        flashloan: args.flashloan || args.bounty,
         onchain_storage_fetching: if is_onchain {
             Some(
                 StorageFetchingMode::from_str(args.onchain_storage_fetching.as_str())
@@ -866,10 +892,10 @@ pub fn evm_main(mut args: EvmArgs) {
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
-        value_capture: args.value_capture,
-        campaign_orchestrator: args.campaign_orchestrator,
-        ghost_identities: args.ghost_identities,
-        temporal_skimming: args.temporal_skimming,
+        value_capture: args.value_capture || args.bounty,
+        campaign_orchestrator: args.campaign_orchestrator || args.bounty,
+        ghost_identities: args.ghost_identities || args.bounty,
+        temporal_skimming: args.temporal_skimming || args.bounty,
         etherscan_api_key,
     };
 
@@ -1028,9 +1054,11 @@ fn test_evm_offchain_setup() {
             }
         },
         impact_eth_gradient: args.impact_eth_gradient,
+        no_topology: args.no_topology,
+        topology_bias: args.topology_bias,
         oracle: oracles,
         producers,
-        flashloan: args.flashloan,
+        flashloan: args.flashloan || args.bounty,
         onchain_storage_fetching: None,
         replay_file: args.replay_file,
         flashloan_oracle,
@@ -1060,10 +1088,10 @@ fn test_evm_offchain_setup() {
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
         load_corpus: args.load_corpus,
-        value_capture: args.value_capture,
-        campaign_orchestrator: args.campaign_orchestrator,
-        ghost_identities: args.ghost_identities,
-        temporal_skimming: args.temporal_skimming,
+        value_capture: args.value_capture || args.bounty,
+        campaign_orchestrator: args.campaign_orchestrator || args.bounty,
+        ghost_identities: args.ghost_identities || args.bounty,
+        temporal_skimming: args.temporal_skimming || args.bounty,
         etherscan_api_key: String::from(""),
     };
 

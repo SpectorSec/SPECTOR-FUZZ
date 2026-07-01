@@ -373,6 +373,12 @@ pub struct TopologyHints {
     /// Each entry: (flat selector list, confidence 0-100).
     /// Flat because `[u8; 4]` doesn't impl Serialize cleanly as nested vec.
     pub sets: Vec<HintSet>,
+    /// Mutator-bias strength in [0.0, 1.0] (from `--topology-bias`). Scales how much
+    /// topology confidence steers the mutator: `multiplier = 1 + (conf/100) * bias`.
+    /// 1.0 = full floodlight (legacy), 0.3 = nudge (default), 0.0 = topology stays on
+    /// for intelligence + oracle gap-filling but the mutator runs unbiased.
+    #[serde(default)]
+    pub bias: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +401,7 @@ impl TopologyHints {
     pub fn from_report_and_abi(
         report: &TopologyReport,
         address_to_abi: &HashMap<EVMAddress, Vec<ABIConfig>>,
+        bias: f64,
     ) -> Self {
         // Build family → selectors from already-loaded ABIs using the same
         // classify_selector logic that produced the topology report.
@@ -428,7 +435,7 @@ impl TopologyHints {
             })
             .collect();
 
-        TopologyHints { sets }
+        TopologyHints { sets, bias }
     }
 
     /// Returns the highest confidence hint set that contains `selector`,

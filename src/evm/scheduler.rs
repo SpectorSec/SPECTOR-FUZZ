@@ -419,7 +419,8 @@ where
                             Ok(meta) => meta.topology_hits,
                             Err(_) => 0,
                         };
-                        let base_boost = 1.0 + (confidence as f64 / 100.0);
+                        // --topology-bias scales the confidence steer (floodlight→nudge→off).
+                        let base_boost = 1.0 + (confidence as f64 / 100.0) * hints.bias;
                         let decay = 0.95_f64.powi(hits as i32);
                         let effective_boost = 1.0 + (base_boost - 1.0) * decay;
                         power *= effective_boost;

@@ -648,8 +648,9 @@ where
         if self.campaign_orchestrator {
             let campaign_threshold = if let Some(hints) = state.metadata_map().get::<TopologyHints>() {
                 let max_conf = hints.sets.iter().map(|s| s.confidence).max().unwrap_or(0) as f64;
-                // Scale: 10% base * (1 + confidence/100), e.g., 95% conf -> ~19.5%
-                ((CAMPAIGN_CHOICE as f64) * (1.0 + max_conf / 100.0)).min(MUTATOR_SAMPLE_MAX as f64) as u64
+                // Scale: base * (1 + (confidence/100) * bias). bias (--topology-bias) dials
+                // the steer from floodlight (1.0) to nudge (0.3 default) to off (0.0).
+                ((CAMPAIGN_CHOICE as f64) * (1.0 + (max_conf / 100.0) * hints.bias)).min(MUTATOR_SAMPLE_MAX as f64) as u64
             } else {
                 CAMPAIGN_CHOICE
             };

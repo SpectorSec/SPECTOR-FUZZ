@@ -90,135 +90,36 @@ impl
             let liquidation_percent = EVMU256::from(liquidation_percent);
             let mut liquidations_earned = Vec::new();
 
+            // Whole-campaign baseline (FlashloanData::initial_token_holdings): the
+            // attacker's token balances before the sequence began. Only the NET gain
+            // (post - initial) is real loot; liquidating the full balance would count
+            // pre-existing/seeded holdings as phantom profit.
+            let initial_holdings = ctx
+                .fuzz_state
+                .get_execution_result()
+                .new_state
+                .state
+                .flashloan_data
+                .initial_token_holdings
+                .clone();
+
             for ((caller, token), new_balance) in self.erc20_producer.deref().borrow().balances.iter() {
                 if *new_balance > EVMU256::ZERO {
-                    let mut has_token = self.known_tokens.borrow().contains_key(token);
-                    if !has_token {
-                        let flashloan_mid_opt = ctx.executor.deref().borrow().host.flashloan_middleware.clone();
-                        if let Some(flashloan_mid) = flashloan_mid_opt {
-                            let mut mid = flashloan_mid.borrow_mut();
-                            if let Some(token_ctx) = mid.get_token_context(*token) {
-                                let can_liquidate = !token_ctx.swaps.is_empty();
-                                unsafe {
-                                    CAN_LIQUIDATE |= can_liquidate;
-                                }
-                                self.known_tokens.borrow_mut().insert(*token, token_ctx);
-                                has_token = true;
-                            } else {
-                                // Try to find a local pair that swaps *token
-                                let mut found_pair = None;
-                                let mut other_token = EVMAddress::default();
-                                
-                                for pair in mid.pair_address.iter() {
-                                    let calls = vec![
-                                        (*pair, Bytes::from(vec![0x0d, 0xfe, 0xa0, 0x05])), // token0()
-                                        (*pair, Bytes::from(vec![0xd2, 0x12, 0x20, 0xa7])), // token1()
-                                    ];
-                                    
-                                    let results = ctx.executor.borrow_mut().fast_static_call(
-                                        &calls,
-                                        &ctx.post_state,
-                                        ctx.fuzz_state
-                                    );
-                                    
-                                    if results.len() == 2 && results[0].len() >= 32 && results[1].len() >= 32 {
-                                        let t0 = EVMAddress::from_slice(&results[0][12..32]);
-                                        let t1 = EVMAddress::from_slice(&results[1][12..32]);
-                                        
-                                        if t0 == *token {
-                                            found_pair = Some(*pair);
-                                            other_token = t1;
-                                            break;
-                                        } else if t1 == *token {
-                                            found_pair = Some(*pair);
-                                            other_token = t0;
-                                            break;
-                                        }
-                                    }
-                                }
-                                
-                                if let Some(pair_addr) = found_pair {
-                                    let weth_addr = mid.chain_cfg.as_ref()
-                                        .map(|c| c.get_weth())
-                                        .and_then(|w| EVMAddress::from_str(w.as_str()).ok())
-                                        .unwrap_or_else(|| EVMAddress::from_str("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap());
-                                        
-                                    let has_route_out = other_token == weth_addr || self.known_tokens.borrow().contains_key(&other_token);
-                                    
-                                    if has_route_out {
-                                        let side = if *token < other_token { 0 } else { 1 };
-                                        
-                                        let mut initial_reserves = (EVMU256::ZERO, EVMU256::ZERO);
-                                        let reserves_call = vec![
-                                            (pair_addr, Bytes::from(vec![0x09, 0x02, 0xf1, 0xac])), // getReserves()
-                                        ];
-                                        let reserves_res = ctx.executor.borrow_mut().fast_static_call(
-                                            &reserves_call,
-                                            &ctx.post_state,
-                                            ctx.fuzz_state
-                                        );
-                                        if !reserves_res.is_empty() && reserves_res[0].len() >= 64 {
-                                            let r0 = EVMU256::try_from_be_slice(&reserves_res[0][0..32]).unwrap_or_default();
-                                            let r1 = EVMU256::try_from_be_slice(&reserves_res[0][32..64]).unwrap_or_default();
-                                            initial_reserves = (r0, r1);
-                                        }
-                                        
-                                        let pair_ctx = crate::evm::tokens::v2_transformer::UniswapPairContext {
-                                            pair_address: pair_addr,
-                                            in_token_address: *token,
-                                            next_hop: other_token,
-                                            side,
-                                            uniswap_info: std::sync::Arc::new(crate::evm::tokens::UniswapInfo {
-                                                pool_fee: 30,
-                                                router: None,
-                                            }),
-                                            initial_reserves,
-                                        };
-                                        
-                                        let route_step = crate::evm::tokens::PairContextTy::Uniswap(Rc::new(RefCell::new(pair_ctx)));
-                                        let mut route = vec![route_step];
-                                        
-                                        if other_token != weth_addr {
-                                            if let Some(out_ctx) = self.known_tokens.borrow().get(&other_token).cloned() {
-                                                if !out_ctx.swaps.is_empty() {
-                                                    route.extend(out_ctx.swaps[0].route.clone());
-                                                }
-                                            }
-                                        }
-                                        
-                                        let path_ctx = crate::evm::tokens::PathContext { route };
-                                        
-                                        let mut known = self.known_tokens.borrow_mut();
-                                        let token_ctx = known.entry(*token).or_insert_with(|| TokenContext {
-                                            swaps: vec![],
-                                            is_weth: *token == weth_addr,
-                                            weth_address: weth_addr,
-                                        });
-                                        
-                                        if !token_ctx.swaps.iter().any(|p| p.route.iter().any(|r| {
-                                            match r {
-                                                crate::evm::tokens::PairContextTy::Uniswap(c) => c.borrow().pair_address == pair_addr,
-                                                _ => false,
-                                            }
-                                        })) {
-                                            token_ctx.swaps.push(path_ctx);
-                                            unsafe {
-                                                CAN_LIQUIDATE = true;
-                                            }
-                                            println!("[DynamicRouter] Registered dynamic local route for {:?} -> {:?} via pair {:?}", token, other_token, pair_addr);
-                                        }
-                                        has_token = true;
-                                    }
-                                }
-                            }
-                        }
+                    // Engine-only liquidation: the deployed fork engine discovers the
+                    // route on-chain (ERC-4626/Aave/Compound/Lido/Curve/Uniswap V2/V3),
+                    // so no TokenContext / known_tokens gate is needed. Only the NET
+                    // gain over the whole-campaign baseline is real loot.
+                    let initial = initial_holdings
+                        .get(caller)
+                        .and_then(|m| m.get(token))
+                        .copied()
+                        .unwrap_or(EVMU256::ZERO);
+                    let gained = (*new_balance).saturating_sub(initial);
+                    if gained == EVMU256::ZERO {
+                        continue;
                     }
-                    if has_token {
-                        let known_tokens = self.known_tokens.borrow();
-                        let token_info = known_tokens.get(token).unwrap();
-                        let liq_amount = *new_balance * liquidation_percent / EVMU256::from(10);
-                        liquidations_earned.push((*caller, *token, token_info.clone(), liq_amount));
-                    }
+                    let liq_amount = gained * liquidation_percent / EVMU256::from(10);
+                    liquidations_earned.push((*caller, *token, liq_amount));
                 }
             }
 
@@ -228,30 +129,21 @@ impl
                 ctx.executor.deref().borrow_mut().host.evmstate = ctx.post_state.clone();
             }
             let mut failed = false;
-            for (caller, token_addr, _token_info, _amount) in liquidations_earned {
+            for (caller, token_addr, amount) in liquidations_earned {
                 let backup = ctx.executor.deref().borrow_mut().host.evmstate.clone();
-                // Primary: deployed multi-route engine (ERC-4626/Compound/Aave/Lido/Curve/
-                // Uniswap V2/V3). Forwards realized ETH to the attacker so earned/owed counts
-                // it — this is what lets vault-share / receipt loot be valued, not just
-                // Uniswap-liquid tokens.
+                // One loop: liquidate through the SAME deployed fork engine that
+                // acquisition uses. It discovers the route on-chain (ERC-4626/Compound/
+                // Aave/Lido/Curve/Uniswap V2/V3) and forwards realized ETH to the attacker
+                // so earned/owed counts it. None = illiquid → revert this leg. No
+                // in-process Uniswap-sim (System 1) fallback — both legs price through
+                // the same on-chain source, so the round-trip is a closed loop.
                 let via_engine = ctx
                     .executor
                     .deref()
                     .borrow_mut()
-                    .liquidate_via_engine(caller, token_addr, _amount, ctx.fuzz_state)
+                    .liquidate_via_engine(caller, token_addr, amount, ctx.fuzz_state)
                     .is_some();
-                if !via_engine
-                    && _token_info
-                        .sell(
-                            _amount,
-                            caller,
-                            ctx.fuzz_state,
-                            &mut *ctx.executor.deref().borrow_mut(),
-                            ctx.input.get_randomness().as_slice(),
-                        )
-                        .is_none()
-                {
-                    // Neither the engine nor the Uniswap fallback could liquidate — revert.
+                if !via_engine {
                     ctx.executor.deref().borrow_mut().host.evmstate = backup;
                     continue;
                 }

@@ -16,47 +16,48 @@ use crate::{
     state::HasExecutionResult,
 };
 
-/// Detects fee-on-transfer tokens: an account's real balance change is less
-/// than the NET amount its Transfer events say it should have received.
+/// Detects fee-on-transfer tokens: for a SINGLE `transfer`/`transferFrom` CALL, the
+/// recipient's real balance increased by less than the amount claimed in the calldata.
 ///
-/// Measured net-to-net (mirrors `rebasing.rs`): for each (token, account) we sum
-/// ALL inflow events minus ALL outflow events into `expected`, and compare against
-/// the actual whole-execution balance delta. The previous version compared a SINGLE
-/// transfer's value against the whole-execution delta — which false-positived on any
-/// trace where the recipient also moved the token elsewhere (it invented a phantom
-/// "fee" out of an unrelated outflow; e.g. a 15,562 USDC transfer + a 60 USDC outflow
-/// looked like a 60 USDC "fee" on fee-less USDC). See `fee_shortfall`.
+/// The measurement is performed inline by `FeeOnTransferDetector` (a middleware), which
+/// brackets each transfer's call frame — snapshotting the recipient's balance slot at
+/// the CALL opcode and re-reading it at the matching return — and records
+/// `(token, recipient, claimed, actual)` into `EVMState::fee_observations`. This oracle
+/// only judges that evidence via `fee_shortfall`.
+///
+/// The previous implementations diffed balances over the WHOLE transaction (first a
+/// single transfer vs whole-tx delta, then net-inflow vs whole-tx delta). Both could not
+/// distinguish a transit/pass-through recipient (received then forwarded in a *later*
+/// call, netting ~0) from a 100%-fee token, and manufactured phantom fees on fee-less
+/// tokens like USDC (e.g. the 15,562 USDC Yearn-fork false positive). A per-frame
+/// measurement is structurally immune to that: forwarding is a separate call.
 pub struct FeeOnTransferOracle {
     pub address_to_name: HashMap<EVMAddress, String>,
-    /// balanceOf(address) selector
-    balance_of_sel: Vec<u8>,
 }
 
 impl FeeOnTransferOracle {
     pub fn new(address_to_name: HashMap<EVMAddress, String>) -> Self {
-        Self {
-            address_to_name,
-            balance_of_sel: hex::decode("70a08231").unwrap(),
-        }
-    }
-
-    fn balance_calldata(&self, addr: &EVMAddress) -> Bytes {
-        let mut data = self.balance_of_sel.clone();
-        data.extend_from_slice(&[0u8; 12]); // left-pad address to 32 bytes
-        data.extend_from_slice(addr.as_slice());
-        Bytes::from(data)
+        Self { address_to_name }
     }
 }
 
-/// Decide whether a recipient's balance shortfall is a real transfer fee.
+/// Decide whether a single transfer's balance shortfall is a real transfer fee.
 ///
-/// `expected` = net inflow from Transfer events (sum of inflows − outflows for that
-/// account); `actual` = the real balance delta. A fee-on-transfer token delivers
-/// strictly less than the net inflow. Returns `Some(fee)` only when the shortfall
-/// exceeds a rounding tolerance of 1 basis point (0.01%) of `expected` — integer
-/// division dust is not a fee, and real FoT tokens charge whole percents.
+/// `expected` = the amount claimed in the transfer's calldata; `actual` = the recipient's
+/// real per-frame balance delta. A fee-on-transfer token delivers strictly less than the
+/// claimed amount. Returns `Some(fee)` only when the shortfall exceeds a rounding
+/// tolerance of 1 basis point (0.01%) of `expected` — integer division dust is not a fee,
+/// and real FoT tokens charge whole percents.
 fn fee_shortfall(expected: EVMU256, actual: EVMU256) -> Option<EVMU256> {
     if expected == EVMU256::ZERO || actual >= expected {
+        return None;
+    }
+    // Zero-delta guard: even with per-frame inline measurement, a transfer whose
+    // recipient netted ZERO within the call frame is not a credible fee victim — the
+    // common cause is a self-transfer (from == to, balance unchanged) or a recipient
+    // that received and re-sent inside the same frame. The only thing this rejects is
+    // the pathological 100%-fee honeypot (effectively nonexistent), so require actual > 0.
+    if actual == EVMU256::ZERO {
         return None;
     }
     let fee = expected - actual;
@@ -103,57 +104,26 @@ impl
         >,
         _stage: u64,
     ) -> Vec<u64> {
-        let transfers = ctx.post_state.erc20_transfers.clone();
-        if transfers.is_empty() {
+        // Inline per-transfer evidence recorded by FeeOnTransferDetector:
+        // (token, recipient, claimed, actual). Each tuple is one bracketed transfer
+        // call frame, so claimed-vs-actual is an apples-to-apples per-transfer fee.
+        let observations = ctx.post_state.fee_observations.clone();
+        if observations.is_empty() {
             return vec![];
         }
 
-        // Net flow per (token, account) from ALL Transfer events: how much the
-        // account SHOULD have gained if the token moves exact values. Comparing one
-        // transfer against the whole-execution balance delta (old logic) invented a
-        // phantom fee whenever the recipient also sent the token elsewhere — net-to-net
-        // (like rebasing.rs) is the correct measurement.
-        let mut inflow:  HashMap<(EVMAddress, EVMAddress), EVMU256> = HashMap::new();
-        let mut outflow: HashMap<(EVMAddress, EVMAddress), EVMU256> = HashMap::new();
-        let mut recipients: Vec<(EVMAddress, EVMAddress)> = Vec::new();
-        let mut seen = HashSet::new();
-        for (token, from, to, value) in &transfers {
-            *inflow.entry((*token, *to)).or_insert(EVMU256::ZERO) += *value;
-            *outflow.entry((*token, *from)).or_insert(EVMU256::ZERO) += *value;
-            if seen.insert((*token, *to)) {
-                recipients.push((*token, *to));
-            }
-        }
-
-        // One balanceOf query per net recipient, before and after the whole execution.
-        let queries: Vec<(EVMAddress, Bytes)> = recipients
-            .iter()
-            .map(|(token, to)| (*token, self.balance_calldata(to)))
-            .collect();
-
-        let pre_balances  = ctx.call_pre_batch(&queries);
-        let post_balances = ctx.call_post_batch(&queries);
-
         let mut res = vec![];
-        for (i, (token, to)) in recipients.iter().enumerate() {
-            // A failed/empty balanceOf static call (token code not loaded, or the call
-            // reverted — common under a runaway call tree / resource pressure) returns
-            // empty bytes, which parse as 0 and manufacture a phantom "fee=full amount"
-            // (actual=0). Unmeasurable is NOT a zero balance — skip this recipient.
-            if pre_balances[i].is_empty() || post_balances[i].is_empty() {
-                continue;
-            }
-            let pre  = EVMU256::try_from_be_slice(pre_balances[i].as_slice()).unwrap_or(EVMU256::ZERO);
-            let post = EVMU256::try_from_be_slice(post_balances[i].as_slice()).unwrap_or(EVMU256::ZERO);
-
-            let in_v  = inflow.get(&(*token, *to)).copied().unwrap_or(EVMU256::ZERO);
-            let out_v = outflow.get(&(*token, *to)).copied().unwrap_or(EVMU256::ZERO);
-            let expected = in_v.saturating_sub(out_v); // net the account should have gained
-            let actual   = post.saturating_sub(pre);   // net it actually gained
-
-            let Some(fee) = fee_shortfall(expected, actual) else {
+        let mut reported = HashSet::new();
+        for (token, to, claimed, actual) in &observations {
+            let Some(fee) = fee_shortfall(*claimed, *actual) else {
                 continue;
             };
+
+            // One report per (token, recipient) — a fee token charges on every transfer,
+            // so dedup to avoid flooding the corpus with the same finding.
+            if !reported.insert((*token, *to)) {
+                continue;
+            }
 
             let mut hasher = DefaultHasher::new();
             token.hash(&mut hasher);
@@ -170,8 +140,8 @@ impl
                 "Fee-on-Transfer".to_string(),
                 bug_idx,
                 format!(
-                    "Token {} to {:?}: net expected={} actual={} (fee={})",
-                    token_name, to, expected, actual, fee,
+                    "Token {} to {:?}: claimed={} actual={} (fee={})",
+                    token_name, to, claimed, actual, fee,
                 ),
                 ConciseEVMInput::from_input(ctx.input, ctx.fuzz_state.get_execution_result()),
                 None,
@@ -212,6 +182,15 @@ mod fee_on_transfer_tests {
         let expected = EVMU256::from(1_000_000_000_000_000_000u64);
         let actual   = expected - EVMU256::from(1u64);
         assert_eq!(fee_shortfall(expected, actual), None);
+    }
+
+    /// Transit/pass-through: recipient received tokens (expected>0) but netted ZERO
+    /// balance change (forwarded them) → NOT a fee victim. This is the 92% phantom
+    /// pattern observed on the Yearn fork (actual=0 with absurd "fees").
+    #[test]
+    fn transit_passthrough_is_not_a_fee() {
+        assert_eq!(fee_shortfall(EVMU256::from(31065089360u64), EVMU256::ZERO), None);
+        assert_eq!(fee_shortfall(EVMU256::from(5_132_510_927_991_555_994_808u128), EVMU256::ZERO), None);
     }
 
     /// Pure net receiver with full delivery → no fee; zero expected → no fee.

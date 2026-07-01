@@ -89,6 +89,10 @@ impl
                 })
                 .collect::<Vec<(EVMAddress, Bytes)>>();
             let post_balance_res = ctx.call_post_batch(&query_balance_batch);
+            // Pre-execution balances form the whole-campaign baseline. Captured
+            // insert-if-absent (first sighting of each caller/token) and persisted in
+            // flashloan_data, so the loot oracle liquidates only the NET gained amount.
+            let pre_balance_res = ctx.call_pre_batch(&query_balance_batch);
 
             let mut idx = 0;
 
@@ -98,6 +102,25 @@ impl
                     let post_balance = &post_balance_res[idx];
                     let new_balance = EVMU256::try_from_be_slice(post_balance.as_slice()).unwrap_or(EVMU256::ZERO);
                     self.balances.insert((*caller, token), new_balance);
+
+                    // Record the baseline only when the pre-call actually measured a
+                    // balance (non-empty). An empty/failed call is unmeasurable — NOT a
+                    // zero baseline — so we skip and let a later successful step capture
+                    // it, rather than poisoning the baseline with a phantom zero.
+                    let pre_balance = &pre_balance_res[idx];
+                    if !pre_balance.is_empty() {
+                        let pre = EVMU256::try_from_be_slice(pre_balance.as_slice()).unwrap_or(EVMU256::ZERO);
+                        ctx.fuzz_state
+                            .get_execution_result_mut()
+                            .new_state
+                            .state
+                            .flashloan_data
+                            .initial_token_holdings
+                            .entry(*caller)
+                            .or_default()
+                            .entry(token)
+                            .or_insert(pre);
+                    }
                     idx += 1;
                 }
             }

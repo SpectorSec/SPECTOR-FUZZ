@@ -1380,28 +1380,49 @@ impl OnChainConfig {
     /// Deploy a contract via eth_sendTransaction on the fork and return its address.
     /// Uses anvil's built-in account management (no private key needed).
     fn deploy_via_send_tx(&mut self, init_data: &str, from: &str, label: &str) -> Option<EVMAddress> {
+        // Historical forks have lower block gas limits than modern mainnet (~12.5M in
+        // early 2021, ~8M in 2019, vs 30M today). A hardcoded 16M deploy gas is rejected
+        // with "intrinsic gas too high" on any such block → the engines never deploy and
+        // the whole acquire/liquidate loop silently dies. Cap deploy gas to 90% of the
+        // fork block's ACTUAL gas limit (the engine needs only ~3-4M to deploy anyway).
+        let block_gas_limit = self
+            ._request("eth_getBlockByNumber".to_string(), r#"["latest", false]"#.to_string())
+            .and_then(|b| b.get("gasLimit").and_then(|g| g.as_str()).map(String::from))
+            .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(16_000_000);
+        let deploy_gas = (block_gas_limit - block_gas_limit / 10).min(16_000_000);
         let tx_params = format!(
-            r#"{{"from":"{}","data":"{}","gas":"0xF42400"}}"#,
-            from, init_data
+            r#"{{"from":"{}","data":"{}","gas":"0x{:x}"}}"#,
+            from, init_data, deploy_gas
         );
         let tx_hash = self._request("eth_sendTransaction".to_string(), format!("[{}]", tx_params))?
             .as_str()?.to_string();
 
-        // Poll for receipt — anvil may need a moment to mine even with automine.
-        let receipt_params = format!(r#"["{}"]"#, tx_hash);
-        let _ = receipt_params; // silence unused
-        let contract_addr = loop {
+        // Poll for receipt — anvil may need a moment to mine even with automine. Bounded
+        // so a reverted deploy (receipt present, contractAddress = null) returns None
+        // instead of spinning forever.
+        let mut contract_addr = String::new();
+        for _ in 0..40 {
             if let Some(Value::Object(obj)) = self._request(
                 "eth_getTransactionReceipt".to_string(), format!(r#"["{}"]"#, tx_hash)
             ) {
                 if let Some(addr) = obj.get("contractAddress").and_then(|v| v.as_str()) {
                     if !addr.is_empty() && addr != "0x" {
-                        break addr.to_string();
+                        contract_addr = addr.to_string();
+                        break;
                     }
+                }
+                // Receipt exists but no contractAddress → deploy reverted; stop polling.
+                if obj.get("status").and_then(|v| v.as_str()) == Some("0x0") {
+                    break;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-        };
+        }
+        if contract_addr.is_empty() {
+            tracing::warn!("[{}] deploy failed (no contractAddress / reverted) — engine unavailable", label);
+            return None;
+        }
 
         let addr = EVMAddress::from_str(&contract_addr).ok();
         // The engine is mined AFTER the pinned fork block, so get_contract_code (which

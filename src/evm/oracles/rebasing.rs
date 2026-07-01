@@ -159,12 +159,27 @@ impl
 
             let flow = *net_flow.get(&(*token, *addr)).unwrap_or(&0i128);
 
-            if balance_delta == flow {
+            // Genuine (and exploitable) rebasing INCREASES a holder's balance beyond
+            // what Transfer events explain — tokens appear on the holder with no transfer
+            // (positive rebase / accrual), so a protocol caching balances under-counts.
+            // Fire ONLY when balance_delta > flow. The opposite case (balance_delta < flow)
+            // means the account was credited by events but its balance didn't rise to
+            // match — a TRANSIT / pass-through (e.g. a pool or vault forwarding tokens
+            // mid-swap) or a fee-on-transfer point, NOT a rebase. Flagging that is the
+            // transit-blindness false positive that also plagued the old fee_on_transfer
+            // oracle (on the Yearn fork the vault shows delta≪flow during engine swaps).
+            let surplus = balance_delta.saturating_sub(flow);
+            // Require the unexplained surplus to STRICTLY EXCEED a 1bp rounding tolerance
+            // of the event flow (min 1) — integer dust is not a rebase. `<=` (not `<`) so
+            // a surplus equal to the floor (e.g. delta −1 vs flow −2 → surplus 1, tol 1)
+            // is treated as dust, not a rebase.
+            let tolerance = (flow.abs() / 10_000).max(1);
+            if surplus <= tolerance {
                 continue;
             }
 
-            // The balance changed by a different amount than Transfer events
-            // account for — rebasing token behaviour.
+            // The balance grew MORE than Transfer events account for — rebasing token
+            // behaviour (unexplained holder inflation).
             let mut hasher = DefaultHasher::new();
             token.hash(&mut hasher);
             addr.hash(&mut hasher);
