@@ -72,6 +72,39 @@ pub struct CampaignTargetCache {
 
 impl_serdeany!(CampaignTargetCache);
 
+/// Feature 015 Phase 2 — per-step boundary offsets into the campaign's ordered
+/// `erc20_transfers` log, written by the campaign executor when `CampaignSequence.aposteriori`
+/// is set. `offsets[i]` is the length of the transfer log BEFORE step `i` executed, with a
+/// trailing entry for the total after the last step — so step `i`'s transfers are the slice
+/// `erc20_transfers[offsets[i]..offsets[i+1]]`. This is the ONLY new instrumentation the
+/// a-posteriori path needs: the atomic campaign's staged-state chaining already accumulates
+/// the transfer log in order across steps, so recording the offsets suffices to attribute an
+/// attacker-inflow delta to the belly call that produced it. `offsets.len() == steps.len()+1`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CampaignInflowBoundaries {
+    pub offsets: Vec<usize>,
+}
+
+impl_serdeany!(CampaignInflowBoundaries);
+
+/// Feature 015 Phase 2 — the ledger-moving belly call discovered a-posteriori. The feedback
+/// attributes per-step attacker inflow via `CampaignInflowBoundaries`, and records the single
+/// highest-inflow step here (one lever/frame — protects the 3.5GB ceiling against
+/// over-promotion). The mutator reads this and pins the matching campaign step into
+/// `CampaignSequence.promoted` so Locate+Amplify (the ledger-secant) tunes it. Keyed by
+/// `(contract, selector)` so the pin re-fires whenever that call recurs in a freshly sampled
+/// campaign, despite clone-per-iteration corpus semantics. `best_inflow` is a high-water mark:
+/// only a strictly larger delta replaces the incumbent candidate.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PromotionCandidate {
+    pub contract: EVMAddress,
+    pub selector: [u8; 4],
+    pub best_inflow: u128,
+    pub set: bool,
+}
+
+impl_serdeany!(PromotionCandidate);
+
 impl CampaignTargetCache {
     /// Build the cache from the ABI registry by scanning for known selector patterns.
     /// Delegates with no preset selectors → hardcoded PRIME/EXPLOIT fallback.
@@ -213,6 +246,12 @@ pub fn plan_campaign_sampled<R: Rand>(
             steps.push(lever);
         }
     }
+    // Feature 015 Phase 2 (a-posteriori Promote): on the reflexive path, if NO a-priori
+    // lever matched (the target exposes no registered reflexive primitive), arm the
+    // executor to record per-step attacker-inflow boundaries so the feedback can discover
+    // the ledger-moving belly call at runtime. One lever/frame: only arm when `promoted`
+    // is still empty. Off the reflexive path this stays `false` ⇒ no executor overhead.
+    let aposteriori = reflexive_lever && promoted.is_empty();
     if let Some((addr, abi)) = exploit_step {
         steps.push(build_abi_step(addr, abi));
     }
@@ -236,7 +275,7 @@ pub fn plan_campaign_sampled<R: Rand>(
         warps.push((exploit_idx, 10));
     }
 
-    Some(CampaignSequence { steps, linkages: Vec::new(), warps, promoted })
+    Some(CampaignSequence { steps, linkages: Vec::new(), warps, promoted, aposteriori })
 }
 
 /// Pick prime and exploit target addresses, using topology intelligence
@@ -704,6 +743,62 @@ mod tests {
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no promotion when reflexive_lever is off");
         assert_eq!(campaign.steps.len(), 2, "plain prime→exploit frame, lever untouched");
+    }
+
+    // ── Feature 015 Phase 2 (T10) — a-posteriori arming ──
+
+    /// On a target with NO registered reflexive archetype (no `add_liquidity`/imbalance in the
+    /// vocabulary), the reflexive path arms the executor's per-step inflow snapshot instead of
+    /// promoting a-priori: `aposteriori == true`, `promoted` empty. This is the generalization
+    /// trigger — "no archetype fired, so go discover the lever at runtime".
+    #[test]
+    fn test_aposteriori_armed_when_no_archetype() {
+        let mut map = HashMap::new();
+        // Prime + exploit only — deliberately NO Curve pool / reflexive selector present.
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+        assert!(cache.reflexive_targets.is_empty(), "fixture has no reflexive archetype");
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert!(campaign.promoted.is_empty(), "no a-priori lever to promote");
+        assert!(campaign.aposteriori, "reflexive path with no archetype must arm a-posteriori");
+    }
+
+    /// When an a-priori archetype DOES fire, a-posteriori stays disarmed (the lever is already
+    /// in the frame; one lever/frame). `promoted` populated ⇒ `aposteriori == false`.
+    #[test]
+    fn test_aposteriori_disarmed_when_apriori_fires() {
+        let mut map = HashMap::new();
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x0c; 20]), vec![make_abi(SEL_ADD_LIQUIDITY)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert_eq!(campaign.promoted.len(), 1, "a-priori lever promoted");
+        assert!(!campaign.aposteriori, "a-priori match ⇒ a-posteriori disarmed");
+    }
+
+    /// Off the reflexive path, a-posteriori is never armed (zero executor overhead).
+    #[test]
+    fn test_aposteriori_off_when_flag_off() {
+        let mut map = HashMap::new();
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, false, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert!(!campaign.aposteriori, "flag off ⇒ never armed");
     }
 }
 

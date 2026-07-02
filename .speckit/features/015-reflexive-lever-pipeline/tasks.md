@@ -1,6 +1,6 @@
 # Tasks — Feature 015 — Reflexive Lever Pipeline (Promote → Locate → Amplify)
 
-**Status:** In Progress — PHASE 1 CODE-COMPLETE (T1–T9 ✅, all unit tests green). Live yDAI-fork validation (9b/9c) is the user's Lane-A step. Phase 2 (T10) not started.
+**Status:** In Progress — PHASE 1 CODE-COMPLETE (T1–T9 ✅) + PHASE 2/T10 CODE-COMPLETE (a-posteriori promote ✅), all unit tests green. Live yDAI-fork validation (9b/9c) + live novel-target discovery are the user's Lane-A steps.
 **Last updated:** 2026-07-02
 **Decisions locked:** CLI deps = auto-enable+warn (A); Amplify objective = raw-inflow secant / net-ETH selector (A).
 
@@ -158,3 +158,32 @@ Threshold + one-lever-per-frame bound to protect the 3.5GB ceiling (Risk: over-p
 **Done when:** On a target with no registered archetype, a ledger-moving belly call is
 promoted and then amplified; bounded to one lever/frame.
 **Blocks:** none (generalization path; independently shippable after Phase 1)
+
+### T10 — BUILD LOG (2026-07-02): CODE-COMPLETE, compiles clean, unit tests green.
+Architecture pivot from the literal spec (documented deviation, cleaner + gate-respecting):
+the atomic campaign's staged-state chaining accumulates ONE ordered `erc20_transfers` log
+across all steps (vm.rs replaces evmstate from the input's staged state each `execute()`, and
+the executor chains `new_state` forward). So per-step attribution needs no opcode-level
+`get_next_call` hook and no `flashloan.rs` change — just the log offset at each step boundary.
+- **`CampaignSequence.aposteriori: bool`** (`#[serde(default)]`, input.rs). Planner sets it in
+  `plan_campaign_sampled` ONLY when `reflexive_lever && promoted.is_empty()` (reflexive path,
+  no a-priori archetype). Off-path false ⇒ executor does one bool check, no work.
+- **Executor (executor.rs)**: when `campaign.aposteriori`, push `erc20_transfers.len()` at each
+  step boundary into new metadata `CampaignInflowBoundaries { offsets }` (len == steps+1). This
+  is the ONLY new instrumentation.
+- **feedbacks.rs**: `record_aposteriori_candidate` (gated on `reflexive_lever` + armed campaign)
+  attributes per-step attacker inflow via the boundary slices and records the single largest
+  mover (>`APOSTERIORI_MIN_INFLOW`=1e15, high-water) into `PromotionCandidate {contract,
+  selector, best_inflow, set}`. Pure core extracted to free fn `best_inflow_step` (unit-tested).
+- **mutator.rs**: `maybe_pin_aposteriori_lever` (before the AMPLIFY block) reads the candidate
+  and pins the matching `(contract, selector)` campaign step into `promoted` — then the existing
+  `apply_ledger_secant` (T8) Locates + Amplifies it, same mutate pass. One lever/frame.
+- **Metadata** `CampaignInflowBoundaries` + `PromotionCandidate` in campaign_planner.rs
+  (`impl_serdeany!`), re-exported from planner mod.
+- **Tests:** feedbacks — attribution picks largest / rejects dust / skips borrow+selectorless /
+  ignores non-attacker / rejects malformed offsets. planner — armed when no archetype /
+  disarmed when a-priori fires / off when flag off. `cargo check --bin` clean.
+- **Deviation from spec:** flashloan.rs untouched (no per-call hook needed — offsets suffice);
+  "get_next_call boundary" realized as the campaign STEP boundary (the fuzzer plays the belly as
+  chained single-call inputs; the atomic campaign is where they become an ordered log).
+- **NOT proven:** live discovery on a novel target (needs the Lane-A fork run, like 9b/9c).

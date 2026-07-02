@@ -65,6 +65,14 @@ pub struct CampaignSequence {
     /// `warps`, so pre-015 campaign JSON deserializes to an empty vec).
     #[serde(default)]
     pub promoted: Vec<usize>,
+    /// Feature 015 Phase 2 (a-posteriori Promote): set by the planner ONLY when
+    /// `--reflexive-lever` is on AND no a-priori archetype matched (`promoted` empty on a
+    /// target with no registered reflexive primitive). When set, the campaign executor
+    /// records per-step attacker-inflow boundary offsets (see `CampaignInflowBoundaries`)
+    /// so the feedback can discover WHICH belly call moved the ledger and promote it.
+    /// `false` by default (serde) ⇒ zero extra executor work off-path.
+    #[serde(default)]
+    pub aposteriori: bool,
 }
 
 /// EVM Input Types

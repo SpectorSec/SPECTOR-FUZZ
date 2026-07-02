@@ -16,10 +16,12 @@ use libafl::{
     Error,
 };
 use libafl_bolts::Named;
+use libafl::state::HasMetadata;
 
 use super::{input::EVMInput, types::EVMFuzzState};
 use crate::{
-    evm::{input::ConciseEVMInput, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
+    evm::{input::{ConciseEVMInput, EVMInputTy}, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
+    evm::planner::{CampaignInflowBoundaries, PromotionCandidate},
     generic_vm::vm_state::VMStateT,
     input::VMInputT,
     r#const::INFANT_STATE_INITIAL_VOTES,
@@ -255,6 +257,122 @@ impl<SC> TokenBalanceFeedback<SC> {
             reflexive_lever,
         }
     }
+
+    /// Feature 015 Phase 2 (a-posteriori Promote): attribute per-step attacker inflow across
+    /// an armed campaign and record the single largest ledger-moving belly call as a
+    /// `PromotionCandidate`. The atomic campaign accumulates one ordered `erc20_transfers` log;
+    /// the executor stamped step-boundary offsets (`CampaignInflowBoundaries`) so step `i`'s
+    /// transfers are the slice `[offsets[i]..offsets[i+1]]`. We keep only the highest-inflow
+    /// step above `APOSTERIORI_MIN_INFLOW` (one lever/frame — bounds over-promotion against the
+    /// 3.5GB ceiling), and only replace the incumbent on a strictly larger delta (high-water).
+    /// The mutator later pins the matching step into `promoted` for Locate+Amplify.
+    ///
+    /// Entirely gated: fires only when `reflexive_lever` is on and the campaign was armed
+    /// (`aposteriori && promoted.is_empty()`), so off-path it is a couple of cheap checks.
+    fn record_aposteriori_candidate(&self, state: &mut EVMFuzzState, input: &EVMInput) {
+        let Some(campaign) = &input.campaign else { return };
+        if !campaign.aposteriori || !campaign.promoted.is_empty() {
+            return;
+        }
+
+        // Snapshot transfers + revert flag, then drop the execution-result borrow so the
+        // metadata write below can take &mut state.
+        let (transfers, reverted) = {
+            let result = state.get_execution_result();
+            (
+                result.new_state.state.erc20_transfers.clone(),
+                result.reverted,
+            )
+        };
+        if reverted {
+            return;
+        }
+
+        // Boundary offsets recorded by the campaign executor (one per step + a trailing close).
+        let offsets = match state.metadata_map().get::<CampaignInflowBoundaries>() {
+            Some(b) if b.offsets.len() == campaign.steps.len() + 1 => b.offsets.clone(),
+            _ => return,
+        };
+
+        // Attribute per-step attacker inflow; keep the single largest mover above the floor.
+        let Some((idx, inflow)) = best_inflow_step(
+            &campaign.steps,
+            &transfers,
+            &offsets,
+            &self.attackers,
+            APOSTERIORI_MIN_INFLOW,
+        ) else {
+            return;
+        };
+        let step = &campaign.steps[idx];
+        let selector = step.data.as_ref().map(|d| d.function).unwrap_or_default();
+        let contract = step.contract;
+
+        // High-water: only a strictly larger delta unseats the incumbent candidate.
+        let incumbent = state
+            .metadata_map()
+            .get::<PromotionCandidate>()
+            .filter(|c| c.set)
+            .map(|c| c.best_inflow)
+            .unwrap_or(0);
+        if inflow > incumbent {
+            tracing::info!(
+                "[aposteriori-tel] promotion candidate: step={} contract={:?} selector=0x{} inflow={}",
+                idx, contract, hex::encode(selector), inflow
+            );
+            state.add_metadata(PromotionCandidate {
+                contract,
+                selector,
+                best_inflow: inflow,
+                set: true,
+            });
+        }
+    }
+}
+
+/// Feature 015 Phase 2 — dust floor for a-posteriori promotion: an attributed per-step
+/// attacker inflow must clear this to be a candidate (rejects rounding/refund noise). 1e15 raw
+/// units ≈ 0.001 of an 18-decimal token; below-decimal tokens (e.g. 6-dec USDC) clear it at
+/// ~1e9 human units, which is well past dust. A live-tuning parameter, deliberately generous.
+const APOSTERIORI_MIN_INFLOW: u128 = 1_000_000_000_000_000;
+
+/// Feature 015 Phase 2 — pure per-step attacker-inflow attribution. Given the campaign's
+/// ordered `erc20_transfers` log, the executor's boundary `offsets` (`len == steps.len()+1`,
+/// so step `i`'s transfers are `[offsets[i]..offsets[i+1]]`), the attacker set and a dust
+/// floor, return the `(step_index, inflow)` of the SINGLE largest ledger-moving belly call, or
+/// `None`. Borrow and selector-less steps are skipped (nothing to pin/tune). Extracted from
+/// `record_aposteriori_candidate` so the attribution is unit-testable without a live fork.
+fn best_inflow_step(
+    steps: &[ConciseEVMInput],
+    transfers: &[(EVMAddress, EVMAddress, EVMAddress, EVMU256)],
+    offsets: &[usize],
+    attackers: &HashSet<EVMAddress>,
+    min_inflow: u128,
+) -> Option<(usize, u128)> {
+    if offsets.len() != steps.len() + 1 {
+        return None;
+    }
+    let mut best: Option<(usize, u128)> = None;
+    for (i, step) in steps.iter().enumerate() {
+        if step.input_type == EVMInputTy::Borrow || step.data.is_none() {
+            continue;
+        }
+        let (lo, hi) = (offsets[i], offsets[i + 1]);
+        if hi <= lo || hi > transfers.len() {
+            continue;
+        }
+        let mut sum = EVMU256::ZERO;
+        for (_token, _from, to, value) in &transfers[lo..hi] {
+            if attackers.contains(to) && *value > EVMU256::ZERO {
+                sum = sum.saturating_add(*value);
+            }
+        }
+        let inflow = evmu256_to_u128_sat_fb(sum);
+        if inflow >= min_inflow && best.map_or(true, |(_, b)| inflow > b) {
+            best = Some((i, inflow));
+        }
+    }
+    best
 }
 
 /// Feature 011 (Part A) test seam: sum the realized-ETH value of a set of
@@ -344,6 +462,16 @@ where
             };
             publish_ledger_objective(obj);
         }
+
+        // Feature 015 Phase 2 (a-posteriori Promote): discover the ledger-moving belly call
+        // and record it as a promotion candidate. Self-gates on an armed campaign, so this is
+        // inert unless `--reflexive-lever` is on AND the planner found no a-priori archetype.
+        if self.reflexive_lever {
+            self.record_aposteriori_candidate(state, input);
+        }
+
+        // Re-borrow the execution result after the (possibly &mut) candidate write above.
+        let result = state.get_execution_result();
 
         if result.reverted {
             return Ok(false);
@@ -573,5 +701,96 @@ mod impact_011_tests {
         ); // big swap, ~0 net
         assert!(real > mirage, "real profit ({real}) must out-rank gross mirage ({mirage})");
         assert_eq!(mirage, EVMU512::ZERO);
+    }
+
+    // ── Feature 015 Phase 2 (T10) — a-posteriori per-step inflow attribution ──
+
+    use crate::evm::abi::{AEmpty, BoxedABI};
+    use crate::evm::input::{ConciseEVMInput, EVMInputTy};
+
+    /// A campaign step: `Borrow` (no data) or an `ABI` call carrying an (empty) BoxedABI so
+    /// `data.is_some()`. `best_inflow_step` only checks presence, not the selector bytes.
+    fn step(borrow: bool, with_data: bool) -> ConciseEVMInput {
+        ConciseEVMInput {
+            input_type: if borrow { EVMInputTy::Borrow } else { EVMInputTy::ABI },
+            data: if with_data { Some(BoxedABI::new(Box::new(AEmpty {}))) } else { None },
+            ..Default::default()
+        }
+    }
+
+    /// One erc20 transfer tuple `(token, from, to, value)`.
+    fn xfer(to: EVMAddress, v: u128) -> (EVMAddress, EVMAddress, EVMAddress, EVMU256) {
+        (addr(0xAA), addr(0xBB), to, EVMU256::from(v))
+    }
+
+    const E18: u128 = 1_000_000_000_000_000_000;
+
+    /// The single largest ledger-moving belly call is attributed to its step. Steps:
+    /// 0=borrow (skipped), 1=big inflow, 2=small inflow. Boundaries carve the ordered log.
+    #[test]
+    fn aposteriori_attributes_largest_step() {
+        let attacker = addr(1);
+        let attackers: HashSet<EVMAddress> = [attacker].into_iter().collect();
+        let steps = [step(true, false), step(false, true), step(false, true)];
+        // step1 = transfers[0..2] (8e18), step2 = transfers[2..3] (1e18); borrow slice empty.
+        let transfers = vec![
+            xfer(attacker, 5 * E18),
+            xfer(attacker, 3 * E18),
+            xfer(attacker, 1 * E18),
+        ];
+        let offsets = vec![0usize, 0, 2, 3]; // len == steps+1
+        let got = best_inflow_step(&steps, &transfers, &offsets, &attackers, APOSTERIORI_MIN_INFLOW);
+        assert_eq!(got, Some((1, 8 * E18)), "step 1 is the biggest ledger mover");
+    }
+
+    /// Dust below the floor produces no candidate (rejects rounding/refund noise).
+    #[test]
+    fn aposteriori_rejects_below_threshold() {
+        let attacker = addr(1);
+        let attackers: HashSet<EVMAddress> = [attacker].into_iter().collect();
+        let steps = [step(false, true), step(false, true)];
+        let transfers = vec![xfer(attacker, 1_000u128), xfer(attacker, 2_000u128)];
+        let offsets = vec![0usize, 1, 2];
+        let got = best_inflow_step(&steps, &transfers, &offsets, &attackers, APOSTERIORI_MIN_INFLOW);
+        assert_eq!(got, None, "sub-floor dust must not become a candidate");
+    }
+
+    /// Borrow steps and selector-less steps are skipped even with huge inflow in their slice
+    /// (a flashloan credit is not the lever). Only the real ABI call is attributed.
+    #[test]
+    fn aposteriori_skips_borrow_and_selectorless() {
+        let attacker = addr(1);
+        let attackers: HashSet<EVMAddress> = [attacker].into_iter().collect();
+        // 0=borrow (huge), 1=selector-less (huge), 2=real ABI (moderate).
+        let steps = [step(true, false), step(false, false), step(false, true)];
+        let transfers = vec![
+            xfer(attacker, 100 * E18), // borrow slice
+            xfer(attacker, 50 * E18),  // selector-less slice
+            xfer(attacker, 2 * E18),   // real ABI slice
+        ];
+        let offsets = vec![0usize, 1, 2, 3];
+        let got = best_inflow_step(&steps, &transfers, &offsets, &attackers, APOSTERIORI_MIN_INFLOW);
+        assert_eq!(got, Some((2, 2 * E18)), "only the tunable ABI step is a candidate");
+    }
+
+    /// Inflow to a non-attacker address is not the adversary's ledger → no candidate.
+    #[test]
+    fn aposteriori_ignores_non_attacker_inflow() {
+        let attackers: HashSet<EVMAddress> = [addr(1)].into_iter().collect();
+        let steps = [step(false, true)];
+        let transfers = vec![xfer(addr(9), 100 * E18)]; // to a stranger, not the attacker
+        let offsets = vec![0usize, 1];
+        let got = best_inflow_step(&steps, &transfers, &offsets, &attackers, APOSTERIORI_MIN_INFLOW);
+        assert_eq!(got, None, "non-attacker inflow is not promotable");
+    }
+
+    /// Malformed boundaries (`offsets.len() != steps.len()+1`) are rejected defensively.
+    #[test]
+    fn aposteriori_rejects_malformed_offsets() {
+        let attackers: HashSet<EVMAddress> = [addr(1)].into_iter().collect();
+        let steps = [step(false, true), step(false, true)];
+        let transfers = vec![xfer(addr(1), 100 * E18)];
+        let bad = vec![0usize, 1]; // len 2, needs 3
+        assert_eq!(best_inflow_step(&steps, &transfers, &bad, &attackers, 0), None);
     }
 }

@@ -1,5 +1,8 @@
 pub mod campaign_planner;
 pub mod campaign_executor;
 
-pub use campaign_planner::{plan_campaign, plan_campaign_sampled, CampaignTargetCache};
+pub use campaign_planner::{
+    plan_campaign, plan_campaign_sampled, CampaignInflowBoundaries, CampaignTargetCache,
+    PromotionCandidate,
+};
 pub use campaign_executor::execute_campaign;

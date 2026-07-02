@@ -156,6 +156,19 @@ where
                     let mut current_state: EVMStagedVMState = evm_input.sstate.clone();
                     let mut intermediate_states: Vec<EVMStagedVMState> = Vec::new();
 
+                    // Feature 015 Phase 2 (a-posteriori Promote): record the offset into the
+                    // campaign's ordered `erc20_transfers` log at each step boundary, so the
+                    // feedback can attribute an attacker-inflow delta to the belly call that
+                    // produced it. `offsets[i]` = log length BEFORE step `i`; a trailing entry
+                    // (after the last step) closes the final slice. Only armed when the planner
+                    // set `aposteriori` (reflexive path, no a-priori archetype) ⇒ off-path this
+                    // is one `bool` check and no allocation.
+                    let aposteriori = campaign.aposteriori;
+                    let mut inflow_offsets: Vec<usize> = Vec::new();
+                    if aposteriori {
+                        inflow_offsets.push(current_state.state.erc20_transfers.len());
+                    }
+
                     for (i, step_ci) in steps.iter().enumerate().take(steps.len() - 1) {
                         let (mut step_input, _) = step_ci.to_input(current_state.clone());
                         // Apply warp delta before execute, so vm.rs:598 picks up the warped env
@@ -176,6 +189,9 @@ where
                             let concrete_ref: &EVMStagedVMState = &*(generic_ref as *const StagedVMState<Loc, Addr, VS, CI> as *const EVMStagedVMState);
                             concrete_ref.clone()
                         };
+                        if aposteriori {
+                            inflow_offsets.push(current_state.state.erc20_transfers.len());
+                        }
                     }
 
                     let last_idx = steps.len() - 1;
@@ -254,6 +270,20 @@ where
                     state.add_metadata(CampaignWarpStates {
                         warps: campaign.warps.clone(),
                     });
+                    // Feature 015 Phase 2: close the final slice and publish the boundaries so
+                    // the feedback can attribute per-step attacker inflow. `offsets.len()` ends
+                    // up `steps.len() + 1`.
+                    if aposteriori {
+                        let final_len = unsafe {
+                            let generic_ref: &StagedVMState<Loc, Addr, VS, CI> = &state.get_execution_result().new_state;
+                            let concrete_ref: &EVMStagedVMState = &*(generic_ref as *const StagedVMState<Loc, Addr, VS, CI> as *const EVMStagedVMState);
+                            concrete_ref.state.erc20_transfers.len()
+                        };
+                        inflow_offsets.push(final_len);
+                        state.add_metadata(crate::evm::planner::CampaignInflowBoundaries {
+                            offsets: inflow_offsets,
+                        });
+                    }
                     return Ok(ExitKind::Ok);
                 }
             }

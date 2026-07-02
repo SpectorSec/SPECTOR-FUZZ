@@ -19,7 +19,7 @@ use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{CampaignSequence, EVMInputT, NestedAction};
 use crate::evm::oracles::{TrustedCallerMetadata, WhaleAddressMetadata};
-use crate::evm::planner::{plan_campaign_sampled, CampaignTargetCache};
+use crate::evm::planner::{plan_campaign_sampled, CampaignTargetCache, PromotionCandidate};
 use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
     evm::{
@@ -642,6 +642,46 @@ where
     /// the profit peak; when two consecutive local slopes bracket a `+→−` crossing, snap
     /// to the interpolated peak via `secant_step_signed`. NO concolic requeue: a flat
     /// ledger slope means "not the lever," never "hand to SMT."
+    /// Feature 015 Phase 2 (a-posteriori Promote) — pin the discovered ledger-moving belly
+    /// call. When a prior execution's feedback recorded a `PromotionCandidate` (the largest
+    /// per-step attacker-inflow belly call), and this input carries an armed campaign whose
+    /// matching `(contract, selector)` step is not yet pinned, mark that step index in
+    /// `promoted`. `apply_ledger_secant` (below, same mutate pass) then Locates + Amplifies it.
+    /// One lever/frame: pins exactly the single candidate step. Inert off the reflexive path.
+    fn maybe_pin_aposteriori_lever<I, S>(&self, input: &mut I, state: &mut S) -> bool
+    where
+        I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
+        S: HasMetadata + HasCorpus,
+    {
+        if !self.reflexive_lever {
+            return false;
+        }
+        // The candidate recorded by a prior execution's feedback (cross-iteration channel).
+        let (contract, selector) = {
+            let Some(cand) = state.metadata_map().get::<PromotionCandidate>() else {
+                return false;
+            };
+            if !cand.set {
+                return false;
+            }
+            (cand.contract, cand.selector)
+        };
+        // Pin the matching step in the current campaign, if any and not already pinned.
+        let Some(campaign) = input.get_campaign_mut() else { return false };
+        if !campaign.promoted.is_empty() {
+            return false;
+        }
+        let hit = campaign.steps.iter().position(|step| {
+            let sel = step.data.as_ref().map(|d| d.function).unwrap_or_default();
+            step.contract == contract && sel == selector
+        });
+        if let Some(idx) = hit {
+            campaign.promoted = vec![idx];
+            return true;
+        }
+        false
+    }
+
     fn apply_ledger_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
     where
         I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
@@ -939,6 +979,15 @@ where
         #[cfg(feature = "cmp")]
         if state.rand_mut().below(100) < 20 {
             if self.apply_calldata_secant(input, state) {
+                mutated = true;
+            }
+        }
+
+        // Feature 015 Phase 2 (a-posteriori Promote): pin the discovered ledger-moving belly
+        // call BEFORE the AMPLIFY step, so the secant can tune it in this same pass. Inert
+        // until the feedback has recorded a candidate on a novel (archetype-less) target.
+        if self.reflexive_lever {
+            if self.maybe_pin_aposteriori_lever(input, state) {
                 mutated = true;
             }
         }
@@ -1643,6 +1692,7 @@ mod tests {
             linkages: Vec::new(),
             warps: Vec::new(),
             promoted: Vec::new(),
+            aposteriori: false,
         };
         assert!(campaign.warps.is_empty());
         assert!(campaign.promoted.is_empty());
@@ -1662,6 +1712,7 @@ mod tests {
             linkages: Vec::new(),
             warps: vec![(2, 10)],
             promoted: vec![1, 3],
+            aposteriori: false,
         };
         let encoded = serde_json::to_string(&campaign).expect("serialize");
         let decoded: crate::evm::input::CampaignSequence =
