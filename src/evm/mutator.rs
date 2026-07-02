@@ -11,7 +11,7 @@ use libafl::{
 };
 use alloy_sol_types::SolCall;
 use foundry_cheatcodes::Vm;
-use libafl_bolts::{prelude::Rand, Named};
+use libafl_bolts::{prelude::{Rand, StdRand}, Named};
 use revm_interpreter::{interpreter_types::Jumps, Interpreter};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{CampaignSequence, EVMInputT, NestedAction};
 use crate::evm::oracles::{TrustedCallerMetadata, WhaleAddressMetadata};
-use crate::evm::planner::{plan_campaign_with_value_flow, CampaignTargetCache};
+use crate::evm::planner::{plan_campaign_sampled, CampaignTargetCache};
 use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
     evm::{
@@ -634,6 +634,11 @@ where
             if input.get_input_type() != Borrow {
                 match state.get_next_call() {
                     Some((addr, abi)) => {
+                        // Telemetry: which call from the preset sequence the fuzzer serves,
+                        // and where. Over a run this shows whether the exploit SHAPE engages
+                        // (selectors called in the seeded order) — the controlled-experiment
+                        // measurement of intelligence/data-flow alignment.
+                        tracing::info!("[preset-tel] served selector=0x{} target={:?}", hex::encode(abi.function), addr);
                         input.set_contract_and_abi(addr, Some(abi));
                         input.mutate(state);
                         return Ok(MutationResult::Mutated);
@@ -655,32 +660,35 @@ where
                 CAMPAIGN_CHOICE
             };
             if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
+                // Seed a local RNG from the fuzzer RNG so the planner can SAMPLE the
+                // candidate pool (get_next_call-style) instead of first()/first().
+                // Taken before the immutable metadata borrow below to avoid a
+                // simultaneous &mut state / &state conflict.
+                let mut plan_rand = StdRand::with_seed(state.rand_mut().next());
                 if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
                     let topology_report = state.metadata_map().get::<TopologyReport>();
-                    // Value-flow feedback: selectors the LIVE target was observed to return
-                    // a value from (value-capture "blood in the water"), parsed from
-                    // observed_values keys "{addr}_{selectorhex}_return". Drives adaptive,
-                    // in-the-now prime-step selection alongside the topology shape.
-                    let value_producing: std::collections::HashSet<[u8; 4]> = input
-                        .get_state()
-                        .as_any()
-                        .downcast_ref::<EVMState>()
-                        .map(|s| {
-                            s.observed_values
-                                .keys()
-                                .filter_map(|k| {
-                                    let sel_hex = k.strip_suffix("_return")?.rsplit('_').next()?;
-                                    if sel_hex.len() == 8 {
-                                        let bytes = hex::decode(sel_hex).ok()?;
-                                        <[u8; 4]>::try_from(bytes.as_slice()).ok()
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if let Some(campaign) = plan_campaign_with_value_flow(cache, topology_report, self.temporal_skimming, &value_producing) {
+                    // No per-selector value anchor: the planner samples structure and the
+                    // net-realized ledger (objective layer) selects economic survivors.
+                    // The removed anchor read observed_values (ABI-return words), which
+                    // misread approve's bool `true` as profit and skewed chains toward
+                    // approve→approve. Economic truth now lives solely at the ledger.
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, &mut plan_rand) {
+                        // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
+                        // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
+                        // deposit/withdraw) into a real sentence, or just isolated words? This
+                        // is the "builds the exploit vs speaks the vocabulary" measurement.
+                        let chain: Vec<String> = campaign
+                            .steps
+                            .iter()
+                            .map(|s| match s.input_type {
+                                crate::evm::input::EVMInputTy::Borrow => "borrow".to_string(),
+                                _ => match &s.data {
+                                    Some(d) => format!("0x{}", hex::encode(d.function)),
+                                    None => "?".to_string(),
+                                },
+                            })
+                            .collect();
+                        tracing::info!("[chain-tel] campaign: {}", chain.join(" -> "));
                         // Warp refinement is done by the campaign EXECUTOR via
                         // controlled probes (src/executor.rs) — clean, deterministic.
                         // The planner's base warp flows through unchanged here.

@@ -255,6 +255,11 @@ pub fn evm_fuzzer(
         instance_map.map.insert(*addr, abi.clone());
     });
 
+    // Matched-preset selectors → candidate-based campaign target discovery (below).
+    // Empty when no preset feature/match → campaign falls back to hardcoded selectors.
+    #[allow(unused_mut)]
+    let mut preset_chain_selectors: Vec<[u8; 4]> = Vec::new();
+
     #[cfg(feature = "use_presets")]
     {
         // Start with the baked-in DefiHacksPresets corpus — always loaded,
@@ -262,16 +267,23 @@ pub fn evm_fuzzer(
         // default-on in this fork (after Sha3Bypass and flashloan accounting).
         // The README's "80% of previous hacks" claim depends on these
         // templates being matched against the target's deployed contracts.
-        let mut exploit_templates = ExploitTemplate::baked_in();
-        info!("[presets] loaded {} baked-in exploit templates", exploit_templates.len());
+        // --preset-only isolates the preset language: use ONLY the --preset-file-path
+        // templates, skipping the baked-in corpus entirely, so the mutator's preset
+        // budget speaks one exploit's shape with zero dilution (controlled experiment).
+        let mut exploit_templates = if config.preset_only && !config.preset_file_path.is_empty() {
+            info!("[presets] --preset-only: skipping baked-in corpus, using only {}", config.preset_file_path);
+            Vec::new()
+        } else {
+            let baked = ExploitTemplate::baked_in();
+            info!("[presets] loaded {} baked-in exploit templates", baked.len());
+            baked
+        };
 
-        // If the user passed --preset-file-path, layer those templates ON TOP
-        // of the baked-in set (additive, never replacing). Keeps power-user
-        // workflows working — they can ship their own curated corpus and
-        // still benefit from the baked-in historical set.
+        // If --preset-file-path is set, add those templates. Additive by default (layered
+        // on the baked set, fuzzland's original behavior); the sole set under --preset-only.
         if !config.preset_file_path.is_empty() {
             let extra = ExploitTemplate::from_filename(config.preset_file_path.clone());
-            debug!("loaded {} additional templates from {}", extra.len(), config.preset_file_path);
+            info!("[presets] loaded {} template(s) from {}", extra.len(), config.preset_file_path);
             exploit_templates.extend(extra);
         }
 
@@ -300,6 +312,11 @@ pub fn evm_fuzzer(
         }
         let has_preset_match = !matched_templates.is_empty();
         info!("[presets] has_preset_match: {} ({} template(s) fully matched this target)", has_preset_match, matched_templates.len());
+
+        // Candidate-based campaign discovery: the matched exploit's OWN selectors become
+        // the campaign's prime/exploit chain candidates (not a hardcoded menu).
+        preset_chain_selectors = sig_to_addr_abi_map.keys().cloned().collect();
+        info!("[presets] {} matched selector(s) feed campaign candidate discovery", preset_chain_selectors.len());
 
         state.init_presets(has_preset_match, matched_templates.clone(), sig_to_addr_abi_map);
     }
@@ -362,8 +379,19 @@ pub fn evm_fuzzer(
         }
         let instance_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
         let cache = instance_map
-            .map(|m| CampaignTargetCache::new(&m, Vec::new()))
-            .unwrap_or_else(|| CampaignTargetCache::new(&ABIAddressToInstanceMap::default(), Vec::new()));
+            .map(|m| CampaignTargetCache::new_with_preset(&m, Vec::new(), &preset_chain_selectors))
+            .unwrap_or_else(|| CampaignTargetCache::new_with_preset(&ABIAddressToInstanceMap::default(), Vec::new(), &preset_chain_selectors));
+        // [pool-tel] one-shot: how many (contract,selector) entries per selector in the
+        // campaign candidate pool. Exposes contract-multiplicity bias (e.g. approve on
+        // every ERC20 → over-weighted in uniform (contract,selector) sampling).
+        {
+            use std::collections::BTreeMap;
+            let mut prime_counts: BTreeMap<String, usize> = BTreeMap::new();
+            for (_a, sel, _abi) in &cache.prime_targets {
+                *prime_counts.entry(format!("0x{}", hex::encode(sel))).or_default() += 1;
+            }
+            info!("[pool-tel] prime_targets={} entries; per-selector contract-counts: {:?}", cache.prime_targets.len(), prime_counts);
+        }
         state.add_metadata(cache);
     }
 

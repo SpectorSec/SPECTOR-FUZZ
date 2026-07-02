@@ -108,6 +108,9 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub temporal_skimming: bool,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
+    /// Use ONLY --preset-file-path templates, skip the baked-in corpus (isolation).
+    #[cfg(feature = "use_presets")]
+    pub preset_only: bool,
 }
 
 impl<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> Debug

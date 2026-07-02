@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use libafl_bolts::impl_serdeany;
+use libafl_bolts::rands::{Rand, StdRand};
 use serde::{Deserialize, Serialize};
 
 use crate::evm::abi::{ABIAddressToInstanceMap, BoxedABI};
@@ -66,10 +67,33 @@ impl_serdeany!(CampaignTargetCache);
 
 impl CampaignTargetCache {
     /// Build the cache from the ABI registry by scanning for known selector patterns.
+    /// Delegates with no preset selectors → hardcoded PRIME/EXPLOIT fallback.
     pub fn new(abi_map: &ABIAddressToInstanceMap, borrowable_tokens: Vec<EVMAddress>) -> Self {
+        Self::new_with_preset(abi_map, borrowable_tokens, &[])
+    }
+
+    /// Candidate-based target discovery. When `preset_selectors` is non-empty (a preset
+    /// matched the target), the prime/exploit chain candidates are drawn from the matched
+    /// EXPLOIT'S OWN vocabulary — so the campaign chains what THIS exploit actually uses,
+    /// adapting to the target instead of hunting a hardcoded function menu the exploit's
+    /// selectors may fall entirely outside of. Empty → falls back to the hardcoded
+    /// PRIME/EXPLOIT_SELECTORS. This removes the hidden candidate-bias at discovery: the
+    /// same "candidates, not a fixed prior" principle the preset system already uses.
+    pub fn new_with_preset(
+        abi_map: &ABIAddressToInstanceMap,
+        borrowable_tokens: Vec<EVMAddress>,
+        preset_selectors: &[[u8; 4]],
+    ) -> Self {
+        let (prime_sels, exploit_sels): (&[[u8; 4]], &[[u8; 4]]) = if !preset_selectors.is_empty() {
+            // Every matched-exploit selector is a candidate for both ends of the chain;
+            // pick_prime_and_exploit (value-flow-aware) then orders them.
+            (preset_selectors, preset_selectors)
+        } else {
+            (PRIME_SELECTORS, EXPLOIT_SELECTORS)
+        };
         Self {
-            prime_targets: find_targets_by_selector(abi_map, PRIME_SELECTORS),
-            exploit_targets: find_targets_by_selector(abi_map, EXPLOIT_SELECTORS),
+            prime_targets: find_targets_by_selector(abi_map, prime_sels),
+            exploit_targets: find_targets_by_selector(abi_map, exploit_sels),
             borrowable_tokens,
             generic_targets: find_generic_targets(abi_map),
         }
@@ -101,21 +125,31 @@ pub fn plan_campaign(
     topology_report: Option<&TopologyReport>,
     temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
-    // No observed value-flow supplied → falls back to topology-shape + defaults.
-    plan_campaign_with_value_flow(cache, topology_report, temporal_skimming, &HashSet::new())
+    // Deterministic entry (tests / no live fuzzer RNG): seed a fixed local RNG.
+    // With single-candidate pools the sampled draw resolves to the sole element,
+    // so structure is stable; production goes through the value-flow entry below
+    // with the live `state.rand_mut()`.
+    let mut rand = StdRand::with_seed(0xC0FFEE);
+    plan_campaign_sampled(cache, topology_report, temporal_skimming, &mut rand)
 }
 
-/// Value-flow-aware campaign planner. `value_producing` is the set of function
-/// selectors the LIVE target was observed (via value-capture) to return a value —
-/// the "blood in the water." The prime step is preferentially anchored on such a
-/// producer, so the campaign chains FROM where value actually flows on *this* target
-/// (adaptable feedback), not only from a historical/topology shape (formalized
-/// feedback). Both signals INFORM the sequence; neither FORCES the mutator's aim.
-pub fn plan_campaign_with_value_flow(
+/// Structural-sampling campaign planner. The planner's ONLY job is to propose an
+/// atomic frame (borrow → sampled prime → sampled exploit) by drawing uniformly from
+/// the harvested contract vocabulary, `get_next_call`-style. It deliberately does NOT
+/// consult any per-selector "value-flow" signal: the authoritative economic feedback
+/// is the primitive net-realized ledger (`flashloan_data.earned/owed`,
+/// `net_realized()` in feedbacks.rs) that already gates the objective/fitness layer.
+/// The planner PROPOSES structure; the machine-primitive ledger DISPOSES — monotonic
+/// filtering keeps only sampled sequences that yield genuine token/ETH inflows. A
+/// prior version anchored the prime on `observed_values` (a syntactic ABI-return
+/// pool), which read `approve`'s `bool true` as profit and collapsed chains toward
+/// `approve → approve`. That proxy is removed; the ledger is the single source of
+/// economic truth.
+pub fn plan_campaign_sampled<R: Rand>(
     cache: &CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
     temporal_skimming: bool,
-    value_producing: &HashSet<[u8; 4]>,
+    rand: &mut R,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
 
@@ -125,7 +159,7 @@ pub fn plan_campaign_with_value_flow(
     }
 
     // Populate prime + exploit steps (with concrete function ABIs), respecting hints
-    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, value_producing);
+    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, rand);
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
     }
@@ -161,36 +195,15 @@ pub fn plan_campaign_with_value_flow(
 /// pools, etc.).
 type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
 
-fn pick_prime_and_exploit<'a>(
-    cache: &'a CampaignTargetCache,
+fn pick_prime_and_exploit<R: Rand>(
+    cache: &CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
-    value_producing: &HashSet<[u8; 4]>,
+    rand: &mut R,
 ) -> (PickedStep, PickedStep) {
-    // ── Value-flow feedback (primary): chain FROM where the target reveals value ──
-    // If value-capture observed a prime function actually returning a value on THIS
-    // target, anchor the prime there — that's the blood in the water. Pair with a
-    // same-contract exploit if one exists (tight deposit→exploit chain), else the
-    // first exploit target. This makes the campaign adaptive to the live target,
-    // not just its historical/topology shape.
-    if !value_producing.is_empty() {
-        for (addr, sel, p_abi) in &cache.prime_targets {
-            if value_producing.contains(sel) {
-                if let Some((_, _, e_abi)) = cache.exploit_targets.iter().find(|(a, _, _)| a == addr) {
-                    return (
-                        Some((*addr, Some(p_abi.clone()))),
-                        Some((*addr, Some(e_abi.clone()))),
-                    );
-                }
-                if let Some((e_addr, _, e_abi)) = cache.exploit_targets.first() {
-                    return (
-                        Some((*addr, Some(p_abi.clone()))),
-                        Some((*e_addr, Some(e_abi.clone()))),
-                    );
-                }
-            }
-        }
-    }
-
+    // No per-selector "value-flow" anchor: economic truth is the net-realized ledger
+    // at the objective layer (see plan_campaign_sampled docs). The planner only
+    // samples structure; topology INFORMS a same-contract preference, nothing FORCES
+    // an aim.
     let prefer_same_contract = topology_report
         .and_then(|r| r.ranked.first())
         .map(|(cls, _)| {
@@ -204,28 +217,59 @@ fn pick_prime_and_exploit<'a>(
         .unwrap_or(false);
 
     if prefer_same_contract {
-        // Prefer an address in both lists, pinning each side's concrete function.
-        for (addr, _, p_abi) in &cache.prime_targets {
-            if let Some((_, _, e_abi)) = cache.exploit_targets.iter().find(|(a, _, _)| a == addr) {
-                return (
-                    Some((*addr, Some(p_abi.clone()))),
-                    Some((*addr, Some(e_abi.clone()))),
-                );
-            }
+        // Sample among same-contract prime/exploit pairs (not the first pair), each
+        // side's concrete function pinned. Topology INFORMS the preference (same
+        // contract); the draw within that preference stays a coverage-style sample.
+        let pairs: Vec<(usize, usize)> = cache
+            .prime_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, (addr, p_sel, _))| {
+                // Same-contract exploit candidates, EXCLUDING the prime's own selector.
+                // A step calling the same function twice on the same contract is a
+                // degenerate chain, not a prime→exploit — and it's exactly how a
+                // single-vocabulary contract (e.g. 3Crv, whose only matched selector is
+                // approve) forces X→X. Excluding p_sel drops such a prime out of the
+                // same-contract pairing entirely (falls through to the default sampler).
+                let exps: Vec<usize> = cache
+                    .exploit_targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (a, sel, _))| a == addr && sel != p_sel)
+                    .map(|(i, _)| i)
+                    .collect();
+                sample_idx(exps.len(), rand).map(|k| (pi, exps[k]))
+            })
+            .collect();
+        if let Some((pi, ei)) = sample_idx(pairs.len(), rand).map(|k| pairs[k]) {
+            let (p_addr, _, p_abi) = &cache.prime_targets[pi];
+            let (_, _, e_abi) = &cache.exploit_targets[ei];
+            return (
+                Some((*p_addr, Some(p_abi.clone()))),
+                Some((*p_addr, Some(e_abi.clone()))),
+            );
         }
     }
 
-    // Default: first from each selector-matched list, carrying the concrete ABI.
-    let prime = cache.prime_targets.first().map(|(a, _, abi)| (*a, Some(abi.clone())));
-    let exploit = cache.exploit_targets.first().map(|(a, _, abi)| (*a, Some(abi.clone())));
+    // Default: SELECTOR-LEVEL sample from each candidate pool, exactly like the
+    // original fuzzland's get_next_call (draw from `interesting_signatures`, a SET of
+    // selectors, then resolve to a contract). Sampling raw `(contract, selector)`
+    // entries would weight a selector by how many contracts expose it, so a ubiquitous
+    // ERC-20 method (approve, on every token) drowns out the exploit-specific words —
+    // the [pool-tel]-confirmed approve=3/7 skew. Two-stage sampling (uniform over
+    // distinct selectors, then a contract carrying it) restores one-word-one-vote
+    // while keeping contract diversity. Coverage-guided steps sequence the survivors.
+    let prime = sample_by_selector(&cache.prime_targets, rand).map(|(a, _, abi)| (*a, Some(abi.clone())));
+    let exploit = sample_by_selector(&cache.exploit_targets, rand).map(|(a, _, abi)| (*a, Some(abi.clone())));
     if prime.is_some() && exploit.is_some() {
         return (prime, exploit);
     }
 
-    // Fallback: name-heuristic single-contract target. Pin the trigger function as
-    // the exploit step (so the executor probe calls it, not the fallback) and a
-    // different function as the benign prime step.
-    if let Some((addr, prime_abi, exploit_abi)) = cache.generic_targets.first() {
+    // Fallback: name-heuristic single-contract target (sampled). Pin the trigger
+    // function as the exploit step (so the executor probe calls it, not the
+    // fallback) and a different function as the benign prime step.
+    if let Some(gi) = sample_idx(cache.generic_targets.len(), rand) {
+        let (addr, prime_abi, exploit_abi) = &cache.generic_targets[gi];
         return (
             Some((*addr, prime_abi.clone())),
             Some((*addr, exploit_abi.clone())),
@@ -233,6 +277,43 @@ fn pick_prime_and_exploit<'a>(
     }
 
     (prime, exploit)
+}
+
+/// Selector-level uniform sample: draw a distinct selector (vocabulary word) uniformly
+/// from `targets`, then a contract carrying it. Mirrors fuzzland's `get_next_call`
+/// (draw from the selector SET `interesting_signatures`, then resolve a contract),
+/// so a selector present on many contracts is one word with one vote — not weighted by
+/// contract-multiplicity. `None` when empty.
+fn sample_by_selector<'a, R: Rand>(
+    targets: &'a [(EVMAddress, [u8; 4], BoxedABI)],
+    rand: &mut R,
+) -> Option<&'a (EVMAddress, [u8; 4], BoxedABI)> {
+    // Distinct selectors, insertion-order-stable (determinism under a fixed seed).
+    let mut selectors: Vec<[u8; 4]> = Vec::new();
+    for (_, sel, _) in targets {
+        if !selectors.contains(sel) {
+            selectors.push(*sel);
+        }
+    }
+    let sel = *selectors.get(sample_idx(selectors.len(), rand)?)?;
+    // Contracts carrying the chosen selector; pick one uniformly (keeps diversity).
+    let carriers: Vec<usize> = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, s, _))| *s == sel)
+        .map(|(i, _)| i)
+        .collect();
+    Some(&targets[carriers[sample_idx(carriers.len(), rand)?]])
+}
+
+/// Uniform random index into a slice of `len` elements (get_next_call-style draw).
+/// `None` when empty. The one primitive behind the campaign's candidate sampling.
+fn sample_idx<R: Rand>(len: usize, rand: &mut R) -> Option<usize> {
+    if len == 0 {
+        None
+    } else {
+        Some(rand.below(len as u64) as usize)
+    }
 }
 
 /// Find all contracts whose ABI list includes any of the given selectors.
@@ -327,7 +408,7 @@ mod tests {
     use super::*;
     use crate::evm::abi::{ABIAddressToInstanceMap, BoxedABI, AEmpty, AUnknown};
     use crate::evm::input::EVMInputTy;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Serializes tests that call `set_func_with_signature`, which writes the global
     // `static mut FUNCTION_SIG` HashMap — concurrent writes are a data race (UB).

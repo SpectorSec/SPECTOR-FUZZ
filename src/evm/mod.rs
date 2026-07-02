@@ -346,6 +346,15 @@ pub struct EvmArgs {
     #[arg(long, default_value = "")]
     preset_file_path: String,
 
+    /// Use ONLY the templates from --preset-file-path, skipping the baked-in
+    /// DefiHacksPresets corpus entirely. This isolates the preset language: the
+    /// mutator's preset budget (20%) speaks only the supplied exploit's shape, with
+    /// no dilution from the 1000+ historical templates. Controlled-experiment switch
+    /// for measuring exactly how the fuzzer mutates around one known exploit.
+    #[cfg(feature = "use_presets")]
+    #[arg(long, default_value = "false")]
+    preset_only: bool,
+
     #[arg(long, default_value = "")]
     base_directory: String,
 
@@ -893,6 +902,8 @@ pub fn evm_main(mut args: EvmArgs) {
         },
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
+        #[cfg(feature = "use_presets")]
+        preset_only: args.preset_only,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture || args.bounty,
         campaign_orchestrator: args.campaign_orchestrator || args.bounty,
@@ -1089,6 +1100,8 @@ fn test_evm_offchain_setup() {
         },
         #[cfg(feature = "use_presets")]
         preset_file_path: args.preset_file_path,
+        #[cfg(feature = "use_presets")]
+        preset_only: args.preset_only,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture || args.bounty,
         campaign_orchestrator: args.campaign_orchestrator || args.bounty,
