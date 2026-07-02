@@ -1,9 +1,17 @@
 # Feature 011 — Impact Maximization
 
-**Status:** Specified
+**Status:** Specified — **Part A + Part B SUPERSEDED BY Feature 015 (2026-07-02)**
 **Owner:** Skyler
-**Last updated:** 2026-06-29
+**Last updated:** 2026-07-02
 **Sign-off:** Skyler 2026-06-29 — checkpoints 11.1–11.4, 11.6 ✓; 11.5 ◑ (TVL normalizer scoped as optional follow-on). Part A core = realized-ETH gradient; %-of-TVL metric deferred.
+
+> **Superseded note (2026-07-02):** Parts A and B were specified here but never wired into
+> the run loop (verified: empty grep `blood|amplif|ladder|scale_up`). They are realized as
+> **Part 3 of Feature 015 (Reflexive Lever Pipeline)** — the realized-ETH ledger becomes the
+> ledger-secant's *objective*, and the amplifier is built there so it can act on a *promoted*
+> reflexive lever (011 alone could only tune amounts already in the frame, which for reflexive
+> exploits like yDAI never contain the lever). Build/track the amplifier in 015, not here. The
+> %-of-TVL severity metric (11.5) remains an independent optional follow-on.
 
 ---
 

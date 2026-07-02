@@ -214,6 +214,35 @@ fn secant_step(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     Some(x1.saturating_add(step))
 }
 
+/// Feature 015 — secant on the ledger's DERIVATIVE (finds an interior profit peak).
+///
+/// The value/calldata secants ([`secant_step`]) drive one monotone comparison distance
+/// to zero. A reflexive-skew lever is different: pushing the amount too far *reverses*
+/// the profit (over-skew pays more slippage than it steals), so the objective is a hump
+/// and the target is its MAXIMUM — where the derivative crosses zero from `+` to `−`.
+///
+/// `g1`, `g2` are two signed slope samples of the objective, measured at `x1` and
+/// `x1 + delta`. When they bracket a downward zero-crossing (`g1 > 0 > g2`) the peak lies
+/// between the probes; linear-interpolate the derivative's root:
+///   `x* = x1 + g1·delta / (g1 − g2)`.
+/// Returns `None` on flat (`g1 == g2`), monotone (both slopes same sign — the peak, if
+/// any, is outside this bracket), or a trough (`g1 < 0 < g2`, a minimum — never the
+/// lever's profit peak). All value math is unsigned wei-scale (u128) to match the
+/// arg-amount domain; only the slopes are signed.
+fn secant_step_signed(x1: u128, g1: i128, g2: i128, delta: u128) -> Option<u128> {
+    // Interior maximum only: derivative must fall through zero (`+` → `−`).
+    if !(g1 > 0 && g2 < 0) {
+        return None;
+    }
+    // g1 > 0 > g2 ⇒ (g1 − g2) > 0 and fits (our slopes are far from i128 extremes).
+    let denom = g1.saturating_sub(g2) as u128;
+    if denom == 0 {
+        return None;
+    }
+    let step = (g1 as u128).saturating_mul(delta) / denom;
+    Some(x1.saturating_add(step))
+}
+
 /// Feature 009 §5.3 stall→requeue fallback.
 ///
 /// When the secant definitively gives up on a comparison (flat gradient,
@@ -265,6 +294,9 @@ where
     pub ghost_identities: bool,
     /// Enable Temporal Pre-condition Skimming (multi-block state priming).
     pub temporal_skimming: bool,
+    /// Feature 015: enable reflexive-lever promotion (hoist the skew lever into the
+    /// campaign frame so the ledger-secant can amount-tune it).
+    pub reflexive_lever: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
 
@@ -277,12 +309,13 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool) -> Self {
+    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool, reflexive_lever: bool) -> Self {
         Self {
             infant_scheduler,
             campaign_orchestrator,
             ghost_identities,
             temporal_skimming,
+            reflexive_lever,
             phantom: Default::default(),
         }
     }
@@ -593,6 +626,179 @@ where
         data[offset + 16..offset + 32].copy_from_slice(&bytes);
         input.set_direct_data(Bytes::from(data));
     }
+
+    /// Feature 015 — LOCATE + AMPLIFY on a promoted reflexive-skew lever.
+    ///
+    /// Unlike the value/calldata secants this reads the POST-execution realized-inflow
+    /// ledger (`LEDGER_OBJECTIVE`, published by `TokenBalanceFeedback`) rather than the
+    /// in-execution `CMP_MAP`, and it tunes an argument of a CAMPAIGN STEP (the promoted
+    /// lever) rather than the top-level input. The whole campaign runs atomically in one
+    /// `run_target`, so writing the lever's arg on this clone and reading the ledger next
+    /// call closes the tune→execute→measure loop — the same clone-per-iteration contract
+    /// the value-secant relies on (state lives in `metadata_map`, not on the input).
+    ///
+    /// LOCATE: rotate over the lever's args, probe each, keep the arg with the strongest
+    /// |Δledger/Δarg| — that's the amount knob. AMPLIFY: gradient-ascend the knob toward
+    /// the profit peak; when two consecutive local slopes bracket a `+→−` crossing, snap
+    /// to the interpolated peak via `secant_step_signed`. NO concolic requeue: a flat
+    /// ledger slope means "not the lever," never "hand to SMT."
+    fn apply_ledger_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
+    where
+        I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
+        S: HasMetadata + HasCorpus,
+    {
+        if !self.reflexive_lever {
+            return false;
+        }
+
+        // Gate: the input must carry a campaign whose first promoted step has tunable args.
+        let (pin_step, n_args) = {
+            let Some(campaign) = input.get_campaign() else { return false };
+            let Some(&pin) = campaign.promoted.first() else { return false };
+            let Some(step) = campaign.steps.get(pin) else { return false };
+            let n = step.data.as_ref().map(|a| a.get_bytes_vec().len() / 32).unwrap_or(0);
+            (pin, n)
+        };
+        if n_args == 0 {
+            return false; // no addressable arg words (e.g. an empty-ABI fixture) — nothing to tune.
+        }
+
+        // Scale-adaptive probe/march, floored so a planner default of 0 can still grow.
+        const BASE: u128 = 1_000_000_000_000_000_000; // 1 token @ 18 decimals
+        const MAX_ARG: u128 = 1_000_000_000 * BASE; // trust-region ceiling (1e9 tokens)
+        const COOLDOWN: u32 = 8;
+
+        let obj = crate::evm::feedbacks::read_ledger_objective();
+
+        let mut s = state
+            .metadata_map()
+            .get::<crate::feedback::LedgerSecantState>()
+            .cloned()
+            .unwrap_or_default();
+        // Re-plan drift: if the pinned frame changed under us, restart bookkeeping.
+        if s.pin_step != pin_step || s.n_args != n_args {
+            s = crate::feedback::LedgerSecantState { pin_step, n_args, ..Default::default() };
+        }
+
+        let arg = if s.located { s.arg_idx } else { s.locate_cursor % n_args };
+        let probe_delta = (s.x1 / 16).max(BASE / 1000);
+
+        match s.phase {
+            crate::feedback::SecantPhase::Idle => {
+                if s.cooldown > 0 {
+                    s.cooldown -= 1;
+                    state.metadata_map_mut().insert(s);
+                    return false;
+                }
+                // Baseline x1 = the step's current arg value; pin it for this episode.
+                let x1 = read_step_arg_u128(input.get_campaign(), pin_step, arg);
+                s.x1 = x1;
+                write_step_arg_u128(input.get_campaign_mut(), pin_step, arg, x1);
+                s.phase = crate::feedback::SecantPhase::Probe1;
+                state.metadata_map_mut().insert(s);
+                true
+            }
+            crate::feedback::SecantPhase::Probe1 => {
+                // `obj` is the ledger from the x1 execution → O1.
+                s.o1 = obj;
+                let x2 = s.x1.saturating_add(probe_delta).min(MAX_ARG);
+                write_step_arg_u128(input.get_campaign_mut(), pin_step, arg, x2);
+                s.phase = crate::feedback::SecantPhase::Probe2;
+                state.metadata_map_mut().insert(s);
+                true
+            }
+            crate::feedback::SecantPhase::Probe2 => {
+                // `obj` is the ledger from the x1+δ execution → O2. Local slope over δ.
+                let o2 = obj;
+                let local_slope: i128 = (o2 as i128).saturating_sub(s.o1 as i128);
+                s.phase = crate::feedback::SecantPhase::Idle;
+                s.cooldown = COOLDOWN;
+
+                if !s.located {
+                    // LOCATE: record this arg's sensitivity, rotate to the next.
+                    let sens = local_slope.unsigned_abs();
+                    if sens > s.best_sens {
+                        s.best_sens = sens;
+                        s.best_arg = arg;
+                    }
+                    s.locate_cursor += 1;
+                    if s.locate_cursor >= n_args {
+                        if s.best_sens > 0 {
+                            s.arg_idx = s.best_arg;
+                            s.located = true;
+                            s.prev_slope = None; // begin amplify fresh
+                        } else {
+                            // No arg moved the ledger this rotation → not the lever here.
+                            s.locate_cursor = 0;
+                        }
+                    }
+                    // Restore the baseline so the throwaway execution is neutral.
+                    write_step_arg_u128(input.get_campaign_mut(), pin_step, arg, s.x1);
+                    state.metadata_map_mut().insert(s);
+                    return false;
+                }
+
+                // AMPLIFY: interpolate the peak on a `+→−` bracket, else march the knob.
+                let next_x = match s.prev_slope {
+                    Some(g_prev) if g_prev > 0 && local_slope < 0 && s.x1 > s.prev_x1 => {
+                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1)
+                            .unwrap_or(s.x1)
+                    }
+                    _ => {
+                        // Multiplicative-ish trust-region march, floored for x1 == 0.
+                        let march = (s.x1 / 2).max(BASE);
+                        if local_slope > 0 {
+                            s.x1.saturating_add(march)
+                        } else if local_slope < 0 {
+                            s.x1.saturating_sub(march)
+                        } else {
+                            s.x1 // flat: hold
+                        }
+                    }
+                }
+                .min(MAX_ARG);
+
+                s.prev_x1 = s.x1;
+                s.prev_slope = Some(local_slope);
+                write_step_arg_u128(input.get_campaign_mut(), pin_step, arg, next_x);
+                state.metadata_map_mut().insert(s);
+                true
+            }
+        }
+    }
+}
+
+/// Feature 015 — read a promoted campaign step's arg word as u128 (lower 16 bytes).
+/// `0` when the step/arg is absent (empty ABI, out-of-range index).
+fn read_step_arg_u128(campaign: &Option<CampaignSequence>, pin_step: usize, arg_idx: usize) -> u128 {
+    let Some(c) = campaign else { return 0 };
+    let Some(step) = c.steps.get(pin_step) else { return 0 };
+    let Some(abi) = &step.data else { return 0 };
+    let args = abi.get_bytes_vec();
+    let off = arg_idx * 32;
+    if off + 32 > args.len() {
+        return 0;
+    }
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&args[off + 16..off + 32]);
+    u128::from_be_bytes(b)
+}
+
+/// Feature 015 — write a u128 into a promoted campaign step's arg word (lower 16 bytes,
+/// big-endian) and re-encode the step's calldata. No-op when the step/arg is absent.
+fn write_step_arg_u128(campaign: &mut Option<CampaignSequence>, pin_step: usize, arg_idx: usize, value: u128) {
+    let Some(c) = campaign else { return };
+    let Some(step) = c.steps.get_mut(pin_step) else { return };
+    let Some(abi) = &mut step.data else { return };
+    let mut args = abi.get_bytes_vec();
+    let off = arg_idx * 32;
+    if off + 32 > args.len() {
+        return;
+    }
+    args[off + 16..off + 32].copy_from_slice(&value.to_be_bytes());
+    // `set_bytes` strips the leading 4-byte selector; prepend it back.
+    let full = [Vec::from(abi.function), args].concat();
+    abi.set_bytes(full);
 }
 
 impl<VS, Loc, Addr, SC, CI> Named for FuzzMutator<VS, Loc, Addr, SC, CI>
@@ -672,7 +878,7 @@ where
                     // The removed anchor read observed_values (ABI-return words), which
                     // misread approve's bool `true` as profit and skewed chains toward
                     // approve→approve. Economic truth now lives solely at the ledger.
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, &mut plan_rand) {
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, &mut plan_rand) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This
@@ -733,6 +939,15 @@ where
         #[cfg(feature = "cmp")]
         if state.rand_mut().below(100) < 20 {
             if self.apply_calldata_secant(input, state) {
+                mutated = true;
+            }
+        }
+
+        // Feature 015: ledger-guided AMPLIFY of a promoted reflexive-skew lever. Not
+        // cmp-gated (its signal is the post-execution ledger, not CMP_MAP); self-gates on
+        // `reflexive_lever` + presence of a promoted step, so it is inert off-path.
+        if self.reflexive_lever && state.rand_mut().below(100) < 40 {
+            if self.apply_ledger_secant(input, state) {
                 mutated = true;
             }
         }
@@ -1427,12 +1642,67 @@ mod tests {
             steps: Vec::new(),
             linkages: Vec::new(),
             warps: Vec::new(),
+            promoted: Vec::new(),
         };
         assert!(campaign.warps.is_empty());
+        assert!(campaign.promoted.is_empty());
         // Verify backward compatibility: default when deserialized from old format
         let json = r#"{"steps":[],"linkages":[]}"#;
         let decoded: crate::evm::input::CampaignSequence = serde_json::from_str(json).expect("should deserialize without warps field");
         assert!(decoded.warps.is_empty(), "warps should default to empty for backward compat");
+        // Feature 015: pre-015 JSON (no `promoted` key) must default to empty.
+        assert!(decoded.promoted.is_empty(), "promoted should default to empty for backward compat");
+    }
+
+    #[test]
+    fn test_campaign_sequence_promoted_roundtrip() {
+        // A populated `promoted` vec must survive a serde round-trip intact.
+        let campaign = crate::evm::input::CampaignSequence {
+            steps: Vec::new(),
+            linkages: Vec::new(),
+            warps: vec![(2, 10)],
+            promoted: vec![1, 3],
+        };
+        let encoded = serde_json::to_string(&campaign).expect("serialize");
+        let decoded: crate::evm::input::CampaignSequence =
+            serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.promoted, vec![1, 3], "promoted indices round-trip");
+        assert_eq!(decoded.warps, vec![(2, 10)]);
+    }
+
+    #[test]
+    fn test_ledger_secant_state_roundtrip() {
+        use crate::feedback::{LedgerSecantState, SecantPhase};
+        let s = LedgerSecantState {
+            phase: SecantPhase::Probe2,
+            pin_step: 2,
+            n_args: 4,
+            locate_cursor: 3,
+            best_sens: 12345,
+            best_arg: 1,
+            located: true,
+            arg_idx: 1,
+            x1: 1_000_000_000_000_000_000,
+            o1: 42,
+            prev_x1: 500_000_000_000_000_000,
+            prev_slope: Some(-77),
+            cooldown: 8,
+        };
+        let encoded = serde_json::to_string(&s).expect("serialize");
+        let d: LedgerSecantState = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(d.phase, SecantPhase::Probe2);
+        assert_eq!(d.pin_step, 2);
+        assert_eq!(d.n_args, 4);
+        assert_eq!(d.arg_idx, 1);
+        assert!(d.located);
+        assert_eq!(d.x1, 1_000_000_000_000_000_000);
+        assert_eq!(d.prev_slope, Some(-77));
+        assert_eq!(d.cooldown, 8);
+        // Default is a clean Idle/unlocated state.
+        let def = LedgerSecantState::default();
+        assert_eq!(def.phase, SecantPhase::Idle);
+        assert!(!def.located);
+        assert_eq!(def.prev_slope, None);
     }
 
     // ── Tier 1: snapshot-secant unit fixtures (Feature 008) ─────────────────
@@ -1449,6 +1719,32 @@ mod tests {
             Some(500),
             "linear accrual must be exact in one secant step"
         );
+    }
+
+    #[test]
+    fn test_secant_step_signed_finds_interior_peak() {
+        // Symmetric hump: derivative +200 at x1=10, −200 at x1+δ=110.
+        // Peak is exactly midway: x* = 10 + 200·100/(200−(−200)) = 10 + 50 = 60.
+        assert_eq!(
+            super::secant_step_signed(10, 200, -200, 100),
+            Some(60),
+            "bracketed +/− slopes must interpolate the derivative's root (the peak)"
+        );
+        // Asymmetric hump: slope still steep (+300) at x1, mildly negative (−100) at x1+δ
+        // ⇒ peak sits closer to the RIGHT probe. x* = 10 + 300·100/400 = 85.
+        assert_eq!(super::secant_step_signed(10, 300, -100, 100), Some(85));
+    }
+
+    #[test]
+    fn test_secant_step_signed_none_when_not_a_peak() {
+        // Monotone increasing (peak beyond the bracket) → None (step further, don't solve).
+        assert_eq!(super::secant_step_signed(10, 200, 100, 100), None);
+        // Monotone decreasing (past the peak / wrong side) → None.
+        assert_eq!(super::secant_step_signed(10, -100, -200, 100), None);
+        // Trough (derivative −→+, a MINIMUM) → None; never the profit peak.
+        assert_eq!(super::secant_step_signed(10, -200, 200, 100), None);
+        // Flat → None.
+        assert_eq!(super::secant_step_signed(10, 0, 0, 100), None);
     }
 
     #[cfg(feature = "cmp")]

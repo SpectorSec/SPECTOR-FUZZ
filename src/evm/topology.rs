@@ -95,6 +95,12 @@ pub enum ExploitClass {
     DeflationaryToken,
     /// Callback alone: unprotected flash callback allows state manipulation.
     UnprotectedCallback,
+    /// Feature 015 — AMM + Vault/Staking: REFLEXIVE skew. A liquidity primitive
+    /// (`add_liquidity`/`remove_liquidity_imbalance`) skews a pool invariant, a vault
+    /// reads the skewed virtual price mid-sequence, and the unwind pockets the delta.
+    /// Yearn yDAI ($11M), Harvest ($34M) pattern. The manipulation is a TRANSITION, so
+    /// the lever must be promoted into the tunable frame (see Feature 015).
+    ReflexiveSkew,
 }
 
 impl ExploitClass {
@@ -113,6 +119,7 @@ impl ExploitClass {
             ExploitClass::AMMInvariant => "AMM K-invariant / slippage bypass",
             ExploitClass::DeflationaryToken => "fee-on-transfer / rebase accounting error",
             ExploitClass::UnprotectedCallback => "unprotected flash/swap callback",
+            ExploitClass::ReflexiveSkew => "reflexive AMM skew (pool price read mid-sequence)",
         }
     }
 
@@ -132,6 +139,8 @@ impl ExploitClass {
             ExploitClass::AMMInvariant => "invariant leak",
             ExploitClass::DeflationaryToken => "value leak",
             ExploitClass::UnprotectedCallback => "control leak",
+            // Reflexive skew leaks the pool INVARIANT (virtual price) into a vault read.
+            ExploitClass::ReflexiveSkew => "invariant leak",
         }
     }
 }
@@ -179,6 +188,20 @@ impl TopologyReport {
         }
         if has(&ProtocolFamily::Callback) && has(&ProtocolFamily::ERC20) {
             scores.push((ExploitClass::ArbitraryCallDrain, 78));
+        }
+        // Feature 015 — reflexive skew: an AMM/liquidity pool co-occurring with a vault
+        // or staking layer that reads the pool's (skewable) price mid-sequence. Ranked
+        // just under the specific two-family vault signals (95/90) but well above the
+        // bare AMMInvariant single-family signal (65), so reflexive targets prefer the
+        // promoted-lever plan. (Concrete promotion still keys on selector presence in
+        // the target cache — see campaign_planner — so this score drives prioritization,
+        // not the trigger itself.)
+        if has_amm
+            && (has(&ProtocolFamily::ERC4626)
+                || has(&ProtocolFamily::Lending)
+                || has(&ProtocolFamily::Staking))
+        {
+            scores.push((ExploitClass::ReflexiveSkew, 88));
         }
         if has(&ProtocolFamily::Rebasing) && has(&ProtocolFamily::ERC20) {
             scores.push((ExploitClass::DeflationaryToken, 78));
@@ -356,6 +379,8 @@ impl ExploitClass {
                 &[ProtocolFamily::Rebasing, ProtocolFamily::ERC20],
             ExploitClass::UnprotectedCallback =>
                 &[ProtocolFamily::Callback, ProtocolFamily::FlashLoan],
+            ExploitClass::ReflexiveSkew =>
+                &[ProtocolFamily::UniswapV2, ProtocolFamily::UniswapV3, ProtocolFamily::ERC4626],
         }
     }
 }

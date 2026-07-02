@@ -61,6 +61,13 @@ pub struct CampaignTargetCache {
     /// trigger-named function (pinned so the executor probe calls it), the prime is
     /// a different (benign) function. Forms a same-contract prime->exploit chain.
     pub generic_targets: Vec<(EVMAddress, Option<BoxedABI>, Option<BoxedABI>)>,
+    /// Feature 015: contracts exposing a reflexive-skew liquidity primitive
+    /// (`add_liquidity` / `remove_liquidity_imbalance`). Scanned independently of the
+    /// prime/exploit allowlists so promotion can fire without polluting normal discovery;
+    /// consulted ONLY on the `--reflexive-lever` path, so when the feature is off this
+    /// field is computed once but never read — off-path behavior is byte-identical.
+    #[serde(default)]
+    pub reflexive_targets: Vec<(EVMAddress, [u8; 4], BoxedABI)>,
 }
 
 impl_serdeany!(CampaignTargetCache);
@@ -96,6 +103,12 @@ impl CampaignTargetCache {
             exploit_targets: find_targets_by_selector(abi_map, exploit_sels),
             borrowable_tokens,
             generic_targets: find_generic_targets(abi_map),
+            // Feature 015: independent scan for the two reflexive-skew liquidity
+            // primitives, regardless of what the prime/exploit allowlists matched.
+            reflexive_targets: find_targets_by_selector(
+                abi_map,
+                &[SEL_ADD_LIQUIDITY, SEL_REMOVE_LIQUIDITY_IMBALANCE],
+            ),
         }
     }
 
@@ -130,7 +143,29 @@ pub fn plan_campaign(
     // so structure is stable; production goes through the value-flow entry below
     // with the live `state.rand_mut()`.
     let mut rand = StdRand::with_seed(0xC0FFEE);
-    plan_campaign_sampled(cache, topology_report, temporal_skimming, &mut rand)
+    // Deterministic/test entry keeps reflexive promotion OFF; the live fuzzer path
+    // (mutator) passes `self.reflexive_lever`.
+    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, &mut rand)
+}
+
+/// Feature 015 selectors of reflexive-skew liquidity primitives.
+/// `add_liquidity(uint256[N],uint256)` = 0x4515cef3 (Curve StableSwap 3-pool form);
+/// `remove_liquidity_imbalance(uint256[N],uint256)` = 0x9fdaea0c.
+const SEL_ADD_LIQUIDITY: [u8; 4] = [0x45, 0x15, 0xce, 0xf3];
+const SEL_REMOVE_LIQUIDITY_IMBALANCE: [u8; 4] = [0x9f, 0xda, 0xea, 0x0c];
+
+/// Feature 015 — a-priori Promote. If the harvested vocabulary (target cache) contains a
+/// reflexive-skew liquidity primitive, return a pinned lever step for it. `add_liquidity`
+/// is the primary skew lever (it moves the pool balance the vault reads); we fall back to
+/// `remove_liquidity_imbalance`. Keyed on selector presence so it fires on both the preset
+/// path (selectors seeded into the cache) and the onchain path (harvested ABIs).
+fn maybe_promote_lever(cache: &CampaignTargetCache) -> Option<ConciseEVMInput> {
+    for want in [SEL_ADD_LIQUIDITY, SEL_REMOVE_LIQUIDITY_IMBALANCE] {
+        if let Some((addr, _sel, abi)) = cache.reflexive_targets.iter().find(|(_, sel, _)| *sel == want) {
+            return Some(build_abi_step(*addr, Some(abi.clone())));
+        }
+    }
+    None
 }
 
 /// Structural-sampling campaign planner. The planner's ONLY job is to propose an
@@ -149,9 +184,12 @@ pub fn plan_campaign_sampled<R: Rand>(
     cache: &CampaignTargetCache,
     topology_report: Option<&TopologyReport>,
     temporal_skimming: bool,
+    reflexive_lever: bool,
     rand: &mut R,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
+    // Feature 015: indices of promoted reflexive-skew lever steps.
+    let mut promoted: Vec<usize> = Vec::new();
 
     // Step 0 (optional): Borrow step — acquire capital via flashloan
     if let Some(token_addr) = cache.borrowable_tokens.first() {
@@ -162,6 +200,18 @@ pub fn plan_campaign_sampled<R: Rand>(
     let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, rand);
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
+    }
+    // Feature 015 — a-priori Promote: hoist the reflexive-skew liquidity lever
+    // (`add_liquidity`/`remove_liquidity_imbalance`) into the frame BETWEEN prime and
+    // exploit, so the ledger-secant can pin and amount-tune it. Without this the lever
+    // only ever appears in the runtime belly (`get_next_call`) where no tuner can reach
+    // it. Trigger keys on selector presence in the harvested vocabulary (works for both
+    // preset and onchain paths); the `ReflexiveSkew` topology class only prioritizes.
+    if reflexive_lever {
+        if let Some(lever) = maybe_promote_lever(cache) {
+            promoted.push(steps.len());
+            steps.push(lever);
+        }
     }
     if let Some((addr, abi)) = exploit_step {
         steps.push(build_abi_step(addr, abi));
@@ -186,7 +236,7 @@ pub fn plan_campaign_sampled<R: Rand>(
         warps.push((exploit_idx, 10));
     }
 
-    Some(CampaignSequence { steps, linkages: Vec::new(), warps })
+    Some(CampaignSequence { steps, linkages: Vec::new(), warps, promoted })
 }
 
 /// Pick prime and exploit target addresses, using topology intelligence
@@ -212,6 +262,7 @@ fn pick_prime_and_exploit<R: Rand>(
                 ExploitClass::PriceGatedVault
                     | ExploitClass::FlashDepositDrain
                     | ExploitClass::RewardAccumulator
+                    | ExploitClass::ReflexiveSkew
             )
         })
         .unwrap_or(false);
@@ -598,6 +649,61 @@ mod tests {
         // temporal_skimming = false → no warps (backward compatible)
         let campaign = plan_campaign(&cache, None, false).expect("should produce campaign");
         assert!(campaign.warps.is_empty(), "no warps when temporal_skimming is disabled");
+    }
+
+    /// Feature 015 — the cheapest proof the Promote path works end-to-end: a yDAI-like
+    /// fixture (prime + exploit + a Curve pool exposing `add_liquidity`) must, with
+    /// `reflexive_lever=true`, hoist the lever into the frame and record its index in
+    /// `promoted`, and the promoted step must carry the `add_liquidity` selector.
+    #[test]
+    fn test_reflexive_lever_promoted_into_frame() {
+        let mut map = HashMap::new();
+        let prime_addr = EVMAddress::from([0x01; 20]);
+        let exploit_addr = EVMAddress::from([0x02; 20]);
+        let pool_addr = EVMAddress::from([0x0c; 20]); // Curve pool (the skew lever host)
+        map.insert(prime_addr, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(exploit_addr, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        map.insert(pool_addr, vec![make_abi(SEL_ADD_LIQUIDITY)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        // The independent scan finds the lever even though it's not in PRIME_SELECTORS.
+        assert!(
+            cache.reflexive_targets.iter().any(|(a, s, _)| *a == pool_addr && *s == SEL_ADD_LIQUIDITY),
+            "reflexive scan must discover the Curve pool's add_liquidity"
+        );
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert_eq!(campaign.promoted.len(), 1, "exactly one lever promoted");
+        let lever_idx = campaign.promoted[0];
+        let lever_sel = campaign.steps[lever_idx]
+            .data
+            .as_ref()
+            .expect("promoted lever has a pinned ABI")
+            .function;
+        assert_eq!(lever_sel, SEL_ADD_LIQUIDITY, "promoted step is the add_liquidity lever");
+        // The lever sits between prime and exploit (never last — the exploit reads after it).
+        assert!(lever_idx < campaign.steps.len() - 1, "lever precedes the exploit step");
+    }
+
+    /// Off-path proof: with `reflexive_lever=false` the same fixture yields NO promotion,
+    /// so the feature is genuinely inert when disabled (constitution: zero code path off).
+    #[test]
+    fn test_reflexive_lever_inert_when_disabled() {
+        let mut map = HashMap::new();
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x0c; 20]), vec![make_abi(SEL_ADD_LIQUIDITY)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, false, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert!(campaign.promoted.is_empty(), "no promotion when reflexive_lever is off");
+        assert_eq!(campaign.steps.len(), 2, "plain prime→exploit frame, lever untouched");
     }
 }
 

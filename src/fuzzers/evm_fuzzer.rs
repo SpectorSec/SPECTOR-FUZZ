@@ -395,7 +395,7 @@ pub fn evm_fuzzer(
         state.add_metadata(cache);
     }
 
-    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator, config.ghost_identities, config.temporal_skimming);
+    let mutator: EVMFuzzMutator = FuzzMutator::new(infant_scheduler.clone(), config.campaign_orchestrator, config.ghost_identities, config.temporal_skimming, config.reflexive_lever);
 
     state.metadata_map_mut().insert(UncoveredBranchesMetadata::new());
     let std_stage = PowerABIMutationalStage::new(mutator);
@@ -428,6 +428,7 @@ pub fn evm_fuzzer(
         infant_scheduler.clone(),
         config.impact_eth_gradient,
         eth_engine_ref,
+        config.reflexive_lever,
     );
 
     // Combine: any new coverage ceiling OR any new fund-extraction ceiling
@@ -826,6 +827,11 @@ pub fn evm_fuzzer(
                 }
                 ExploitClass::PermissionEscalation => {
                     // FunctionOracle already auto-activated from artifacts.privileged_functions.
+                }
+                ExploitClass::ReflexiveSkew => {
+                    // Feature 015: reflexive skew is handled by lever PROMOTION in the
+                    // campaign planner + the ledger-secant amplifier, not by an oracle.
+                    // No oracle to activate here.
                 }
             }
         }

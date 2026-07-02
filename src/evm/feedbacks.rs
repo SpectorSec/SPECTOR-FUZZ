@@ -31,6 +31,30 @@ use crate::{
 use revm_primitives::ruint::Uint;
 type EVMU256 = Uint<256, 4>;
 
+use std::cell::Cell;
+
+thread_local! {
+    /// Feature 015 — the AMPLIFY objective (Decision A: raw attacker inflow drives the
+    /// ledger-secant hot path; net-realized ETH stays the survivor selector at `:394`).
+    /// `TokenBalanceFeedback` publishes the summed raw attacker inflow here every
+    /// execution WHEN `reflexive_lever` is on; the mutator's `apply_ledger_secant` reads
+    /// it at probe boundaries. Thread-local so each per-core fuzzing loop has its own
+    /// objective (publish + read happen on the same thread within one iteration) — no
+    /// lock, no `unsafe`. Stays `0` when the feature is off (never written).
+    static LEDGER_OBJECTIVE: Cell<u128> = const { Cell::new(0) };
+}
+
+/// Publish this execution's raw-inflow objective (Feature 015). Only called when
+/// `reflexive_lever` is on, so off-path this global is never touched.
+pub fn publish_ledger_objective(value: u128) {
+    LEDGER_OBJECTIVE.with(|c| c.set(value));
+}
+
+/// Read the last published raw-inflow objective (Feature 015). `0` before any publish.
+pub fn read_ledger_objective() -> u128 {
+    LEDGER_OBJECTIVE.with(|c| c.get())
+}
+
 /// A wrapper around a feedback that also performs sha3 taint analysis
 /// when the feedback is interesting.
 #[allow(clippy::type_complexity)]
@@ -207,6 +231,10 @@ pub struct TokenBalanceFeedback<SC> {
     /// Feature 011 (Part A): best realized-ETH total (raw `earned`-delta scale)
     /// seen across executions. A new max is the ETH-denominated interesting event.
     best_eth_total: EVMU512,
+    /// Feature 015: when true, publish this execution's summed raw attacker inflow to
+    /// `LEDGER_OBJECTIVE` so the ledger-secant can amplify the promoted lever. Purely
+    /// additive — the survivor selection (net-ETH ceiling) is unchanged.
+    reflexive_lever: bool,
 }
 
 impl<SC> TokenBalanceFeedback<SC> {
@@ -215,6 +243,7 @@ impl<SC> TokenBalanceFeedback<SC> {
         scheduler: SC,
         eth_gradient: bool,
         evm_executor: Option<Rc<RefCell<EVMQueueExecutor>>>,
+        reflexive_lever: bool,
     ) -> Self {
         Self {
             attackers,
@@ -223,6 +252,7 @@ impl<SC> TokenBalanceFeedback<SC> {
             eth_gradient,
             evm_executor,
             best_eth_total: EVMU512::ZERO,
+            reflexive_lever,
         }
     }
 }
@@ -235,6 +265,17 @@ impl<SC> TokenBalanceFeedback<SC> {
 /// value-inversion decision (expensive-small pile out-ranks cheap-large pile) is
 /// unit-testable without a live engine or an `EVMFuzzState`. Inflows the valuator
 /// cannot price (`None`) are skipped.
+/// Feature 015 — saturating EVMU256 → u128 (the ledger objective is u128, matching the
+/// secant's arg-amount domain). Values above 2^128 clamp to `u128::MAX`.
+fn evmu256_to_u128_sat_fb(v: EVMU256) -> u128 {
+    let limbs = v.as_limbs(); // [u64; 4], little-endian
+    if limbs[2] != 0 || limbs[3] != 0 {
+        u128::MAX
+    } else {
+        ((limbs[1] as u128) << 64) | (limbs[0] as u128)
+    }
+}
+
 fn aggregate_eth_inflow(
     inflow_pairs: &HashMap<(EVMAddress, EVMAddress), EVMU256>,
     mut value_one: impl FnMut(EVMAddress, EVMAddress, EVMU256) -> Option<EVMU512>,
@@ -284,6 +325,26 @@ where
         OT: ObserversTuple<EVMFuzzState>,
     {
         let result = state.get_execution_result();
+
+        // Feature 015: publish the raw-inflow AMPLIFY objective on EVERY execution
+        // (reverts / zero-inflow ⇒ 0) BEFORE any early return, so the ledger-secant reads
+        // a wrong lever amount as a drop rather than a stale value. One cheap scan,
+        // engine-free, only when the flag is on ⇒ off-path this global is never written.
+        if self.reflexive_lever {
+            let obj: u128 = if result.reverted {
+                0
+            } else {
+                let mut sum = EVMU256::ZERO;
+                for (_token, _from, to, value) in &result.new_state.state.erc20_transfers {
+                    if self.attackers.contains(to) && *value > EVMU256::ZERO {
+                        sum = sum.saturating_add(*value);
+                    }
+                }
+                evmu256_to_u128_sat_fb(sum)
+            };
+            publish_ledger_objective(obj);
+        }
+
         if result.reverted {
             return Ok(false);
         }
@@ -429,7 +490,7 @@ mod impact_011_tests {
     /// Lane-A run, T8.)
     #[test]
     fn eth_gradient_off_is_inert() {
-        let fb = TokenBalanceFeedback::<()>::new(HashSet::new(), (), false, None);
+        let fb = TokenBalanceFeedback::<()>::new(HashSet::new(), (), false, None, false);
         assert!(!fb.eth_gradient, "flag must default off");
         assert!(fb.evm_executor.is_none(), "no engine ref when flag off");
         assert_eq!(fb.best_eth_total, EVMU512::ZERO);

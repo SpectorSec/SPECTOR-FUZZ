@@ -737,3 +737,44 @@ pub struct CalldataSecantState {
 }
 
 impl_serdeany!(CalldataSecantState);
+
+/// Feature 015 — secant state for AMPLIFYING a promoted reflexive-skew lever.
+///
+/// Unlike the value/calldata secants, this one does NOT read the in-execution
+/// `CMP_MAP`; its signal is the POST-execution realized-inflow ledger published to
+/// `LEDGER_OBJECTIVE`. It also root-finds the ledger's *derivative* (the interior
+/// profit peak of a reflexive AMM skew) rather than a comparison flip — hence signed
+/// slopes (`g1`, `prev_slope`) and `secant_step_signed`. The knob is a single argument
+/// (`arg_idx`) of a specific promoted campaign step (`pin_step`), located once by a
+/// ledger-sensitivity sweep and then cached.
+///   Locate → sweep args of `pin_step`, cache the arg with max |Δobj/Δarg| in `arg_idx`
+///   Idle   → set arg to x1                          → exec publishes obj@x1
+///   Probe1 → read obj@x1 as g1, set arg to x1+δ     → exec publishes obj@x1+δ
+///   Probe2 → read obj@x1+δ, slope on the derivative → apply x* toward the peak
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct LedgerSecantState {
+    pub phase: SecantPhase,
+    /// Which promoted step is the lever (index into `CampaignSequence.steps`).
+    pub pin_step: usize,
+    /// Number of tunable arg words of the promoted step (cached from its ABI length).
+    pub n_args: usize,
+    /// Locate rotation cursor over `0..n_args` (probes one arg per episode).
+    pub locate_cursor: usize,
+    /// Best ledger-sensitivity |Δobj/Δarg| seen during Locate, and its arg.
+    pub best_sens: u128,
+    pub best_arg: usize,
+    /// True once Locate has chosen `arg_idx`; Amplify then tunes only that arg.
+    pub located: bool,
+    /// The chosen knob arg (valid once `located`).
+    pub arg_idx: usize,
+    /// Amplify base point for this episode and the objective sampled there (O1).
+    pub x1: u128,
+    pub o1: u128,
+    /// Previous amplify episode's base point + local slope (seeds the derivative secant
+    /// / the `+→−` bracket test). `None` before the first amplify slope is measured.
+    pub prev_x1: u128,
+    pub prev_slope: Option<i128>,
+    pub cooldown: u32,
+}
+
+impl_serdeany!(LedgerSecantState);

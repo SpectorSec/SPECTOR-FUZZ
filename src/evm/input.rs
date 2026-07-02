@@ -58,6 +58,13 @@ pub struct CampaignSequence {
     /// Empty by default for backward compatibility with Features 001-004.
     #[serde(default)]
     pub warps: Vec<(usize, u64)>,
+    /// Feature 015: step indices that are PROMOTED reflexive levers — a manipulation
+    /// call (e.g. Curve `add_liquidity`) hoisted from the runtime belly into the tunable
+    /// frame so the ledger-secant can pin and amount-tune it. Empty by default for
+    /// backward compatibility with Features 001-014 (same `#[serde(default)]` idiom as
+    /// `warps`, so pre-015 campaign JSON deserializes to an empty vec).
+    #[serde(default)]
+    pub promoted: Vec<usize>,
 }
 
 /// EVM Input Types

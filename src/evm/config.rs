@@ -106,6 +106,10 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub campaign_orchestrator: bool,
     pub ghost_identities: bool,
     pub temporal_skimming: bool,
+    /// Feature 015: enable reflexive-lever promotion + ledger-secant amplification.
+    /// Implies `campaign_orchestrator` + `impact_eth_gradient` (auto-enabled with a
+    /// warning if unset — the lever is inert without them).
+    pub reflexive_lever: bool,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
     /// Use ONLY --preset-file-path templates, skip the baked-in corpus (isolation).

@@ -58,7 +58,7 @@ use oracles::{erc20::IERC20OracleFlashloan, v2_pair::PairBalanceOracle};
 use producers::erc20::ERC20Producer;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, warn};
 use types::{EVMAddress, EVMFuzzState, EVMU256};
 use vm::EVMState;
 
@@ -270,6 +270,14 @@ pub struct EvmArgs {
     /// between prime and exploit steps to detect cross-round state divergence.
     #[arg(long, default_value = "false")]
     temporal_skimming: bool,
+
+    /// Feature 015: enable the Reflexive Lever Pipeline — promote a reflexive-skew
+    /// liquidity lever (`add_liquidity`/`remove_liquidity_imbalance`) into the campaign
+    /// frame and amount-tune it with the ledger-secant. Reaches reflexive-body exploits
+    /// (Yearn yDAI, Harvest) that the 2-step frame cannot. Auto-enables
+    /// `campaign_orchestrator` + `impact_eth_gradient` (warns if you disabled them).
+    #[arg(long, default_value = "false")]
+    reflexive_lever: bool,
 
     /// Bounty/production profile: enable the full attacker-REACH set as a unit —
     /// flashloan (economic capital: borrow → acquire → liquidate + fund-loss accounting),
@@ -840,6 +848,18 @@ pub fn evm_main(mut args: EvmArgs) {
 
     contract_loader.force_abi(force_abis);
 
+    // Feature 015: --reflexive-lever is inert without its two prerequisites, so it
+    // auto-enables them. Warn loudly when it has to, so the run's actual configuration
+    // is never silently different from the flags the user typed.
+    if args.reflexive_lever {
+        if !(args.campaign_orchestrator || args.bounty) {
+            warn!("--reflexive-lever auto-enabled --campaign-orchestrator (the lever has no frame to promote into without it)");
+        }
+        if !args.impact_eth_gradient {
+            warn!("--reflexive-lever auto-enabled --impact-eth-gradient (the ledger objective the lever amplifies)");
+        }
+    }
+
     let mut config = Config {
         contract_loader,
         only_fuzz: if !args.only_fuzz.is_empty() {
@@ -861,7 +881,7 @@ pub fn evm_main(mut args: EvmArgs) {
                 args.concolic_num_threads
             }
         },
-        impact_eth_gradient: args.impact_eth_gradient,
+        impact_eth_gradient: args.impact_eth_gradient || args.reflexive_lever,
         no_topology: args.no_topology,
         topology_bias: args.topology_bias,
         oracle: oracles,
@@ -906,9 +926,12 @@ pub fn evm_main(mut args: EvmArgs) {
         preset_only: args.preset_only,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture || args.bounty,
-        campaign_orchestrator: args.campaign_orchestrator || args.bounty,
+        campaign_orchestrator: args.campaign_orchestrator || args.bounty || args.reflexive_lever,
         ghost_identities: args.ghost_identities || args.bounty,
         temporal_skimming: args.temporal_skimming || args.bounty,
+        // Feature 015: reflexive lever auto-enables its two hard prerequisites (above:
+        // campaign_orchestrator + impact_eth_gradient OR'd with args.reflexive_lever).
+        reflexive_lever: args.reflexive_lever,
         etherscan_api_key,
     };
 
@@ -1052,6 +1075,18 @@ fn test_evm_offchain_setup() {
         "",
     );
 
+    // Feature 015: --reflexive-lever is inert without its two prerequisites, so it
+    // auto-enables them. Warn loudly when it has to, so the run's actual configuration
+    // is never silently different from the flags the user typed.
+    if args.reflexive_lever {
+        if !(args.campaign_orchestrator || args.bounty) {
+            warn!("--reflexive-lever auto-enabled --campaign-orchestrator (the lever has no frame to promote into without it)");
+        }
+        if !args.impact_eth_gradient {
+            warn!("--reflexive-lever auto-enabled --impact-eth-gradient (the ledger objective the lever amplifies)");
+        }
+    }
+
     let config = Config {
         contract_loader,
         only_fuzz: HashSet::new(),
@@ -1066,7 +1101,7 @@ fn test_evm_offchain_setup() {
                 args.concolic_num_threads
             }
         },
-        impact_eth_gradient: args.impact_eth_gradient,
+        impact_eth_gradient: args.impact_eth_gradient || args.reflexive_lever,
         no_topology: args.no_topology,
         topology_bias: args.topology_bias,
         oracle: oracles,
@@ -1104,9 +1139,12 @@ fn test_evm_offchain_setup() {
         preset_only: args.preset_only,
         load_corpus: args.load_corpus,
         value_capture: args.value_capture || args.bounty,
-        campaign_orchestrator: args.campaign_orchestrator || args.bounty,
+        campaign_orchestrator: args.campaign_orchestrator || args.bounty || args.reflexive_lever,
         ghost_identities: args.ghost_identities || args.bounty,
         temporal_skimming: args.temporal_skimming || args.bounty,
+        // Feature 015: reflexive lever auto-enables campaign_orchestrator (above) +
+        // impact_eth_gradient (OR'd with args.reflexive_lever at their fields).
+        reflexive_lever: args.reflexive_lever,
         etherscan_api_key: String::from(""),
     };
 
