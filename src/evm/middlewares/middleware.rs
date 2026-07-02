@@ -35,6 +35,11 @@ pub enum MiddlewareType {
     Cheatcode,
     ValueCapture,
     FeeOnTransferDetector,
+    OracleTracker,
+    OracleStaleness,
+    EmptyStateGuard,
+    FlashloanOracle,
+    DoSDetector,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Copy)]

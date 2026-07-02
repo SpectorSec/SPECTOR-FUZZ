@@ -287,6 +287,16 @@ where
                 .borrow()
                 .oracle(&mut oracle_ctx, original_stage)
             {
+                // Phase 0: only report bugs with a causal taint chain.
+                // The injection analysis ran before this feedback (in
+                // Sha3WrappedFeedback) and set INJECTION_CONFIRMED_EXPLOIT_PATH.
+                // When the analysis did not run (step / non-concolic inputs),
+                // injection_exploit_path_detected() returns true (safe default).
+                #[cfg(feature = "concolic_secant_dispatch")]
+                if !crate::evm::middlewares::cmp_linearity::injection_exploit_path_detected() {
+                    continue;
+                }
+
                 let metadata = oracle_ctx
                     .fuzz_state
                     .metadata_map_mut()

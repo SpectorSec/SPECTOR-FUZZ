@@ -30,7 +30,7 @@ use revm_interpreter::{
 use super::middleware::{Middleware, MiddlewareType};
 use crate::evm::{
     host::FuzzHost,
-    types::{as_u64, EVMAddress, EVMFuzzState, EVMU256},
+    types::{as_u64, convert_u256_to_h160, EVMAddress, EVMFuzzState, EVMU256},
 };
 
 const MAX_CALL_DEPTH: u64 = 3;
@@ -45,6 +45,77 @@ fn safe_mem_end(offset: usize, len: usize) -> Option<usize> {
 /// Reset at the start of each linearity reexecution via `full_reset`.
 pub static mut LIN_SAW_TAINTED_CMP: bool = false;
 pub static mut LIN_SAW_NONLINEAR_CMP: bool = false;
+
+/// Feature 013 Phase 1 — injection detection flags.
+/// Set at the CALL/DELEGATECALL/STATICCALL boundary when tainted bytes reach
+/// the `to` address or forwarded calldata. Reset per-execution in `full_reset`.
+pub static mut INJECTION_TAINTED_CALL_TARGET: bool = false;
+pub static mut INJECTION_TAINTED_CALLDATA: bool = false;
+
+/// Feature 013 Phase 2 — four-link chain records.
+/// Per-CALL record appended during reexecution when a CALL has injection taint.
+#[derive(Clone, Debug)]
+pub struct TaintedCallRecord {
+    pub target: EVMAddress,
+    pub selector: [u8; 4],
+    pub succeeded: bool,
+}
+
+pub static mut TAINTED_CALLS: Vec<TaintedCallRecord> = Vec::new();
+
+/// Feature 013 Phase 4 — value-confirmed provenance flag.
+/// Set when a storage slot read retains its tainted written value.
+pub static mut INJECTION_CONFIRMED_PROVENANCE: bool = false;
+
+/// Feature 013 Phase 5 — master flag: a tainted call passed GUARD + SINK + SELECTOR.
+pub static mut INJECTION_CONFIRMED_EXPLOIT_PATH: bool = false;
+
+/// Phase 0 safety gate: true when the taint analysis reexecution actually ran
+/// this execution. When false, `injection_exploit_path_detected()` returns true
+/// (no gating), so oracles fire as normal for step/non-concolic inputs.
+pub static mut INJECTION_ANALYSIS_RAN: bool = false;
+
+/// Post-reexecution: run the four-link chain on all recorded tainted calls.
+pub fn injection_chain_verdict() -> bool {
+    unsafe {
+        if TAINTED_CALLS.is_empty() {
+            INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+            return false;
+        }
+        for rec in TAINTED_CALLS.iter() {
+            if rec.succeeded && rec.selector != [0u8; 4] {
+                INJECTION_CONFIRMED_EXPLOIT_PATH = true;
+                return true;
+            }
+        }
+        INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        false
+    }
+}
+
+/// Read the Phase 5 exploit path flag. Returns true by default when the
+/// taint analysis hasn't run (safe no-op for step/non-concolic inputs).
+pub fn injection_exploit_path_detected() -> bool {
+    unsafe { !INJECTION_ANALYSIS_RAN || INJECTION_CONFIRMED_EXPLOIT_PATH }
+}
+
+/// Per-execution reset of all injection detection static flags.
+pub fn injection_reset_static() {
+    unsafe {
+        INJECTION_TAINTED_CALL_TARGET = false;
+        INJECTION_TAINTED_CALLDATA = false;
+        INJECTION_CONFIRMED_PROVENANCE = false;
+        INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        INJECTION_ANALYSIS_RAN = false;
+    }
+    injection_reset_chain();
+}
+
+pub fn injection_reset_chain() {
+    unsafe {
+        TAINTED_CALLS.clear();
+    }
+}
 
 /// Per-(contract, pc) classification: true = LINEAR (secant), false = NON-LINEAR.
 /// Optional finer-grained view for `is_linear_gate`-style queries.
@@ -144,6 +215,10 @@ struct Ctx {
     storage: HashMap<EVMU256, bool>,
     stack: Vec<TB>,
     input_data: Vec<bool>,
+    shared_storage: bool,
+    tainted_record_idx: Option<usize>,
+    callee: EVMAddress,
+    callee_selector: [u8; 4],
 }
 
 impl Ctx {
@@ -180,6 +255,13 @@ impl CmpLinearityTaint {
         self.stack.clear();
         self.ctxs.clear();
         lin_reset_verdict();
+        unsafe {
+            INJECTION_TAINTED_CALL_TARGET = false;
+            INJECTION_TAINTED_CALLDATA = false;
+            INJECTION_CONFIRMED_PROVENANCE = false;
+            INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        }
+        injection_reset_chain();
     }
 
     fn read_mem_tainted(&mut self, offset: usize, len: usize) -> bool {
@@ -207,29 +289,53 @@ impl CmpLinearityTaint {
         res
     }
 
-    fn push_ctx(&mut self, interp: &mut Interpreter) {
-        let (arg_offset, arg_len) = match interp.bytecode.opcode() {
-            0xf1 | 0xf2 | 0xf4 | 0xfa => (interp.stack.peek(3).unwrap(), interp.stack.peek(2).unwrap()),
+    fn push_ctx(&mut self, interp: &mut Interpreter, tainted_record_idx: Option<usize>) {
+        let opcode = interp.bytecode.opcode();
+        let (arg_offset, arg_len) = match opcode {
+            0xf1 | 0xf2 => (interp.stack.peek(3).unwrap(), interp.stack.peek(4).unwrap()),
+            0xf4 | 0xfa => (interp.stack.peek(2).unwrap(), interp.stack.peek(3).unwrap()),
             _ => return,
         };
         let arg_offset = as_u64(arg_offset) as usize;
         let arg_len = as_u64(arg_len) as usize;
+        let shared_storage = opcode == 0xf4 || opcode == 0xf2;
+        let callee = convert_u256_to_h160(interp.stack.peek(1).unwrap_or(EVMU256::ZERO));
+        let callee_selector = {
+            let mut sel = [0u8; 4];
+            if arg_len >= 4 {
+                if interp.memory.len() >= arg_offset + 4 {
+                    sel.copy_from_slice(&interp.memory.slice_len(arg_offset, 4));
+                }
+            }
+            sel
+        };
         self.ctxs.push(Ctx {
             input_data: self.write_input(arg_offset, arg_len),
             mem: self.mem.clone(),
             storage: self.storage.clone(),
             stack: self.stack.clone(),
+            shared_storage,
+            tainted_record_idx,
+            callee,
+            callee_selector,
         });
         self.mem.clear();
-        self.storage.clear();
+        if !shared_storage {
+            self.storage.clear();
+        }
         self.stack.clear();
     }
 
-    fn pop_ctx(&mut self) {
+    fn pop_ctx(&mut self) -> Option<usize> {
         if let Some(ctx) = self.ctxs.pop() {
             self.mem = ctx.mem;
-            self.storage = ctx.storage;
             self.stack = ctx.stack;
+            if !ctx.shared_storage {
+                self.storage = ctx.storage;
+            }
+            ctx.tainted_record_idx
+        } else {
+            None
         }
     }
 }
@@ -439,14 +545,31 @@ where
             0x54 | 0x5c => {
                 pop!();
                 let key = interp.stack.peek(0).expect("stack");
-                let t = *self.storage.get(&key).unwrap_or(&false);
-                pushtb!(TB { t, nl: false });
+                let address = interp.input.target_address;
+                let persistent = host.tainted_storage.get(&(address, key))
+                    .map(|p| p.tainted).unwrap_or(false);
+                let local = *self.storage.get(&key).unwrap_or(&false);
+                let merged = persistent || local;
+                self.storage.insert(key, merged);
+                if merged && persistent {
+                    INJECTION_CONFIRMED_PROVENANCE = true;
+                }
+                pushtb!(TB { t: merged, nl: false });
             }
             0x55 | 0x5d => {
                 pop!();
                 let v = pop!();
                 let key = interp.stack.peek(0).expect("stack");
                 self.storage.insert(key, v.t);
+                if v.t {
+                    host.tainted_storage.insert(
+                        (interp.input.target_address, key),
+                        crate::evm::host::TaintProvenance {
+                            tainted: true,
+                            stored_value: interp.stack.peek(1).unwrap_or(EVMU256::ZERO),
+                        },
+                    );
+                }
             }
             0x56 => {
                 pop!();
@@ -483,17 +606,87 @@ where
                 clean!();
             }
             0xf1 | 0xf2 => {
+                let stack_len = self.stack.len();
+                let tainted = stack_len >= 7 && self.stack[stack_len - 6].t;
+                if tainted {
+                    INJECTION_TAINTED_CALL_TARGET = true;
+                }
+                let (calldata_off, calldata_len) = (
+                    as_u64(interp.stack.peek(3).unwrap_or(EVMU256::ZERO)) as usize,
+                    as_u64(interp.stack.peek(4).unwrap_or(EVMU256::ZERO)) as usize,
+                );
+                let calldata_tainted = self.read_mem_tainted(calldata_off, calldata_len);
+                if calldata_tainted {
+                    INJECTION_TAINTED_CALLDATA = true;
+                }
+                let tainted_record_idx = if tainted || calldata_tainted {
+                    let target = convert_u256_to_h160(interp.stack.peek(1).unwrap_or(EVMU256::ZERO));
+                    let mut selector = [0u8; 4];
+                    if calldata_len >= 4 {
+                        if interp.memory.len() >= calldata_off + 4 {
+                            selector.copy_from_slice(&interp.memory.slice_len(calldata_off, 4));
+                        } else if interp.memory.len() > calldata_off {
+                            let avail = interp.memory.len() - calldata_off;
+                            selector[..avail].copy_from_slice(&interp.memory.slice_len(calldata_off, avail));
+                        }
+                    }
+                    unsafe {
+                        TAINTED_CALLS.push(TaintedCallRecord {
+                            target,
+                            selector,
+                            succeeded: false,
+                        });
+                        Some(TAINTED_CALLS.len() - 1)
+                    }
+                } else {
+                    None
+                };
                 popn!(7);
                 clean!();
-                self.push_ctx(interp);
+                self.push_ctx(interp, tainted_record_idx);
             }
             0xf3 => {
                 popn!(2);
             }
             0xf4 | 0xfa => {
+                let stack_len = self.stack.len();
+                let tainted = stack_len >= 6 && self.stack[stack_len - 5].t;
+                if tainted {
+                    INJECTION_TAINTED_CALL_TARGET = true;
+                }
+                let (calldata_off, calldata_len) = (
+                    as_u64(interp.stack.peek(2).unwrap_or(EVMU256::ZERO)) as usize,
+                    as_u64(interp.stack.peek(3).unwrap_or(EVMU256::ZERO)) as usize,
+                );
+                let calldata_tainted = self.read_mem_tainted(calldata_off, calldata_len);
+                if calldata_tainted {
+                    INJECTION_TAINTED_CALLDATA = true;
+                }
+                let tainted_record_idx = if tainted || calldata_tainted {
+                    let target = convert_u256_to_h160(interp.stack.peek(1).unwrap_or(EVMU256::ZERO));
+                    let mut selector = [0u8; 4];
+                    if calldata_len >= 4 {
+                        if interp.memory.len() >= calldata_off + 4 {
+                            selector.copy_from_slice(&interp.memory.slice_len(calldata_off, 4));
+                        } else if interp.memory.len() > calldata_off {
+                            let avail = interp.memory.len() - calldata_off;
+                            selector[..avail].copy_from_slice(&interp.memory.slice_len(calldata_off, avail));
+                        }
+                    }
+                    unsafe {
+                        TAINTED_CALLS.push(TaintedCallRecord {
+                            target,
+                            selector,
+                            succeeded: false,
+                        });
+                        Some(TAINTED_CALLS.len() - 1)
+                    }
+                } else {
+                    None
+                };
                 popn!(6);
                 clean!();
-                self.push_ctx(interp);
+                self.push_ctx(interp, tainted_record_idx);
             }
             0xf5 => {
                 popn!(4);
@@ -511,12 +704,33 @@ where
         _interp: &mut Interpreter,
         host: &mut FuzzHost<SC>,
         _state: &mut EVMFuzzState,
-        _by: &Bytes,
+        ret: &Bytes,
     ) {
         if host.call_depth > MAX_CALL_DEPTH {
             return;
         }
-        self.pop_ctx();
+
+        // Feature 014 Phase 0: mark oracle return data as tainted in memory.
+        // Check the returning call's callee against known oracle selectors.
+        if !self.ctxs.is_empty() {
+            if let Some(ctx) = self.ctxs.last() {
+                if let Some(selectors) = host.oracle_selectors.get(&ctx.callee) {
+                    if selectors.contains(&ctx.callee_selector) {
+                        let end = ret.len().min(MEMORY_LIMIT_BYTES);
+                        if self.mem.len() < end {
+                            self.mem.resize(end, false);
+                        }
+                        self.mem[..end].fill(true);
+                    }
+                }
+            }
+        }
+
+        if let Some(tainted_idx) = self.pop_ctx() {
+            if let Some(rec) = TAINTED_CALLS.get_mut(tainted_idx) {
+                rec.succeeded = true;
+            }
+        }
     }
 
     fn get_type(&self) -> MiddlewareType {

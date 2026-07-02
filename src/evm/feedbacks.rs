@@ -92,16 +92,40 @@ where
     {
         // checks if the inner feedback is interesting
         if self.enabled {
+            // Phase 0: run injection taint analysis BEFORE oracles fire so
+            // INJECTION_CONFIRMED_EXPLOIT_PATH is live when they evaluate.
+            #[cfg(feature = "concolic_secant_dispatch")]
+            if !input.is_step() {
+                // Reset per-execution static flags for all 013/014 features.
+                crate::evm::middlewares::cmp_linearity::injection_reset_static();
+                crate::evm::middlewares::oracle_tracker::OracleTracker::reset_static();
+                crate::evm::middlewares::oracle_staleness::OracleStaleness::reset_static();
+                crate::evm::middlewares::empty_state_guard::EmptyStateGuard::reset_static();
+                crate::evm::middlewares::flashloan_oracle::FlashloanOracle::reset_static();
+                crate::evm::middlewares::dos_detector::DoSDetector::reset_static();
+
+                let lin = std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
+                ));
+                (self.evm_executor.deref().borrow_mut())
+                    .reexecute_with_middleware(input, state, lin);
+                // Feature 013 Phase 2+5: four-link chain verdict.
+                crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
+                unsafe {
+                    crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+                }
+            }
+
             match self
                 .inner_feedback
                 .is_interesting(state, manager, input, observers, exit_kind)
             {
                 Ok(true) => {
-                    // Feature 009a: clear last input's linearity verdict so the
-                    // concolic-dispatch triage never reads a stale value (step
-                    // inputs get no reexecution → must default to "keep concolic").
-                    #[cfg(feature = "concolic_secant_dispatch")]
-                    crate::evm::middlewares::cmp_linearity::lin_reset_verdict();
+                        // Feature 009a: clear last input's linearity verdict so the
+                        // concolic-dispatch triage never reads a stale value (step
+                        // inputs get no reexecution → must default to "keep concolic").
+                        #[cfg(feature = "concolic_secant_dispatch")]
+                        crate::evm::middlewares::cmp_linearity::lin_reset_verdict();
                     if !input.is_step() {
                         // reexecute with sha3 taint analysis
                         // Use full_reset (not cleanup) so ctxs / prev_opcode /
@@ -119,19 +143,9 @@ where
                             self.sha3_taints.clone(),
                         );
 
-                        // Feature 009a: classify this input's tainted comparisons
-                        // (linear vs non-linear) for the concolic-dispatch triage.
-                        // Only when concolic is enabled (it manages concolic budget) —
-                        // verdict lands in cmp_linearity globals, read in
-                        // ConcolicFeedbackWrapper::append_metadata.
-                        #[cfg(feature = "concolic_secant_dispatch")]
-                        if crate::evm::middlewares::cmp_linearity::lin_concolic_enabled() {
-                            let lin = std::rc::Rc::new(std::cell::RefCell::new(
-                                crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
-                            ));
-                            (self.evm_executor.deref().borrow_mut())
-                                .reexecute_with_middleware(input, state, lin);
-                        }
+                        // Feature 009a + 013: CmpLinearityTaint reexecution already
+                        // completed above (before inner feedback), populating both the
+                        // linearity verdict and injection chain. No second reexecution.
                     }
                     Ok(true)
                 }

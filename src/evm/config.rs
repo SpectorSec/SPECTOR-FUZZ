@@ -110,6 +110,24 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     /// Implies `campaign_orchestrator` + `impact_eth_gradient` (auto-enabled with a
     /// warning if unset — the lever is inert without them).
     pub reflexive_lever: bool,
+    /// Feature 013 Phase 1: shallow injection detection at CALL boundaries.
+    pub injection_detect: bool,
+    /// Feature 013 Phase 3: persistent cross-execution taint via FuzzHost.
+    pub injection_persist: bool,
+    /// Feature 013 Phase 4: value-confirmed provenance (TaintProvenance).
+    pub injection_provenance: bool,
+    /// Feature 013 Phase 5: scheduler wiring (mutation bias from injection flags).
+    pub injection_feedback: bool,
+    /// Feature 014 Phase 1: oracle-gated value movement detection.
+    pub oracle_detection: bool,
+    /// Feature 014 Phase 2: flash loan oracle manipulation detection.
+    pub flashloan_detection: bool,
+    /// Feature 014 Phase 3: missing updatedAt staleness check detection.
+    pub oracle_staleness: bool,
+    /// Feature 014 Phase 4: empty state guard (first-deposit inflation) detection.
+    pub empty_state_guard: bool,
+    /// Feature 014 Phase 5: DoS via state-dependent revert detection.
+    pub dos_detection: bool,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
     /// Use ONLY --preset-file-path templates, skip the baked-in corpus (isolation).
