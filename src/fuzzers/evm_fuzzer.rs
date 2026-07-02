@@ -42,8 +42,13 @@ use crate::{
             call_printer::CallPrinter,
             cheatcode::Cheatcode,
             coverage::{Coverage, EVAL_COVERAGE},
+            dos_detector::DoSDetector,
+            empty_state_guard::EmptyStateGuard,
             fee_on_transfer_detector::FeeOnTransferDetector,
+            flashloan_oracle::FlashloanOracle,
             middleware::Middleware,
+            oracle_staleness::OracleStaleness,
+            oracle_tracker::OracleTracker,
             reentrancy::ReentrancyTracer,
             sha3_bypass::{Sha3Bypass, Sha3TaintAnalysis},
             value_capture::ValueCaptureMiddleware,
@@ -216,6 +221,37 @@ pub fn evm_fuzzer(
         fuzz_host.add_middlewares(Rc::new(RefCell::new(FeeOnTransferDetector::new())));
     }
 
+    // Feature 014 Phase 1: oracle-gated value movement detection.
+    if config.oracle_detection {
+        debug!("oracle-gated transfer detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(OracleTracker::new())));
+    }
+
+    // Feature 014 Phase 3: oracle staleness (missing updatedAt check) detection.
+    if config.oracle_staleness {
+        debug!("oracle staleness detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(OracleStaleness::new())));
+    }
+
+    // Feature 014 Phase 4: empty state guard (first-deposit inflation) detection.
+    if config.empty_state_guard {
+        debug!("empty state guard detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(EmptyStateGuard::new())));
+    }
+
+    // Feature 014 Phase 2: flash loan oracle manipulation detection.
+    if config.flashloan_detection {
+        debug!("flash loan oracle manipulation detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(FlashloanOracle::new())));
+    }
+
+    // Feature 014 Phase 5: DoS via state-dependent revert detection.
+    // Depends on Feature 013 Phase 3 (persistent taint on host.tainted_storage).
+    if config.dos_detection {
+        debug!("DoS via state-dependent revert detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(DoSDetector::new())));
+    }
+
     let mut evm_executor: EVMQueueExecutor = EVMExecutor::new(fuzz_host, deployer);
 
     if config.replay_file.is_some() {
@@ -331,6 +367,18 @@ pub fn evm_fuzzer(
 
     evm_executor.host.initialize(state);
     evm_executor.host.initial_block_timestamp = Some(artifacts.initial_env.block.timestamp);
+
+    // Feature 014 Phase 0: populate oracle_selectors from known ABI interfaces.
+    for (addr, abis) in &artifacts.address_to_abi_object {
+        let selectors: Vec<[u8; 4]> = abis
+            .iter()
+            .map(|a| a.function)
+            .filter(|sel| crate::evm::oracles::freshness::is_oracle_interface(sel))
+            .collect();
+        if !selectors.is_empty() {
+            evm_executor.host.oracle_selectors.insert(*addr, selectors);
+        }
+    }
 
     // now evm executor is ready, we can clone it
 

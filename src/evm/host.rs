@@ -85,6 +85,15 @@ pub static mut CMP_MAP: [EVMU256; MAP_SIZE] = [EVMU256::MAX; MAP_SIZE];
 #[cfg(feature = "cmp")]
 pub static mut CMP_PC: [u64; MAP_SIZE] = [0u64; MAP_SIZE];
 
+/// Feature 013 Phase 4 — value-confirmed provenance for persistent storage taint.
+/// Records the stored value alongside the taint bit so SLOAD can verify the slot
+/// still holds attacker-written data (eliminates false attribution from overwrites).
+#[derive(Clone, Debug, Default)]
+pub struct TaintProvenance {
+    pub tainted: bool,
+    pub stored_value: EVMU256,
+}
+
 /// Cheap per-(contract, pc) ownership fingerprint for CMP_PC. 0 is reserved as
 /// the "no owner" sentinel, so a real fingerprint of 0 is remapped to 1.
 #[cfg(feature = "cmp")]
@@ -422,6 +431,18 @@ where
     pub initial_block_timestamp: Option<EVMU256>,
     /// Whether the current transaction is a staleness check
     pub is_staleness_test: bool,
+    /// Feature 013 Phase 3-4 — persistent cross-execution taint with provenance.
+    /// Maps (contract_address, storage_slot) → TaintProvenance. Never reset across
+    /// executions within a campaign (only snapshot reset clears it).
+    /// Phase 4 upgrades the value from bool to TaintProvenance for value-confirmed
+    /// provenance — false attribution eliminated by verifying stored_value matches
+    /// the actual EVM slot content at read time.
+    pub tainted_storage: HashMap<(EVMAddress, EVMU256), TaintProvenance>,
+    /// Feature 014 Phase 0 — known oracle selectors per contract address.
+    /// Populated at init by scanning ABIMap for Chainlink/V2/V3/TWAP selectors.
+    /// Used by the return-value taint in cmp_linearity::on_return to mark oracle
+    /// return data as tainted in the shadow memory.
+    pub oracle_selectors: HashMap<EVMAddress, Vec<[u8; 4]>>,
 }
 
 impl<SC> Debug for FuzzHost<SC>
@@ -502,6 +523,8 @@ where
             is_staleness_test: self.is_staleness_test,
             call_tree_stack: Vec::new(),
             completed_call_trees: Vec::new(),
+            tainted_storage: self.tainted_storage.clone(),
+            oracle_selectors: self.oracle_selectors.clone(),
         }
     }
 }
@@ -590,6 +613,8 @@ where
             is_staleness_test: false,
             call_tree_stack: Vec::new(),
             completed_call_trees: Vec::new(),
+            tainted_storage: HashMap::new(),
+            oracle_selectors: HashMap::new(),
         }
     }
 

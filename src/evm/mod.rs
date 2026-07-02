@@ -279,6 +279,55 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     reflexive_lever: bool,
 
+    /// Feature 013 Phase 1: shallow injection detection at CALL boundaries.
+    /// When enabled, the reexecution taint engine reads shadow-stack and memory taint
+    /// at each CALL/DELEGATECALL/STATICCALL boundary and sets static flags for
+    /// post-execution oracle consumption.
+    #[arg(long, default_value = "false")]
+    injection_detect: bool,
+
+    /// Feature 013 Phase 3: persistent cross-execution taint via FuzzHost.
+    /// Enables host-level tainted_storage HashMap so SLOAD reads can merge persistent
+    /// taint from prior executions in the same campaign. Without this, all taint is
+    /// per-execution (resets each iteration).
+    #[arg(long, default_value = "false")]
+    injection_persist: bool,
+
+    /// Feature 013 Phase 4: value-confirmed provenance (TaintProvenance struct).
+    /// Upgrades the host tainted_storage to store the actual written value, enabling
+    /// verification that a storage slot still holds attacker-written data (eliminates
+    /// false attribution from overwritten slots).
+    #[arg(long, default_value = "false")]
+    injection_provenance: bool,
+
+    /// Feature 014 Phase 1: oracle-gated value movement detection.
+    /// Tracks opcode proximity between oracle CALLs and comparisons that gate value
+    /// transfers to financial sinks.
+    #[arg(long, default_value = "false")]
+    oracle_detection: bool,
+
+    /// Feature 014 Phase 2: flash loan oracle manipulation detection.
+    /// Tracks multi-CALL sequences: oracle read → borrow → oracle read → exploit → repay.
+    #[arg(long, default_value = "false")]
+    flashloan_detection: bool,
+
+    /// Feature 014 Phase 3: missing updatedAt staleness check detection.
+    /// Checks whether latestRoundData() CALL is followed by a TIMESTAMP comparison
+    /// within 50 opcodes.
+    #[arg(long, default_value = "false")]
+    oracle_staleness: bool,
+
+    /// Feature 014 Phase 4: empty state guard (first-deposit inflation) detection.
+    /// Checks whether deposit/mint functions check totalSupply > 0 before transferring
+    /// value (ERC-4626 inflation attack guard).
+    #[arg(long, default_value = "false")]
+    empty_state_guard: bool,
+
+    /// Feature 014 Phase 5: DoS via state-dependent revert detection.
+    /// Checks whether REVERT is gated by tainted storage (from 013 Phase 3).
+    #[arg(long, default_value = "false")]
+    dos_detection: bool,
+
     /// Bounty/production profile: enable the full attacker-REACH set as a unit —
     /// flashloan (economic capital: borrow → acquire → liquidate + fund-loss accounting),
     /// value-capture, campaign-orchestrator, ghost-identities, temporal-skimming. Three
@@ -932,6 +981,15 @@ pub fn evm_main(mut args: EvmArgs) {
         // Feature 015: reflexive lever auto-enables its two hard prerequisites (above:
         // campaign_orchestrator + impact_eth_gradient OR'd with args.reflexive_lever).
         reflexive_lever: args.reflexive_lever,
+        injection_detect: args.injection_detect,
+        injection_persist: args.injection_persist,
+        injection_provenance: args.injection_provenance,
+        injection_feedback: false,
+        oracle_detection: args.oracle_detection,
+        flashloan_detection: args.flashloan_detection,
+        oracle_staleness: args.oracle_staleness,
+        empty_state_guard: args.empty_state_guard,
+        dos_detection: args.dos_detection,
         etherscan_api_key,
     };
 
@@ -1145,6 +1203,15 @@ fn test_evm_offchain_setup() {
         // Feature 015: reflexive lever auto-enables campaign_orchestrator (above) +
         // impact_eth_gradient (OR'd with args.reflexive_lever at their fields).
         reflexive_lever: args.reflexive_lever,
+        injection_detect: args.injection_detect,
+        injection_persist: args.injection_persist,
+        injection_provenance: args.injection_provenance,
+        injection_feedback: false,
+        oracle_detection: args.oracle_detection,
+        flashloan_detection: args.flashloan_detection,
+        oracle_staleness: args.oracle_staleness,
+        empty_state_guard: args.empty_state_guard,
+        dos_detection: args.dos_detection,
         etherscan_api_key: String::from(""),
     };
 
