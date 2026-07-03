@@ -1,0 +1,68 @@
+digraph Taint016 {
+    rankdir=TB;
+    bgcolor="#1a1b26";
+    fontcolor="white";
+    fontname="JetBrains Mono";
+    label="016 — Taint Dimension Tags";
+    labeljust=left;
+    pad=0.5;
+
+    node [fontname="JetBrains Mono", fontcolor="white", shape=box, style=rounded, penwidth=2];
+    edge [fontcolor="#565f89", color="#565f89", fontname="JetBrains Mono", fontsize=10];
+
+    subgraph cluster_core {
+        label="Phase 0 — Core Lattice";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        tb [label="TB { t, nl, provenance, dim: TaintDim }" color="#73daca"];
+        lattice [label="Most-specific wins:\nPrice(5) > Accum(4) > Balance(3)\n> Timestamp(2) > Generic(1)" color="#73daca"];
+        mem [label="mem: Vec<TaintDim>\nstorage: HashMap<Slot,TaintDim>" color="#7aa2f7"];
+    }
+
+    subgraph cluster_oracle {
+        label="Phase 1 — Oracle Return Tagging";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        tag [label="tag_oracle_return()\nper-word-offset dim\nPrice / Timestamp / Generic" color="#7aa2f7"];
+        latest_round [label="latestRoundData:\noff32=Price, off64/96=Timestamp" color="#e0af68"];
+        latest_answer [label="latestAnswer:\noff0=Price" color="#e0af68"];
+    }
+
+    subgraph cluster_flow {
+        label="Phase 2 — Flow Type Detection";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        proxy [label="PROXY_TAINT_FLOW\ndim != Generic @ DELEGATECALL" color="#f7768e"];
+        price_manip [label="PRICE_MANIPULATION_FLOW\nPrice-dim cmp → CALL" color="#f7768e"];
+        accum [label="ACCUMULATOR_INFLATION_FLOW\nPrice-dim SSTORE ×2+" color="#f7768e"];
+    }
+
+    subgraph cluster_mutator {
+        label="Phase 3 — Scheduler + Mutator Wiring";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        dim_flow [label="DIMENSION_FLOW thread-local\npublished after reexec" color="#bb9af7"];
+        probe [label="located_dim → probe delta\nPrice: x1/256, Balance: x1/16\nGeneric: x1/64" color="#9ece6a"];
+    }
+
+    lattice -> tb;
+    tb -> mem;
+    tag -> latest_round;
+    tag -> latest_answer;
+    tag -> tb [label="  marks oracle return"];
+    tb -> proxy [label="  dim at DC boundary"];
+    tb -> price_manip [label="  dim at cmp→CALL"];
+    tb -> accum [label="  dim at SSTORE"];
+    proxy -> dim_flow;
+    price_manip -> dim_flow;
+    accum -> dim_flow;
+    dim_flow -> probe;
+}

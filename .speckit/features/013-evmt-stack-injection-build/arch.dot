@@ -1,0 +1,67 @@
+digraph Taint013 {
+    rankdir=LR;
+    bgcolor="#1a1b26";
+    fontcolor="white";
+    fontname="JetBrains Mono";
+    label="013 — Taint Injection Detection & Provenance Tracking";
+    labeljust=left;
+    pad=0.5;
+
+    node [fontname="JetBrains Mono", fontcolor="white", shape=box, style=rounded, penwidth=2];
+    edge [fontcolor="#565f89", color="#565f89", fontname="JetBrains Mono", fontsize=10];
+
+    subgraph cluster_middleware {
+        label="CmpLinearityTaint (cmp_linearity.rs)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        tb [label="TB\n{t: bool, nl: bool, provenance: u64}" shape=box style=rounded color="#73daca"];
+        calldataload [label="CALLDATALOAD\narg_idx = (off-4)/32\nset bit in provenance" color="#7aa2f7"];
+        sload [label="SLOAD\nclear provenance\nmerge host+local taint" color="#7aa2f7"];
+        mload [label="MLOAD\nclear provenance\npreserve t from mem" color="#7aa2f7"];
+        sstore [label="SSTORE\nOR provenance into\nhost.arg_slot_provenance" color="#7aa2f7"];
+        push_ctx [label="DELEGATECALL fix\npeek(2,3) not peek(3,4)\nshared_storage guard" color="#f7768e"];
+    }
+
+    subgraph cluster_host {
+        label="FuzzHost (host.rs)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        tainted_storage [label="tainted_storage\nHashMap<(Addr,Slot), TaintProvenance>\n{tainted, stored_value}" color="#bb9af7"];
+        arg_slot_prov [label="arg_slot_provenance\nHashMap<(Addr,Slot), u64>\naccumulated per slot" color="#bb9af7"];
+    }
+
+    subgraph cluster_feedback {
+        label="Feedback Layer (feedbacks.rs)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        chain [label="injection_chain_verdict()\nwalk TAINTED_CALLS\n→ INJECTION_CONFIRMED_EXPLOIT_PATH" color="#e0af68"];
+        metadata [label="ArgStorageProvenance\n{ per_slot: HashMap<(Addr,Slot), u64> }\ncollected after CmpLinearityTaint" color="#e0af68"];
+        flag_reset [label="Flag reset on each\nis_interesting() call" color="#e0af68"];
+    }
+
+    subgraph cluster_mutator {
+        label="Mutator (mutator.rs)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        locate [label="LOCATE Phase\nIdle: check provenance bitmap\n→ skip args with zero bits\nfor pin contract" color="#9ece6a"];
+    }
+
+    calldataload -> tb [label="  set t=true, provenace"];
+    mload -> tb [label="  t from mem, prov=0"];
+    sload -> tb [label="  merged, prov=0"];
+    sload -> tainted_storage [label="  read host"];
+    sstore -> tainted_storage [label="  write host"];
+    sstore -> arg_slot_prov [label="  OR provenance"];
+    tb -> chain [label="  feeds into"];
+    chain -> locate [label="  gates oracle fire"];
+    arg_slot_prov -> metadata [label="  snapshot"];
+    metadata -> locate [label="  per-contract OR → skip?"];
+}

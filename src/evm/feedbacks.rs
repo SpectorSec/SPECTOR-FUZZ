@@ -36,6 +36,8 @@ type EVMU256 = Uint<256, 4>;
 
 use std::cell::Cell;
 
+use super::middlewares::cmp_linearity::TaintDim;
+
 thread_local! {
     /// Feature 015 — the AMPLIFY objective (Decision A: raw attacker inflow drives the
     /// ledger-secant hot path; net-realized ETH stays the survivor selector at `:394`).
@@ -45,6 +47,10 @@ thread_local! {
     /// objective (publish + read happen on the same thread within one iteration) — no
     /// lock, no `unsafe`. Stays `0` when the feature is off (never written).
     static LEDGER_OBJECTIVE: Cell<u128> = const { Cell::new(0) };
+    /// Feature 016 Phase 3 — last detected dimension flow type from the taint
+    /// analysis reexecution. Set after CmpLinearityTaint runs, read by the mutator's
+    /// `apply_ledger_secant` to bias probe delta and mutation energy.
+    static DIMENSION_FLOW: Cell<TaintDim> = const { Cell::new(TaintDim::Generic) };
 }
 
 /// Publish this execution's raw-inflow objective (Feature 015). Only called when
@@ -56,6 +62,18 @@ pub fn publish_ledger_objective(value: u128) {
 /// Read the last published raw-inflow objective (Feature 015). `0` before any publish.
 pub fn read_ledger_objective() -> u128 {
     LEDGER_OBJECTIVE.with(|c| c.get())
+}
+
+/// Feature 016 Phase 3 — publish the detected dimension flow type from the taint
+/// analysis reexecution. Called from `Sha3WrappedFeedback::is_interesting()` after
+/// CmpLinearityTaint runs.
+pub fn publish_located_dim(dim: TaintDim) {
+    DIMENSION_FLOW.with(|c| c.set(dim));
+}
+
+/// Read the last published dimension flow type. `Generic` before any publish.
+pub fn read_located_dim() -> TaintDim {
+    DIMENSION_FLOW.with(|c| c.get())
 }
 
 /// Feature 013 Phase 6 — arg-to-storage provenance for ledger secant LOCATE.
@@ -125,6 +143,22 @@ where
                 crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
                 unsafe {
                     crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+                }
+                // Feature 016 Phase 3: publish the detected dimension flow type.
+                {
+                    use crate::evm::middlewares::cmp_linearity::{
+                        PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
+                    };
+                    let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
+                        TaintDim::Price
+                    } else if unsafe { ACCUMULATOR_INFLATION_FLOW } {
+                        TaintDim::Accumulator
+                    } else if unsafe { PROXY_TAINT_FLOW } {
+                        TaintDim::Generic  // proxy tag — not a dimension itself
+                    } else {
+                        TaintDim::Generic
+                    };
+                    publish_located_dim(dim);
                 }
                 // Feature 013 Phase 6: snapshot arg-slot provenance for the
                 // ledger secant LOCATE phase (reads it during mutation).

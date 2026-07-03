@@ -33,6 +33,12 @@ use crate::evm::{
     types::{as_u64, convert_u256_to_h160, EVMAddress, EVMFuzzState, EVMU256},
 };
 
+/// Feature 016 Phase 1 — known oracle selectors for per-word-offset dim tagging.
+const LATEST_ROUND_DATA_SEL: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8c];
+const LATEST_ANSWER_SEL: [u8; 4] = [0x50, 0xd2, 0x5b, 0x3a];
+const GET_ROUND_DATA_SEL: [u8; 4] = [0x9a, 0x6a, 0xd7, 0x90];
+const PEEK_SEL: [u8; 4] = [0x59, 0xe1, 0x1b, 0xe5];
+
 const MAX_CALL_DEPTH: u64 = 3;
 const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -69,6 +75,16 @@ pub static mut INJECTION_CONFIRMED_PROVENANCE: bool = false;
 
 /// Feature 013 Phase 5 — master flag: a tainted call passed GUARD + SINK + SELECTOR.
 pub static mut INJECTION_CONFIRMED_EXPLOIT_PATH: bool = false;
+
+/// Feature 016 Phase 2 — flow type detection flags.
+/// Proxy bridge: dim != Generic crosses DELEGATECALL boundary.
+pub static mut PROXY_TAINT_FLOW: bool = false;
+/// Price manipulation: Price-dim comparison gates value-moving CALL.
+pub static mut PRICE_MANIPULATION_FLOW: bool = false;
+/// Accumulator inflation: same slot written with Price-dim ≥2×.
+pub static mut ACCUMULATOR_INFLATION_FLOW: bool = false;
+/// Internal: Price-dim comparison seen before the next CALL.
+pub static mut PRICE_DIM_CMP_SEEN: bool = false;
 
 /// Phase 0 safety gate: true when the taint analysis reexecution actually ran
 /// this execution. When false, `injection_exploit_path_detected()` returns true
@@ -107,6 +123,10 @@ pub fn injection_reset_static() {
         INJECTION_CONFIRMED_PROVENANCE = false;
         INJECTION_CONFIRMED_EXPLOIT_PATH = false;
         INJECTION_ANALYSIS_RAN = false;
+        PROXY_TAINT_FLOW = false;
+        PRICE_MANIPULATION_FLOW = false;
+        ACCUMULATOR_INFLATION_FLOW = false;
+        PRICE_DIM_CMP_SEEN = false;
     }
     injection_reset_chain();
 }
@@ -203,7 +223,31 @@ pub fn lin_tick(routed: bool) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// Feature 016 — Taint dimension tags.
+/// Tags the economic dimension of a tainted value. Most-specific-wins lattice:
+/// Price > Accumulator > Balance > Timestamp > Generic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum TaintDim {
+    #[default]
+    Generic = 0,
+    Timestamp = 1,
+    Balance = 2,
+    Accumulator = 3,
+    Price = 4,
+}
+
+fn dim_priority(d: TaintDim) -> u8 {
+    match d {
+        TaintDim::Price => 5,
+        TaintDim::Accumulator => 4,
+        TaintDim::Balance => 3,
+        TaintDim::Timestamp => 2,
+        TaintDim::Generic => 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct TB {
     t: bool,
     nl: bool,
@@ -212,14 +256,22 @@ struct TB {
     /// the provenance chain. Propagated through linear/nonlinear ops via OR;
     /// cleared at SLOAD/MLOAD (memory/storage lose provenance).
     provenance: u64,
+    /// Feature 016 — economic dimension tag. Most-specific-wins propagation.
+    dim: TaintDim,
+}
+
+impl Default for TB {
+    fn default() -> Self {
+        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct Ctx {
-    mem: Vec<bool>,
-    storage: HashMap<EVMU256, bool>,
+    mem: Vec<TaintDim>,
+    storage: HashMap<EVMU256, TaintDim>,
     stack: Vec<TB>,
-    input_data: Vec<bool>,
+    input_data: Vec<TaintDim>,
     shared_storage: bool,
     tainted_record_idx: Option<usize>,
     callee: EVMAddress,
@@ -227,9 +279,9 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn read_input(&self, start: usize, length: usize) -> Vec<bool> {
+    fn read_input(&self, start: usize, length: usize) -> Vec<TaintDim> {
         let length = length.min(MEMORY_LIMIT_BYTES);
-        let mut res = vec![false; length];
+        let mut res = vec![TaintDim::Generic; length];
         let available = self.input_data.len();
         if start < available && length > 0 {
             let end = start.saturating_add(length).min(available);
@@ -241,12 +293,23 @@ impl Ctx {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CmpLinearityTaint {
-    mem: Vec<bool>,
-    storage: HashMap<EVMU256, bool>,
+    mem: Vec<TaintDim>,
+    storage: HashMap<EVMU256, TaintDim>,
     stack: Vec<TB>,
     ctxs: Vec<Ctx>,
+}
+
+impl Default for CmpLinearityTaint {
+    fn default() -> Self {
+        CmpLinearityTaint {
+            mem: Vec::new(),
+            storage: HashMap::new(),
+            stack: Vec::new(),
+            ctxs: Vec::new(),
+        }
+    }
 }
 
 impl CmpLinearityTaint {
@@ -273,17 +336,17 @@ impl CmpLinearityTaint {
         match safe_mem_end(offset, len) {
             Some(end) => {
                 if self.mem.len() < end {
-                    self.mem.resize(end, false);
+                    self.mem.resize(end, TaintDim::Generic);
                 }
-                self.mem[offset..end].iter().any(|x| *x)
+                self.mem[offset..end].iter().any(|d| *d != TaintDim::Generic)
             }
             None => false,
         }
     }
 
-    fn write_input(&self, start: usize, length: usize) -> Vec<bool> {
+    fn write_input(&self, start: usize, length: usize) -> Vec<TaintDim> {
         let length = length.min(MEMORY_LIMIT_BYTES);
-        let mut res = vec![false; length];
+        let mut res = vec![TaintDim::Generic; length];
         let available = self.mem.len();
         if start < available && length > 0 {
             let end = start.saturating_add(length).min(available);
@@ -345,6 +408,37 @@ impl CmpLinearityTaint {
     }
 }
 
+/// Feature 016 Phase 1 — tag oracle return data per word offset with
+/// dimension-specific TaintDim (Price / Timestamp / Generic).
+fn tag_oracle_return(mem: &mut Vec<TaintDim>, ret: &Bytes, selector: &[u8; 4]) {
+    let word_layout: &[(usize, TaintDim)] = if *selector == LATEST_ROUND_DATA_SEL || *selector == GET_ROUND_DATA_SEL {
+        &[
+            (0, TaintDim::Generic),    // roundId
+            (32, TaintDim::Price),     // answer
+            (64, TaintDim::Timestamp), // startedAt
+            (96, TaintDim::Timestamp), // updatedAt
+            (128, TaintDim::Generic),  // answeredInRound
+        ]
+    } else if *selector == LATEST_ANSWER_SEL {
+        &[(0, TaintDim::Price)]
+    } else if *selector == PEEK_SEL {
+        &[(0, TaintDim::Price)]
+    } else {
+        &[(0, TaintDim::Generic)]
+    };
+
+    for &(offset, dim) in word_layout {
+        let start = offset;
+        let end = (offset + 32).min(ret.len()).min(MEMORY_LIMIT_BYTES);
+        if end > start {
+            if mem.len() < end {
+                mem.resize(end, TaintDim::Generic);
+            }
+            mem[start..end].fill(dim);
+        }
+    }
+}
+
 impl<SC> Middleware<SC> for CmpLinearityTaint
 where
     SC: Scheduler<State = EVMFuzzState> + Clone,
@@ -364,7 +458,8 @@ where
                 self.stack.push($v)
             };
         }
-        // OR both fields over n popped slots, push one — LINEAR transfer.
+        // OR fields over n popped slots, push one — LINEAR transfer.
+        // Dim: most-specific-wins (highest dim_priority).
         macro_rules! linear {
             ($n:expr) => {{
                 let mut r = TB::default();
@@ -373,12 +468,16 @@ where
                     r.t |= x.t;
                     r.nl |= x.nl;
                     r.provenance |= x.provenance;
+                    if dim_priority(x.dim) > dim_priority(r.dim) {
+                        r.dim = x.dim;
+                    }
                 }
                 pushtb!(r);
             }};
         }
         // Non-linear op over n operands: result tainted if any operand tainted,
         // and marked non-linear whenever a tainted operand feeds it.
+        // Dim: reset to Generic (non-linear ops lose dimension context).
         macro_rules! nonlinear {
             ($n:expr) => {{
                 let mut t = false;
@@ -390,7 +489,7 @@ where
                     nl |= x.nl;
                     provenance |= x.provenance;
                 }
-                pushtb!(TB { t, nl: nl || t, provenance });
+                pushtb!(TB { t, nl: nl || t, provenance, dim: TaintDim::Generic });
             }};
         }
         macro_rules! popn {
@@ -408,7 +507,7 @@ where
         macro_rules! ensure {
             ($v:expr, $sz:expr) => {
                 if $v.len() < $sz {
-                    $v.resize($sz, false);
+                    $v.resize($sz, TaintDim::Generic);
                 }
             };
         }
@@ -419,7 +518,8 @@ where
                 let off = as_u64(interp.stack.peek(2).expect("stack")) as usize;
                 if let Some(end) = safe_mem_end(off, len) {
                     ensure!(self.mem, end);
-                    self.mem[off..end].copy_from_slice(vec![false; len].as_slice());
+                    let fill = vec![TaintDim::Generic; len];
+                    self.mem[off..end].copy_from_slice(fill.as_slice());
                 }
             }};
         }
@@ -444,6 +544,7 @@ where
                     t: a.t || b.t,
                     nl: a.nl || b.nl || both,
                     provenance: a.provenance | b.provenance,
+                    dim: if dim_priority(a.dim) > dim_priority(b.dim) { a.dim } else { b.dim },
                 });
             }
             0x03 => linear!(2),        // SUB
@@ -462,15 +563,24 @@ where
                     if nonlin {
                         LIN_SAW_NONLINEAR_CMP = true;
                     }
+                    // Feature 016 Phase 2: track Price-dim comparisons.
+                    if a.dim == TaintDim::Price || b.dim == TaintDim::Price {
+                        PRICE_DIM_CMP_SEEN = true;
+                    }
                     if let Some(m) = CMP_LINEARITY.as_mut() {
                         m.insert((interp.input.target_address, interp.bytecode.pc()), !nonlin);
                     }
                 }
-                pushtb!(TB { t: tainted, nl: nonlin, provenance: a.provenance | b.provenance });
+                pushtb!(TB {
+                    t: tainted,
+                    nl: nonlin,
+                    provenance: a.provenance | b.provenance,
+                    dim: if dim_priority(a.dim) > dim_priority(b.dim) { a.dim } else { b.dim },
+                });
             }
             0x15 => {
                 let a = pop!();
-                pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance });
+                pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance, dim: a.dim });
             }
             0x16..=0x18 => nonlinear!(2), // AND OR XOR
             0x19 => nonlinear!(1),     // NOT
@@ -478,7 +588,7 @@ where
             0x20 => {
                 // SHA3 — non-linear source.
                 popn!(2);
-                pushtb!(TB { t: true, nl: true, provenance: 0 });
+                pushtb!(TB { t: true, nl: true, provenance: 0, dim: TaintDim::Generic });
             }
             0x30 => clean!(),
             0x31 => linear!(1),        // BALANCE
@@ -493,12 +603,12 @@ where
                     if off == 0 {
                         clean!();
                     } else {
-                        let tainted = ctx.read_input(off, 32).contains(&true);
+                        let tainted = ctx.read_input(off, 32).iter().any(|d| *d != TaintDim::Generic);
                         let provenance = if tainted && off >= 4 {
                             let arg_idx = (off - 4) / 32;
                             if arg_idx < 64 { 1u64 << arg_idx } else { 0 }
                         } else { 0 };
-                        pushtb!(TB { t: tainted, nl: false, provenance });
+                        pushtb!(TB { t: tainted, nl: false, provenance, dim: TaintDim::Generic });
                     }
                 } else {
                     clean!();
@@ -519,7 +629,7 @@ where
                 let off = as_u64(interp.stack.peek(2).expect("stack")) as usize;
                 if let Some(end) = safe_mem_end(off, len) {
                     ensure!(self.mem, end);
-                    self.mem[off..end].copy_from_slice(vec![false; len].as_slice());
+                    self.mem[off..end].copy_from_slice(vec![TaintDim::Generic; len].as_slice());
                 }
             }
             0x3d => clean!(),
@@ -529,17 +639,28 @@ where
             // this, temporal gates (reward = f(block.number)) are seen as untainted and
             // never routed to the secant. Other block ctx (COINBASE/GASLIMIT/CHAINID/…)
             // stay clean.
-            0x42 | 0x43 => pushtb!(TB { t: true, nl: false, provenance: 0 }),
+            0x42 | 0x43 => pushtb!(TB { t: true, nl: false, provenance: 0, dim: TaintDim::Timestamp }),
             0x41 | 0x44..=0x48 => clean!(),
             0x50 => {
                 pop!();
             }
             0x51 => {
-                // MLOAD — memory carries only taint; nl and provenance reset (simplification).
+                // MLOAD — memory carries dim; nl and provenance reset (simplification).
                 pop!();
                 let off = as_u64(interp.stack.peek(0).expect("stack")) as usize;
                 let t = self.read_mem_tainted(off, 32);
-                pushtb!(TB { t, nl: false, provenance: 0 });
+                let dim = if t {
+                    match safe_mem_end(off, 32) {
+                        Some(end) => {
+                            if self.mem.len() < end { TaintDim::Generic }
+                            else { *self.mem[off..end].iter().max_by_key(|d| dim_priority(**d)).unwrap_or(&TaintDim::Generic) }
+                        }
+                        None => TaintDim::Generic,
+                    }
+                } else {
+                    TaintDim::Generic
+                };
+                pushtb!(TB { t, nl: false, provenance: 0, dim });
             }
             0x52 => {
                 popn!(1);
@@ -547,7 +668,8 @@ where
                 let v = pop!();
                 if let Some(end) = safe_mem_end(off, 32) {
                     ensure!(self.mem, end);
-                    self.mem[off..end].copy_from_slice(vec![v.t; 32].as_slice());
+                    let fill = vec![if v.t { v.dim } else { TaintDim::Generic }; 32];
+                    self.mem[off..end].copy_from_slice(fill.as_slice());
                 }
             }
             0x53 => {
@@ -556,28 +678,31 @@ where
                 let v = pop!();
                 if let Some(end) = safe_mem_end(off, 1) {
                     ensure!(self.mem, end);
-                    self.mem[off] = v.t;
+                    self.mem[off] = if v.t { v.dim } else { TaintDim::Generic };
                 }
             }
             0x54 | 0x5c => {
                 pop!();
                 let key = interp.stack.peek(0).expect("stack");
                 let address = interp.input.target_address;
-                let persistent = host.tainted_storage.get(&(address, key))
-                    .map(|p| p.tainted).unwrap_or(false);
-                let local = *self.storage.get(&key).unwrap_or(&false);
-                let merged = persistent || local;
-                self.storage.insert(key, merged);
+                let (persistent, host_dim) = host.tainted_storage.get(&(address, key))
+                    .map(|p| (p.tainted, p.dim))
+                    .unwrap_or((false, TaintDim::Generic));
+                let local_dim = self.storage.get(&key).copied().unwrap_or(TaintDim::Generic);
+                let merged = persistent || local_dim != TaintDim::Generic;
+                let dim = if dim_priority(host_dim) > dim_priority(local_dim) { host_dim } else { local_dim };
+                self.storage.insert(key, dim);
                 if merged && persistent {
                     INJECTION_CONFIRMED_PROVENANCE = true;
                 }
-                pushtb!(TB { t: merged, nl: false, provenance: 0 });
+                pushtb!(TB { t: merged, nl: false, provenance: 0, dim });
             }
             0x55 | 0x5d => {
                 pop!();
                 let v = pop!();
                 let key = interp.stack.peek(0).expect("stack");
-                self.storage.insert(key, v.t);
+                let dim = if v.t { v.dim } else { TaintDim::Generic };
+                self.storage.insert(key, dim);
                 let addr = interp.input.target_address;
                 if v.t {
                     host.tainted_storage.insert(
@@ -585,8 +710,17 @@ where
                         crate::evm::host::TaintProvenance {
                             tainted: true,
                             stored_value: interp.stack.peek(1).unwrap_or(EVMU256::ZERO),
+                            dim: v.dim,
                         },
                     );
+                }
+                // Feature 016 Phase 2: accumulator inflation — repeated Price-dim SSTORE to same slot.
+                if v.t && v.dim == TaintDim::Price {
+                    if let Some(existing) = host.tainted_storage.get(&(addr, key)) {
+                        if existing.tainted && existing.dim == TaintDim::Price {
+                            ACCUMULATOR_INFLATION_FLOW = true;
+                        }
+                    }
                 }
                 if v.provenance != 0 {
                     let entry = host.arg_slot_provenance
@@ -635,6 +769,11 @@ where
                 if tainted {
                     INJECTION_TAINTED_CALL_TARGET = true;
                 }
+                // Feature 016 Phase 2: Price-dim comparison followed by value-moving CALL.
+                if PRICE_DIM_CMP_SEEN {
+                    PRICE_MANIPULATION_FLOW = true;
+                    PRICE_DIM_CMP_SEEN = false;
+                }
                 let (calldata_off, calldata_len) = (
                     as_u64(interp.stack.peek(3).unwrap_or(EVMU256::ZERO)) as usize,
                     as_u64(interp.stack.peek(4).unwrap_or(EVMU256::ZERO)) as usize,
@@ -677,6 +816,16 @@ where
                 let tainted = stack_len >= 6 && self.stack[stack_len - 5].t;
                 if tainted {
                     INJECTION_TAINTED_CALL_TARGET = true;
+                }
+                // Feature 016 Phase 2: proxy bridge detection — dim != Generic passing through
+                // DELEGATECALL (shared_storage) boundary.
+                if stack_len >= 2 && self.stack.iter().any(|tb| tb.dim != TaintDim::Generic) {
+                    PROXY_TAINT_FLOW = true;
+                }
+                // Feature 016 Phase 2: Price-dim comparison → value-moving DELEGATECALL.
+                if PRICE_DIM_CMP_SEEN {
+                    PRICE_MANIPULATION_FLOW = true;
+                    PRICE_DIM_CMP_SEEN = false;
                 }
                 let (calldata_off, calldata_len) = (
                     as_u64(interp.stack.peek(2).unwrap_or(EVMU256::ZERO)) as usize,
@@ -740,11 +889,7 @@ where
             if let Some(ctx) = self.ctxs.last() {
                 if let Some(selectors) = host.oracle_selectors.get(&ctx.callee) {
                     if selectors.contains(&ctx.callee_selector) {
-                        let end = ret.len().min(MEMORY_LIMIT_BYTES);
-                        if self.mem.len() < end {
-                            self.mem.resize(end, false);
-                        }
-                        self.mem[..end].fill(true);
+                        tag_oracle_return(&mut self.mem, ret, &ctx.callee_selector);
                     }
                 }
             }

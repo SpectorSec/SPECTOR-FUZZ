@@ -721,7 +721,15 @@ where
         }
 
         let arg = if s.located { s.arg_idx } else { s.locate_cursor % n_args };
-        let probe_delta = (s.x1 / 16).max(BASE / 1000);
+        // Feature 016 Phase 3: dimension-appropriate probe delta.
+        let probe_delta = {
+            use crate::evm::middlewares::cmp_linearity::TaintDim;
+            match s.located_dim {
+                TaintDim::Price => (s.x1 / 256).max(BASE / 1000),
+                TaintDim::Balance => (s.x1 / 16).max(BASE / 1000),
+                _ => (s.x1 / 64).max(BASE / 1000),
+            }
+        };
 
         match s.phase {
             crate::feedback::SecantPhase::Idle => {
@@ -798,6 +806,8 @@ where
                     if s.locate_cursor >= n_args {
                         if s.best_sens > 0 {
                             s.arg_idx = s.best_arg;
+                            // Feature 016 Phase 3: record the located lever's dimension.
+                            s.located_dim = crate::evm::feedbacks::read_located_dim();
                             s.located = true;
                             s.prev_slope = None; // begin amplify fresh
                         } else {
@@ -1771,6 +1781,7 @@ mod tests {
             prev_x1: 500_000_000_000_000_000,
             prev_slope: Some(-77),
             cooldown: 8,
+            located_dim: crate::evm::middlewares::cmp_linearity::TaintDim::Price,
         };
         let encoded = serde_json::to_string(&s).expect("serialize");
         let d: LedgerSecantState = serde_json::from_str(&encoded).expect("deserialize");
@@ -1782,11 +1793,13 @@ mod tests {
         assert_eq!(d.x1, 1_000_000_000_000_000_000);
         assert_eq!(d.prev_slope, Some(-77));
         assert_eq!(d.cooldown, 8);
+        assert_eq!(d.located_dim, crate::evm::middlewares::cmp_linearity::TaintDim::Price);
         // Default is a clean Idle/unlocated state.
         let def = LedgerSecantState::default();
         assert_eq!(def.phase, SecantPhase::Idle);
         assert!(!def.located);
         assert_eq!(def.prev_slope, None);
+        assert_eq!(def.located_dim, crate::evm::middlewares::cmp_linearity::TaintDim::Generic);
     }
 
     // ── Tier 1: snapshot-secant unit fixtures (Feature 008) ─────────────────

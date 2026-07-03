@@ -136,12 +136,10 @@ impl CampaignTargetCache {
             exploit_targets: find_targets_by_selector(abi_map, exploit_sels),
             borrowable_tokens,
             generic_targets: find_generic_targets(abi_map),
-            // Feature 015: independent scan for the two reflexive-skew liquidity
-            // primitives, regardless of what the prime/exploit allowlists matched.
-            reflexive_targets: find_targets_by_selector(
-                abi_map,
-                &[SEL_ADD_LIQUIDITY, SEL_REMOVE_LIQUIDITY_IMBALANCE],
-            ),
+            // Feature 015: independent scan for the data-mined reflexive-lever catalogue
+            // (Curve skew levers + lending-fork rate-warpers), regardless of what the
+            // prime/exploit allowlists matched.
+            reflexive_targets: find_targets_by_selector(abi_map, REFLEXIVE_LEVER_SELECTORS),
         }
     }
 
@@ -183,9 +181,43 @@ pub fn plan_campaign(
 
 /// Feature 015 selectors of reflexive-skew liquidity primitives.
 /// `add_liquidity(uint256[N],uint256)` = 0x4515cef3 (Curve StableSwap 3-pool form);
-/// `remove_liquidity_imbalance(uint256[N],uint256)` = 0x9fdaea0c.
+/// `remove_liquidity_imbalance(uint256[N],uint256)` = 0x9fdaea0c. Kept as named
+/// references (tests + the canonical yDAI lever) and as the two highest-priority
+/// entries of `REFLEXIVE_LEVER_SELECTORS`.
 const SEL_ADD_LIQUIDITY: [u8; 4] = [0x45, 0x15, 0xce, 0xf3];
 const SEL_REMOVE_LIQUIDITY_IMBALANCE: [u8; 4] = [0x9f, 0xda, 0xea, 0x0c];
+
+/// Feature 015 — the reflexive-lever catalogue, data-mined from `calls.db` across the
+/// 57 cross-step reflexive incidents (see `.speckit/research/reflexive-lever-corpus-mining.md`).
+/// These are the attacker state-WARPERS: a mutating call whose write is consumed by a
+/// value-gating read (`get_virtual_price` / `exchangeRate` / `pricePerShare`) a few steps
+/// later. Ordered by promote priority — the Curve StableSwap skew levers first (the canonical
+/// yDAI family), then the lending-fork rate-warpers (Compound/Aave) that dominate the mined
+/// set. Pure positioners (`mint`/`enterMarkets`) are deliberately EXCLUDED: they open the
+/// position a later warper exploits, so they belong to the prime step, not the promoted lever.
+/// The independent scan populates `reflexive_targets` from whichever of these the harvested
+/// vocabulary exposes; `maybe_promote_lever` hoists the first match in this order.
+const REFLEXIVE_LEVER_SELECTORS: &[[u8; 4]] = &[
+    // Curve StableSwap skew levers (canonical yDAI family; highest promote priority)
+    SEL_ADD_LIQUIDITY,        // add_liquidity(uint256[3],uint256) = 0x4515cef3
+    [0x0b, 0x4c, 0x7e, 0x4d], // add_liquidity(uint256[2],uint256)
+    [0x02, 0x9b, 0x2f, 0x34], // add_liquidity(uint256[4],uint256)
+    SEL_REMOVE_LIQUIDITY_IMBALANCE, // remove_liquidity_imbalance(uint256[3],uint256) = 0x9fdaea0c
+    [0xe3, 0x10, 0x32, 0x73], // remove_liquidity_imbalance(uint256[2],uint256)
+    [0x18, 0xa7, 0xbd, 0x76], // remove_liquidity_imbalance(uint256[4],uint256)
+    [0x1a, 0x4d, 0x01, 0xd2], // remove_liquidity_one_coin(uint256,int128,uint256)
+    [0x3d, 0xf0, 0x21, 0x24], // exchange(int128,int128,uint256,uint256)
+    [0xa6, 0x41, 0x7e, 0xd6], // exchange_underlying(int128,int128,uint256,uint256)
+    // Lending-fork rate-warpers (Compound/Aave; the mined generalization)
+    [0xc5, 0xeb, 0xea, 0xec], // borrow(uint256)                          Compound
+    [0xea, 0xc5, 0xb6, 0xe1], // borrow(uint256,uint256,uint256,uint16,address) Aave
+    [0xdb, 0x00, 0x6a, 0x75], // redeem(uint256)
+    [0x85, 0x2a, 0x12, 0xe3], // redeemUnderlying(uint256)
+    [0xf5, 0xe3, 0xc4, 0x62], // liquidateBorrow(address,uint256,address)
+    [0x0e, 0x75, 0x27, 0x02], // repayBorrow(uint256)
+    [0x37, 0x1f, 0xd8, 0xe6], // repay(uint256)
+    [0x57, 0x3a, 0xde, 0x81], // repay(address,uint256,uint256,address)    Aave
+];
 
 /// Feature 015 — a-priori Promote. If the harvested vocabulary (target cache) contains a
 /// reflexive-skew liquidity primitive, return a pinned lever step for it. `add_liquidity`
@@ -193,7 +225,10 @@ const SEL_REMOVE_LIQUIDITY_IMBALANCE: [u8; 4] = [0x9f, 0xda, 0xea, 0x0c];
 /// `remove_liquidity_imbalance`. Keyed on selector presence so it fires on both the preset
 /// path (selectors seeded into the cache) and the onchain path (harvested ABIs).
 fn maybe_promote_lever(cache: &CampaignTargetCache) -> Option<ConciseEVMInput> {
-    for want in [SEL_ADD_LIQUIDITY, SEL_REMOVE_LIQUIDITY_IMBALANCE] {
+    // Hoist the highest-priority warper the target actually exposes: Curve skew levers
+    // first (canonical yDAI), then the lending-fork rate-warpers. Priority order lives in
+    // REFLEXIVE_LEVER_SELECTORS so the a-priori promote and the scan stay in lockstep.
+    for want in REFLEXIVE_LEVER_SELECTORS.iter().copied() {
         if let Some((addr, _sel, abi)) = cache.reflexive_targets.iter().find(|(_, sel, _)| *sel == want) {
             return Some(build_abi_step(*addr, Some(abi.clone())));
         }
@@ -725,6 +760,39 @@ mod tests {
         assert_eq!(lever_sel, SEL_ADD_LIQUIDITY, "promoted step is the add_liquidity lever");
         // The lever sits between prime and exploit (never last — the exploit reads after it).
         assert!(lever_idx < campaign.steps.len() - 1, "lever precedes the exploit step");
+    }
+
+    /// Feature 015 generalization (corpus-mined): a lending-fork target exposing only a
+    /// rate-warper (`borrow`, NO Curve pool present) is discovered by the expanded
+    /// REFLEXIVE_LEVER_SELECTORS catalogue and promoted a-priori — proving the archetype
+    /// covers the mined lending majority, not just Curve. a-posteriori stays disarmed.
+    #[test]
+    fn test_reflexive_lending_lever_promoted() {
+        let mut map = HashMap::new();
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let ctoken = EVMAddress::from([0x0d; 20]); // Compound cToken (the rate-warp host)
+        let borrow_sel = [0xc5, 0xeb, 0xea, 0xec]; // borrow(uint256), NOT a Curve selector
+        map.insert(ctoken, vec![make_abi(borrow_sel)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        assert!(
+            cache.reflexive_targets.iter().any(|(a, s, _)| *a == ctoken && *s == borrow_sel),
+            "mined catalogue must discover the lending rate-warper (no Curve pool present)"
+        );
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert_eq!(campaign.promoted.len(), 1, "the lending lever is promoted");
+        let sel = campaign.steps[campaign.promoted[0]]
+            .data
+            .as_ref()
+            .expect("promoted lever has a pinned ABI")
+            .function;
+        assert_eq!(sel, borrow_sel, "promoted step is the borrow rate-warper");
+        assert!(!campaign.aposteriori, "a-priori fired ⇒ a-posteriori disarmed");
     }
 
     /// Off-path proof: with `reflexive_lever=false` the same fixture yields NO promotion,

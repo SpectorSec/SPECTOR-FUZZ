@@ -92,6 +92,8 @@ pub static mut CMP_PC: [u64; MAP_SIZE] = [0u64; MAP_SIZE];
 pub struct TaintProvenance {
     pub tainted: bool,
     pub stored_value: EVMU256,
+    /// Feature 016 — economic dimension of the taint written to this slot.
+    pub dim: crate::evm::middlewares::cmp_linearity::TaintDim,
 }
 
 /// Cheap per-(contract, pc) ownership fingerprint for CMP_PC. 0 is reserved as
