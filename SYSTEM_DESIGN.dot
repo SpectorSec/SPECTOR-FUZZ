@@ -110,7 +110,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
             label="016 — TaintDim Engine  (cmp_linearity.rs)  [held LOCAL]";
             style=filled; color="#FFFDE7";
             dim_lat  [label="TaintDim Lattice  (max via derived Ord)\nPrice(4) > Accum(3) > Bal(2) > Ts(1) > Generic(0)\n(scalar collapse — see decoupled buses)"];
-            dim_flow [label="Flow-type flags (static mut)\nPROXY_TAINT_FLOW\nPRICE_MANIPULATION_FLOW\nACCUMULATOR_INFLATION_FLOW\nPRICE_DIM_CMP_SEEN"];
+            dim_flow [label="Flow-type flags (static mut)\nPROXY_TAINT_FLOW\nPRICE_MANIPULATION_FLOW\nACCUMULATOR_INFLATION_FLOW\nPRICE_DIM_CMP_SEEN\nTIMESTAMP_DIM_LOCATED (017)\nTIMESTAMP_TAINT_WRITTEN (017)"];
             dim_tag  [label="tag_oracle_return()  (L)\nChainlink (addr-gated) -> Price\n+ REFLEXIVE selectors -> Price:\nget_virtual_price / slot0 / pricePerShare /\nconvertToAssets / exchangeRateStored / get_dy\n+ carried across CALL return-data seam (⑥)", color="#00695C", fontcolor="#00695C"];
             dim_tag -> dim_lat  [label="dim assigned at CALL return  (L)", color="#00695C", fontcolor="#00695C"];
             dim_lat -> dim_flow [label="dim reaches sink -> flag set"];
@@ -177,7 +177,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     locate_f -> locate [label="filtered arg set"];
 
     // 016 -> AMPLIFY: dimension-aware probe (CRITICAL PATH — thick)
-    dim_flow -> amplify [style=bold, penwidth=3, label="CRITICAL: located_dim -> probe_delta\n(feedbacks.rs:152-156 -> read_located_dim)\nPrice=/256 vs else=/64 → 4x resolution on the lever"];
+    dim_flow -> amplify [style=bold, penwidth=3, label="CRITICAL: located_dim -> probe_delta\n(feedbacks.rs:152-156 -> read_located_dim)\nPrice=/256, Accum=/256, Bal=/16, else=/64"];
 
     // AMPLIFY -> planner: mutator bias feedback
     amplify -> planner [label="signed derivative + dim probe → next mutation biased"];
