@@ -241,6 +241,7 @@ mod tests {
     use crate::evm::types::EVMAddress;
     use std::str::FromStr;
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_access_list_slot_detection() {
         // Initialize OnChainConfig with a public RPC to verify.

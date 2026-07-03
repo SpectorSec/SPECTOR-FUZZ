@@ -279,6 +279,13 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     reflexive_lever: bool,
 
+    /// Feature 017: enable Dimension-Driven Warp coupling. When active, the campaign
+    /// planner engages the warp lever (block advance between prime and exploit) when
+    /// the taint engine's Timestamp-presence bit reaches SSTORE during reexecution —
+    /// even without --temporal-skimming. Additive to the existing flag-driven path.
+    #[arg(long, default_value = "false")]
+    dimension_warp: bool,
+
     /// Feature 013 Phase 1: shallow injection detection at CALL boundaries.
     /// When enabled, the reexecution taint engine reads shadow-stack and memory taint
     /// at each CALL/DELEGATECALL/STATICCALL boundary and sets static flags for
@@ -981,6 +988,7 @@ pub fn evm_main(mut args: EvmArgs) {
         // Feature 015: reflexive lever auto-enables its two hard prerequisites (above:
         // campaign_orchestrator + impact_eth_gradient OR'd with args.reflexive_lever).
         reflexive_lever: args.reflexive_lever,
+        dimension_warp: args.dimension_warp,
         injection_detect: args.injection_detect,
         injection_persist: args.injection_persist,
         injection_provenance: args.injection_provenance,
@@ -1031,7 +1039,6 @@ pub fn evm_main(mut args: EvmArgs) {
     evm_fuzzer(config, &mut state)
 }
 
-// #[test]
 fn test_evm_offchain_setup() {
     let mut args = EvmArgs {
         proxy_address: String::from("http://localhost:5001/data"),
@@ -1203,6 +1210,7 @@ fn test_evm_offchain_setup() {
         // Feature 015: reflexive lever auto-enables campaign_orchestrator (above) +
         // impact_eth_gradient (OR'd with args.reflexive_lever at their fields).
         reflexive_lever: args.reflexive_lever,
+        dimension_warp: args.dimension_warp,
         injection_detect: args.injection_detect,
         injection_persist: args.injection_persist,
         injection_provenance: args.injection_provenance,

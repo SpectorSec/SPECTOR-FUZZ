@@ -379,6 +379,7 @@ mod tests {
         types::EVMAddress,
     };
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_pegged_next_hop() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(BSC, 22055611));
@@ -387,6 +388,7 @@ mod tests {
         assert!(v.src == "pegged_weth");
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_all_hops() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(BSC, 22055611));
@@ -396,6 +398,7 @@ mod tests {
         assert!(!v.is_empty());
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_pair() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(ETH, 19021411));
@@ -406,6 +409,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_fetch_uniswap_path() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(BSC, 22055611));
@@ -417,6 +421,7 @@ mod tests {
         assert!(!v.weth_address.is_zero());
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_fetch_uniswap_path_wbnb() {
         let mut config: Box<dyn ChainConfig> = Box::new(OnChainConfig::new(BSC, 22055611));

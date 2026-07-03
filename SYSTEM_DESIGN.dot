@@ -1,21 +1,19 @@
 // =============================================================================
-// SPECTOR-FUZZ — Canonical System Design v3
+// SPECTOR-FUZZ — Canonical System Design v4
 //
 // Lineage: v1 (Claude, code-grounded) -> v2 (DeepSeek, structural refactor) ->
-//          v3 (Claude, reconciled against `main` + held-local taint stack).
+//          v3 (Claude, reconciled against `main`) ->
+//          v4 (DeepSeek, 017 Coupled Signal Buses built + integration_test feature).
 //
-// Changes from v2 (DeepSeek):
-//   1. KEPT v2's interceptor(during-exec 014) vs post-exec oracle-suite split — better.
-//   2. KEPT v2's thick 015<->016 critical path.
-//   3. FLIPPED reflexive-valuation tagging from PROPOSED-red to BUILT.
-//      Verified wired: is_reflexive_valuation_selector cmp_linearity.rs:63 / :487 / :1091.
-//      Marked (LOCAL-ONLY, unpushed) — this is why v2 (diffing stale remote) missed it.
-//   4. FIXED o_erc20 -> amplify: was drawn BUILT; oracles do NOT touch the secant
-//      (oracles/*.rs has zero refs to located_dim/amplify/LedgerSecant). Now PROPOSED.
-//   5. CORRECTED the flag->scheduler label: flags DO feed located_dim->probe
-//      (feedbacks.rs:152-156); what's missing is scheduler-ENERGY boost. New 4th bus.
-//   6. DROPPED two speculative feedback edges with no code basis
-//      (o_reent->prov_src, mw_dos->o_temp).
+// Changes from v3:
+//   1. FLIPPED dim_flow -> temporal from dashed-red to BUILT (017 Wire B:
+//      TIMESTAMP_DIM_LOCATED flag + --dimension-warp CLI gate, planner warp lever).
+//   2. KEPT three remaining dashed-red edges as PROPOSED
+//      (ghost->provenance, cross-contract provenance, dim_flow->scheduler energy)
+//      — each is gated behind a missing primitive or deferred Phase 2.
+//   3. Added Accumulator probe granularity (017): probe_delta at /256 same as Price.
+//   4. Moved 14 RPC-dependent tests behind `integration_test` feature flag
+//      for clean local runs (148 passed, 0 failed, 14 ignored).
 //
 // LINE STYLE CONTRACT:
 //   solid black  = BUILT (in code; (L) = held local/unpushed)
@@ -23,7 +21,7 @@
 //   dotted       = feedback / confirmation loop (BUILT)
 //   thick        = critical path (015<->016 bridge)
 // =============================================================================
-digraph SPECTOR_FUZZ_CANONICAL_V3 {
+digraph SPECTOR_FUZZ_CANONICAL_V4 {
     rankdir=TB;
     splines=true;
     compound=true;
@@ -33,7 +31,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V3 {
     ranksep=0.75;
     labelloc="t";
     fontsize=16;
-    label="SPECTOR-FUZZ — Canonical System Design v3 (2026-07-03, reconciled)";
+    label="SPECTOR-FUZZ — Canonical System Design v4 (2026-07-03, 017 built)";
 
     node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
     edge [fontname="Helvetica", fontsize=9];
@@ -168,7 +166,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V3 {
         style=filled; color="#FBE9E7";
         promote [label="PROMOTE\na-priori: TopologyReport\na-posteriori: T10 ledger delta"];
         locate  [label="LOCATE\nempirical secant sweep\n(provenance-filtered args)\n yields located_dim"];
-        amplify [label="AMPLIFY\nsigned secant derivative\n→ dimension-aware probe delta\nPrice=/256, Bal=/16, else=/64\nfloor: max(., BASE/1000 = 0.001 ETH)"];
+        amplify [label="AMPLIFY\nsigned secant derivative\n→ dimension-aware probe delta\nPrice=/256, Accum=/256, Bal=/16, else=/64\nfloor: max(., BASE/1000 = 0.001 ETH)"];
         promote -> locate [label="lever candidate"];
         locate -> amplify [label="derivative sign + magnitude"];
     }
@@ -191,16 +189,16 @@ digraph SPECTOR_FUZZ_CANONICAL_V3 {
     temporal [label="Temporal Skimming (005)\nwarp insertion + temporal skim oracle\ndivergence > 0.001 ETH\nWarp(10) between campaign steps", shape=note, style=filled, fillcolor="#B2DFDB"];
 
     // =========================================================================
-    // DECOUPLED BUSES  (dashed red — signals exist, not routed) — Feature 017 scope
+    // DECOUPLED BUSES  — 3 remaining dashed-red, 1 now BUILT (017)
     // =========================================================================
-    dim_flow -> temporal [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="017 Wire B: Timestamp dim -> warp lever\nwarp is flag-gated (campaign_planner.rs:304), not dim-gated\nscalar .max() drops Ts under Price (017 Wire A fixes)"];
+    dim_flow -> temporal [style=bold, color="#1B5E20", fontcolor="#1B5E20",
+                          label="017 Wire B: TIMESTAMP_DIM_LOCATED + --dimension-warp\nflag published in feedbacks, planner warp gate\n(campaign_planner.rs:307-310)\nts_seen survival: 017 Wire A (cmp_linearity.rs:291 / :314)"];
     ghost    -> prov_src [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="PROPOSED: caller identity -> provenance\nCALLER = clean(0) today\n(017 OUT-of-scope: correct within calldata threat model)"];
+                          label="PROPOSED: caller identity -> provenance\nCALLER = clean(0) today\n(out-of-scope: correct within calldata threat model)"];
     prov_map -> locate   [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="017 Phase 2: cross-contract provenance\nsame-contract only today (mutator.rs:757)"];
+                          label="PROPOSED: cross-contract provenance\nsame-contract only today (mutator.rs:757)"];
     dim_flow -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="NEW (DeepSeek v2): flow-flag -> scheduler ENERGY\nflags DO feed located_dim->probe; do NOT boost\nscheduler vote weight. PRICE_MANIP->high, ACCUM->med"];
+                          label="PROPOSED: flow-flag -> scheduler ENERGY\nflags DO feed located_dim->probe; do NOT boost\nscheduler vote weight. PRICE_MANIP->high, ACCUM->med"];
 
     // =========================================================================
     // LIQUIDATION — EXTRACTABILITY CONFIRMATION

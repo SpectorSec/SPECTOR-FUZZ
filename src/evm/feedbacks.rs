@@ -148,6 +148,7 @@ where
                 {
                     use crate::evm::middlewares::cmp_linearity::{
                         PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
+                        TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
                     };
                     let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
                         TaintDim::Price
@@ -159,6 +160,11 @@ where
                         TaintDim::Generic
                     };
                     publish_located_dim(dim);
+                    // Feature 017 Wire B: publish Timestamp-dim-located alongside located_dim.
+                    // True when any SSTORE wrote a value with ts_seen=true during reexecution.
+                    unsafe {
+                        TIMESTAMP_DIM_LOCATED = TIMESTAMP_TAINT_WRITTEN;
+                    }
                 }
                 // Feature 013 Phase 6: snapshot arg-slot provenance for the
                 // ledger secant LOCATE phase (reads it during mutation).

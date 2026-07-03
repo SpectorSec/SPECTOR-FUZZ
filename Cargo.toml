@@ -24,6 +24,7 @@ cmp = []
 dataflow = []
 evaluation = []
 ondisk_corpus = []
+integration_test = []
 # need to turn off when running DV contracts
 deployer_is_attacker = []
 print_infant_corpus = []

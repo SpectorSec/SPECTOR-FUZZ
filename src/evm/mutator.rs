@@ -297,6 +297,10 @@ where
     /// Feature 015: enable reflexive-lever promotion (hoist the skew lever into the
     /// campaign frame so the ledger-secant can amount-tune it).
     pub reflexive_lever: bool,
+    /// Feature 017: enable dimension-driven warp engagement. When active, the planner
+    /// gates the warp lever on TIMESTAMP_DIM_LOCATED (set when the taint engine's
+    /// ts_seen bit reached SSTORE during reexecution) in addition to --temporal-skimming.
+    pub dimension_warp: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
 
@@ -309,13 +313,14 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool, reflexive_lever: bool) -> Self {
+    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool, reflexive_lever: bool, dimension_warp: bool) -> Self {
         Self {
             infant_scheduler,
             campaign_orchestrator,
             ghost_identities,
             temporal_skimming,
             reflexive_lever,
+            dimension_warp,
             phantom: Default::default(),
         }
     }
@@ -726,6 +731,7 @@ where
             use crate::evm::middlewares::cmp_linearity::TaintDim;
             match s.located_dim {
                 TaintDim::Price => (s.x1 / 256).max(BASE / 1000),
+                TaintDim::Accumulator => (s.x1 / 256).max(BASE / 1000), // 017: same /256 as Price
                 TaintDim::Balance => (s.x1 / 16).max(BASE / 1000),
                 _ => (s.x1 / 64).max(BASE / 1000),
             }
@@ -961,7 +967,7 @@ where
                     // The removed anchor read observed_values (ABI-return words), which
                     // misread approve's bool `true` as profit and skewed chains toward
                     // approve→approve. Economic truth now lives solely at the ledger.
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, &mut plan_rand) {
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, &mut plan_rand) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This

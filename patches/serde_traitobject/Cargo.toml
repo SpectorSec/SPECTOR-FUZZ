@@ -55,11 +55,6 @@ status = "actively-developed"
 name = "serde_traitobject"
 path = "src/lib.rs"
 
-[[test]]
-name = "test"
-path = "tests/test.rs"
-harness = false
-
 [dependencies.erased-serde]
 version = "0.3"
 

@@ -176,7 +176,7 @@ pub fn plan_campaign(
     let mut rand = StdRand::with_seed(0xC0FFEE);
     // Deterministic/test entry keeps reflexive promotion OFF; the live fuzzer path
     // (mutator) passes `self.reflexive_lever`.
-    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, &mut rand)
+    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, false, &mut rand)
 }
 
 /// Feature 015 selectors of reflexive-skew liquidity primitives.
@@ -253,6 +253,7 @@ pub fn plan_campaign_sampled<R: Rand>(
     topology_report: Option<&TopologyReport>,
     temporal_skimming: bool,
     reflexive_lever: bool,
+    dimension_warp: bool,
     rand: &mut R,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
@@ -301,7 +302,12 @@ pub fn plan_campaign_sampled<R: Rand>(
     // block progression during which state divergence (interest accrual, reward
     // accumulation, oracle price changes) can occur off-screen.
     let mut warps: Vec<(usize, u64)> = Vec::new();
-    if temporal_skimming {
+    // Feature 017 Wire B: engage warp when dimension-driven (timestamp taint reached SSTORE)
+    // OR flag-driven. dimension_warp gates the static read so the feature is off by default.
+    let ts_located = dimension_warp && unsafe {
+        crate::evm::middlewares::cmp_linearity::TIMESTAMP_DIM_LOCATED
+    };
+    if temporal_skimming || ts_located {
         // The exploit step is always the last step. Insert warp before it.
         // Index is steps.len() - 1 (0-indexed).
         let exploit_idx = steps.len() - 1;
@@ -748,7 +754,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "exactly one lever promoted");
         let lever_idx = campaign.promoted[0];
@@ -783,7 +789,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "the lending lever is promoted");
         let sel = campaign.steps[campaign.promoted[0]]
@@ -807,7 +813,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no promotion when reflexive_lever is off");
         assert_eq!(campaign.steps.len(), 2, "plain prime→exploit frame, lever untouched");
@@ -830,7 +836,7 @@ mod tests {
         assert!(cache.reflexive_targets.is_empty(), "fixture has no reflexive archetype");
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no a-priori lever to promote");
         assert!(campaign.aposteriori, "reflexive path with no archetype must arm a-posteriori");
@@ -848,7 +854,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "a-priori lever promoted");
         assert!(!campaign.aposteriori, "a-priori match ⇒ a-posteriori disarmed");
@@ -864,7 +870,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(!campaign.aposteriori, "flag off ⇒ never armed");
     }

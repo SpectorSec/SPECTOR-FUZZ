@@ -517,23 +517,4 @@ impl OffChainArtifact {
 }
 
 #[cfg(test)]
-mod tests {
-    // use tracing::debug;
-    // use crate::evm::blaz::offchain_artifacts::OffChainArtifact;
-    //
-    // #[test]
-    // fn test_from_url() {
-    //     use super::*;
-    //     // let url =
-    // "/Users/shou/coding/test_foundry/build-info/
-    // 685c8631ec48f140bc646da3dcfdb3d9.json";     // let artifact =
-    // OffChainArtifact::from_solc_file(url.to_string()).expect("get artifact
-    // failed");     // chdir
-    //     let dir = "/Users/shou/coding/test_foundry";
-    //     std::env::set_current_dir(dir).expect("set current dir failed");
-    //
-    //     let artifact = OffChainArtifact::from_command("solc
-    // src/Counter.sol".to_string()).expect("get artifact failed");
-    //     println!("{:?}", artifact);
-    // }
-}
+mod tests {}

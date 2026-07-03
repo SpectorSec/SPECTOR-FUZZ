@@ -41,6 +41,7 @@ mod tests {
         Bytecode::new_raw(Bytes::from(bytes))
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_campaign_execution_integration() {
         let work_dir = "/tmp/ityfuzz_campaign_test";

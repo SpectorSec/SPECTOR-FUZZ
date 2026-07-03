@@ -1816,6 +1816,7 @@ mod tests {
         types::EVMAddress,
     };
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_onchain_config() {
         let config = OnChainConfig::new(BSC, 0);
@@ -1826,6 +1827,7 @@ mod tests {
         debug!("{:?}", v)
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_contract_slot() {
         let mut config = OnChainConfig::new(BSC, 0);
@@ -1837,6 +1839,7 @@ mod tests {
         debug!("{:?}", v)
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_fetch_abi() {
         let mut config = OnChainConfig::new(BSC, 0);
@@ -1844,6 +1847,7 @@ mod tests {
         debug!("{:?}", v)
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_balance() {
         let mut config = OnChainConfig::new(ETH, 18168677);
@@ -1852,6 +1856,7 @@ mod tests {
         assert!(v == EVMU256::from(439351222497229612i64));
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_pair_pegged() {
         let mut config = OnChainConfig::new(BSC, 22055611);
@@ -1864,6 +1869,7 @@ mod tests {
         assert!(!v.is_empty() && v.len() < 10);
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn test_get_token_balance() {
         let mut config = OnChainConfig::new(BSC, 37381166);
@@ -1874,6 +1880,7 @@ mod tests {
         println!("{:?}", v);
     }
 
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
     #[test]
     fn get_v3_fee() {
         let mut config = OnChainConfig::new(BSC, 37381166);
@@ -1989,45 +1996,4 @@ mod tests {
         assert_eq!(pair_data.in_token, "0x00000000000000000000000000000000000000bb");
     }
 
-    // #[test]
-    // fn test_fetch_token_price() {
-    //     let mut config = OnChainConfig::new(BSC, 0);
-    //     config.add_moralis_api_key(
-    //         "ocJtTEZWOJZjYOMAQjRmWcHpvUdieMLJDAtUjycFNTdSxgFGofNJhdiRX0Kk1h1O".to_string(),
-    //     );
-    //     let v = config.fetch_token_price(
-    //         EVMAddress::from_str("0xa0a2ee912caf7921eaabc866c6ef6fec8f7e90a4"
-    // ).unwrap(),     );
-    //     debug!("{:?}", v)
-    // }
-    //
-    // #[test]
-    // fn test_fetch_storage_all() {
-    //     let mut config = OnChainConfig::new(BSC, 0);
-    //     let v = config.fetch_storage_all(
-    //         EVMAddress::from_str("0x2aB472b185787b665f334F12618254CaCA668e49"
-    // ).unwrap(),     );
-    //     debug!("{:?}", v)
-    // }
-
-    // #[test]
-    // fn test_fetch_storage_dump() {
-    //     let mut config = OnChainConfig::new(ETH, 0);
-    //     let v = config
-    //         .fetch_storage_dump(
-    //
-    // EVMAddress::from_str("0x3ea826a2724f3df727b64db552f3103192158c58").
-    // unwrap(),         )
-    //         .unwrap();
-
-    //     let v0 = v.get(&EVMU256::from(0)).unwrap().clone();
-
-    //     let slot_v = config.get_contract_slot(
-    //         EVMAddress::from_str("0x3ea826a2724f3df727b64db552f3103192158c58"
-    // ).unwrap(),         EVMU256::from(0),
-    //         false,
-    //     );
-
-    //     assert_eq!(slot_v, v0);
-    // }
 }

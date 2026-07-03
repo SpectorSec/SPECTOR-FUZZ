@@ -110,6 +110,10 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     /// Implies `campaign_orchestrator` + `impact_eth_gradient` (auto-enabled with a
     /// warning if unset — the lever is inert without them).
     pub reflexive_lever: bool,
+    /// Feature 017: enable Dimension-Driven Warp coupling. When active, the planner
+    /// gates the warp lever on TIMESTAMP_DIM_LOCATED (ts_seen reaches SSTORE) as well
+    /// as the --temporal-skimming flag. Additive path.
+    pub dimension_warp: bool,
     /// Feature 013 Phase 1: shallow injection detection at CALL boundaries.
     pub injection_detect: bool,
     /// Feature 013 Phase 3: persistent cross-execution taint via FuzzHost.

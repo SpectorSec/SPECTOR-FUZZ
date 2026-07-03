@@ -94,6 +94,10 @@ pub struct TaintProvenance {
     pub stored_value: EVMU256,
     /// Feature 016 — economic dimension of the taint written to this slot.
     pub dim: crate::evm::middlewares::cmp_linearity::TaintDim,
+    /// Feature 017 Wire A — Timestamp-present bit. OR-merged at SSTORE so the
+    /// temporal provenance survives the .max() scalar collapse and persists
+    /// across executions. Read back at SLOAD to propagate ts_seen.
+    pub ts_seen: bool,
 }
 
 /// Cheap per-(contract, pc) ownership fingerprint for CMP_PC. 0 is reserved as

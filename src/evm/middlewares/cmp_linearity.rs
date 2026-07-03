@@ -122,6 +122,14 @@ pub static mut ACCUMULATOR_INFLATION_FLOW: bool = false;
 /// Internal: Price-dim comparison seen before the next CALL.
 pub static mut PRICE_DIM_CMP_SEEN: bool = false;
 
+/// Feature 017 Wire B — published alongside located_dim. True when the located
+/// lever carried Timestamp taint (ts_seen reached SSTORE). Read by the planner
+/// to engage the warp lever dimensionally (campaign_planner.rs).
+pub static mut TIMESTAMP_DIM_LOCATED: bool = false;
+/// Feature 017 internal — set during reexecution when any SSTORE writes a value
+/// with ts_seen=true. Checked after reexecution to set TIMESTAMP_DIM_LOCATED.
+pub static mut TIMESTAMP_TAINT_WRITTEN: bool = false;
+
 /// Phase 0 safety gate: true when the taint analysis reexecution actually ran
 /// this execution. When false, `injection_exploit_path_detected()` returns true
 /// (no gating), so oracles fire as normal for step/non-concolic inputs.
@@ -163,6 +171,8 @@ pub fn injection_reset_static() {
         PRICE_MANIPULATION_FLOW = false;
         ACCUMULATOR_INFLATION_FLOW = false;
         PRICE_DIM_CMP_SEEN = false;
+        TIMESTAMP_DIM_LOCATED = false;
+        TIMESTAMP_TAINT_WRITTEN = false;
     }
     injection_reset_chain();
 }
@@ -289,11 +299,16 @@ struct TB {
     provenance: u64,
     /// Feature 016 — economic dimension tag. Most-specific-wins propagation.
     dim: TaintDim,
+    /// Feature 017 Wire A — Timestamp-present bit that survives the .max() merge
+    /// via OR (where dim gets collapsed). Set on TIMESTAMP/NUMBER opcode, OR'd
+    /// through linear ops, reset by nonlinear ops. Published at SSTORE as
+    /// TaintProvenance.ts_seen for persistence; SLOAD merges it back.
+    ts_seen: bool,
 }
 
 impl Default for TB {
     fn default() -> Self {
-        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic }
+        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic, ts_seen: false }
     }
 }
 
@@ -373,6 +388,7 @@ impl CmpLinearityTaint {
             INJECTION_TAINTED_CALLDATA = false;
             INJECTION_CONFIRMED_PROVENANCE = false;
             INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+            TIMESTAMP_TAINT_WRITTEN = false;
         }
         injection_reset_chain();
     }
@@ -531,6 +547,7 @@ where
         }
         // OR fields over n popped slots, push one — LINEAR transfer.
         // Dim: most-specific-wins via TaintDim's Ord (a.dim.max(b.dim)).
+        // 017: ts_seen OR-merged so Timestamp provenance survives scalar collapse.
         macro_rules! linear {
             ($n:expr) => {{
                 let mut r = TB::default();
@@ -540,6 +557,7 @@ where
                     r.nl |= x.nl;
                     r.provenance |= x.provenance;
                     r.dim = r.dim.max(x.dim); // most-specific-wins via TaintDim Ord
+                    r.ts_seen |= x.ts_seen; // OR-merge: preserves through .max() collapse
                 }
                 pushtb!(r);
             }};
@@ -547,6 +565,7 @@ where
         // Non-linear op over n operands: result tainted if any operand tainted,
         // and marked non-linear whenever a tainted operand feeds it.
         // Dim: reset to Generic (non-linear ops lose dimension context).
+        // 017: ts_seen reset (non-linear ops lose all temporal context).
         macro_rules! nonlinear {
             ($n:expr) => {{
                 let mut t = false;
@@ -558,7 +577,7 @@ where
                     nl |= x.nl;
                     provenance |= x.provenance;
                 }
-                pushtb!(TB { t, nl: nl || t, provenance, dim: TaintDim::Generic });
+                pushtb!(TB { t, nl: nl || t, provenance, dim: TaintDim::Generic, ts_seen: false });
             }};
         }
         macro_rules! popn {
@@ -614,6 +633,7 @@ where
                     nl: a.nl || b.nl || both,
                     provenance: a.provenance | b.provenance,
                     dim: a.dim.max(b.dim),
+                    ts_seen: a.ts_seen || b.ts_seen, // 017: temporal signal passes through MUL
                 });
             }
             0x03 => linear!(2),        // SUB
@@ -641,6 +661,7 @@ where
                     nl: tainted, // non-linear whenever a tainted operand feeds the DIV
                     provenance: a.provenance | b.provenance,
                     dim,
+                    ts_seen: a.ts_seen || b.ts_seen, // 017: temporal signal preserved through division
                 });
             }
             0x06..=0x07 => nonlinear!(2), // MOD SMOD — truly dimensionless
@@ -659,6 +680,7 @@ where
                     nl: tainted,
                     provenance: _size.provenance | value.provenance,
                     dim: value.dim,
+                    ts_seen: _size.ts_seen || value.ts_seen, // 017: temporal signal survives signextend
                 });
             }
             // LT GT SLT SGT EQ — the GATE. Record classification.
@@ -685,6 +707,7 @@ where
                     nl: nonlin,
                     provenance: a.provenance | b.provenance,
                     dim: a.dim.max(b.dim),
+                    ts_seen: a.ts_seen || b.ts_seen, // 017: temporal signal passes through comparisons
                 });
             }
             0x15 => {
@@ -698,7 +721,7 @@ where
                 if a.t && a.dim == TaintDim::Price {
                     PRICE_DIM_CMP_SEEN = true;
                 }
-                pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance, dim: a.dim });
+                pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance, dim: a.dim, ts_seen: a.ts_seen });
             }
             // AND — non-linear for the secant, but dimension-PRESERVING when one
             // operand is a constant BITMASK. This is how packed storage words are
@@ -715,7 +738,7 @@ where
                     (x, y) => x.max(y),
                 };
                 let tainted = a.t || b.t;
-                pushtb!(TB { t: tainted, nl: tainted, provenance: a.provenance | b.provenance, dim });
+                pushtb!(TB { t: tainted, nl: tainted, provenance: a.provenance | b.provenance, dim, ts_seen: a.ts_seen || b.ts_seen });
             }
             0x17..=0x18 => nonlinear!(2), // OR XOR — genuine bit-mixing, dimension-destroying
             0x19 => nonlinear!(1),     // NOT
@@ -733,12 +756,13 @@ where
                     nl: tainted,
                     provenance: _shift.provenance | value.provenance,
                     dim: value.dim, // value's economic dimension survives the shift
+                    ts_seen: _shift.ts_seen || value.ts_seen, // 017: temporal signal survives the shift
                 });
             }
             0x20 => {
                 // SHA3 — non-linear source.
                 popn!(2);
-                pushtb!(TB { t: true, nl: true, provenance: 0, dim: TaintDim::Generic });
+                pushtb!(TB { t: true, nl: true, provenance: 0, dim: TaintDim::Generic, ts_seen: false });
             }
             0x30 => clean!(),
             0x31 => linear!(1),        // BALANCE
@@ -758,7 +782,7 @@ where
                             let arg_idx = (off - 4) / 32;
                             if arg_idx < 64 { 1u64 << arg_idx } else { 0 }
                         } else { 0 };
-                        pushtb!(TB { t: tainted, nl: false, provenance, dim: TaintDim::Generic });
+                        pushtb!(TB { t: tainted, nl: false, provenance, dim: TaintDim::Generic, ts_seen: false });
                     }
                 } else {
                     clean!();
@@ -800,12 +824,13 @@ where
                     }
                 }
             }
-            // TIMESTAMP (0x42) / NUMBER (0x43): the warp-controllable clock — a LINEAR
+             // TIMESTAMP (0x42) / NUMBER (0x43): the warp-controllable clock — a LINEAR
             // taint source for the warp secant (008), exactly like calldata. Without
             // this, temporal gates (reward = f(block.number)) are seen as untainted and
             // never routed to the secant. Other block ctx (COINBASE/GASLIMIT/CHAINID/…)
             // stay clean.
-            0x42 | 0x43 => pushtb!(TB { t: true, nl: false, provenance: 0, dim: TaintDim::Timestamp }),
+            // 017: ts_seen=true preserves Timestamp provenance through .max() merge.
+            0x42 | 0x43 => pushtb!(TB { t: true, nl: false, provenance: 0, dim: TaintDim::Timestamp, ts_seen: true }),
             0x41 | 0x44..=0x48 => clean!(),
             0x50 => {
                 pop!();
@@ -826,7 +851,7 @@ where
                 } else {
                     TaintDim::Generic
                 };
-                pushtb!(TB { t, nl: false, provenance: 0, dim });
+                pushtb!(TB { t, nl: false, provenance: 0, dim, ts_seen: false });
             }
             0x52 => {
                 popn!(1);
@@ -851,17 +876,19 @@ where
                 pop!();
                 let key = interp.stack.peek(0).expect("stack");
                 let address = interp.input.target_address;
-                let (persistent, host_dim) = host.tainted_storage.get(&(address, key))
-                    .map(|p| (p.tainted, p.dim))
-                    .unwrap_or((false, TaintDim::Generic));
+                let (persistent, host_dim, host_ts) = host.tainted_storage.get(&(address, key))
+                    .map(|p| (p.tainted, p.dim, p.ts_seen))
+                    .unwrap_or((false, TaintDim::Generic, false));
                 let local_dim = self.storage.get(&key).copied().unwrap_or(TaintDim::Generic);
                 let merged = persistent || local_dim != TaintDim::Generic;
                 let dim = host_dim.max(local_dim); // most-specific-wins via TaintDim Ord
+                // 017: ts_seen OR-merged from persistent store — survives .max() scalar collapse.
+                let ts_seen = host_ts;
                 self.storage.insert(key, dim);
                 if merged && persistent {
                     INJECTION_CONFIRMED_PROVENANCE = true;
                 }
-                pushtb!(TB { t: merged, nl: false, provenance: 0, dim });
+                pushtb!(TB { t: merged, nl: false, provenance: 0, dim, ts_seen });
             }
             0x55 | 0x5d => {
                 pop!();
@@ -870,6 +897,10 @@ where
                 let dim = if v.t { v.dim } else { TaintDim::Generic };
                 self.storage.insert(key, dim);
                 let addr = interp.input.target_address;
+                // 017: track ts_seen for TIMESTAMP_DIM_LOCATED publication.
+                if v.ts_seen {
+                    TIMESTAMP_TAINT_WRITTEN = true;
+                }
                 if v.t {
                     host.tainted_storage.insert(
                         (addr, key),
@@ -877,6 +908,7 @@ where
                             tainted: true,
                             stored_value: interp.stack.peek(1).unwrap_or(EVMU256::ZERO),
                             dim: v.dim,
+                            ts_seen: v.ts_seen, // 017: persist for cross-execution survival
                         },
                     );
                 }
@@ -1151,10 +1183,10 @@ mod dim_propagation_tests {
     }
 
     fn price() -> TB {
-        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Price }
+        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Price, ts_seen: false }
     }
     fn generic() -> TB {
-        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic }
+        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic, ts_seen: false }
     }
 
     // Recompute each oracle selector from its canonical signature and compare to the
@@ -1541,7 +1573,7 @@ mod dim_propagation_tests {
     }
 
     fn balance() -> TB {
-        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Balance }
+        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Balance, ts_seen: false }
     }
 
     #[test]
@@ -1601,5 +1633,65 @@ mod dim_propagation_tests {
             TaintDim::Price,
             "normalized oracle price must reach the secant as Price (/256), not Generic (/64)"
         );
+    }
+
+    fn timestamp() -> TB {
+        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Timestamp, ts_seen: true }
+    }
+
+    fn step_ts_seen(op: u8, inputs: &[TB]) -> bool {
+        let mut mw = CmpLinearityTaint::new();
+        mw.stack = inputs.to_vec();
+        let mut interp = interp_with(op, inputs.len());
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        unsafe { mw.on_step(&mut interp, &mut h, &mut st); }
+        mw.stack.last().expect("shadow result").ts_seen
+    }
+
+    #[test]
+    fn ts_seen_linear_or_merge() {
+        assert_eq!(step_dim(0x01, &[timestamp(), price()]), TaintDim::Price);
+        assert!(step_ts_seen(0x01, &[timestamp(), price()]), "ts_seen must survive linear merge with Price");
+    }
+
+    #[test]
+    fn ts_seen_linear_or_merge_both_ts_seen() {
+        assert!(step_ts_seen(0x01, &[timestamp(), timestamp()]), "both-ts_seen must stay true");
+    }
+
+    #[test]
+    fn ts_seen_nonlinear_reset() {
+        assert!(!step_ts_seen(0x19, &[timestamp(), generic()]), "nonlinear op must reset ts_seen");
+    }
+
+    #[test]
+    fn ts_seen_mul_preserves() {
+        assert!(step_ts_seen(0x02, &[timestamp(), generic()]), "MUL preserves ts_seen when timestamp present");
+        assert!(step_ts_seen(0x02, &[generic(), timestamp()]), "MUL preserves ts_seen on either side");
+    }
+
+    #[test]
+    fn ts_seen_sub_linear_merge() {
+        assert!(step_ts_seen(0x03, &[timestamp(), generic()]), "SUB preserves ts_seen");
+    }
+
+    #[test]
+    fn ts_seen_div_preserves_when_numerator() {
+        let ts_dim = step_dim(0x04, &[generic(), timestamp()]);
+        let ts_flag = step_ts_seen(0x04, &[generic(), timestamp()]);
+        assert_eq!(ts_dim, TaintDim::Timestamp, "Timestamp/scalar DIV keeps Timestamp");
+        assert!(ts_flag, "DIV preserves ts_seen from numerator");
+    }
+
+    #[test]
+    fn accumulator_probe_delta_formula() {
+        let base = 1000u64;
+        let price_delta = |x1: u64| (x1 / 256).max(base / 1000);
+        let generic_delta = |x1: u64| (x1 / 64).max(base / 1000);
+        assert_eq!(price_delta(25600), 100, "/256 of 25600");
+        assert_eq!(generic_delta(25600), 400, "/64 of 25600");
+        assert!(price_delta(25600) < generic_delta(25600), "Accumulator probe must be coarser than Generic");
+        assert_eq!(price_delta(0), 1, "floor = 1");
     }
 }
