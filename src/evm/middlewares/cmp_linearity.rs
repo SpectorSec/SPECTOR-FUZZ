@@ -906,7 +906,20 @@ where
             0x58..=0x5a => clean!(),
             0x5b => {}
             0x5e => {
+                // MCOPY(destOffset, srcOffset, length) — memory→memory copy (EIP-5656,
+                // emitted by modern solc for struct/array copies). Propagate the dim
+                // shadow so a price copied between memory regions keeps its dimension;
+                // previously this dropped it (same class as the old RETURNDATACOPY bug).
                 popn!(3);
+                let dest = as_u64(interp.stack.peek(0).expect("stack")) as usize;
+                let src = as_u64(interp.stack.peek(1).expect("stack")) as usize;
+                let len = as_u64(interp.stack.peek(2).expect("stack")) as usize;
+                if let (Some(src_end), Some(dst_end)) = (safe_mem_end(src, len), safe_mem_end(dest, len)) {
+                    ensure!(self.mem, src_end.max(dst_end));
+                    // Snapshot source first — src/dest regions may overlap (memmove).
+                    let snapshot: Vec<TaintDim> = self.mem[src..src_end].to_vec();
+                    self.mem[dest..dst_end].copy_from_slice(&snapshot);
+                }
             }
             0x5f..=0x7f => clean!(), // PUSH
             0x80..=0x8f => {
@@ -1434,6 +1447,27 @@ mod dim_propagation_tests {
 
         assert!(mw.ret_dims.is_empty(), "returndata shadow must be cleared for a plain return");
         assert_eq!(mw.mem.get(0x80).copied(), Some(TaintDim::Generic), "no dim may leak to caller");
+    }
+
+    // MCOPY (EIP-5656) must carry the dim shadow memory→memory (struct/array copies),
+    // like RETURNDATACOPY. Stack (top→bottom): destOffset, srcOffset, length.
+    #[test]
+    fn mcopy_carries_dim() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        mw.mem = vec![TaintDim::Generic; 0x80];
+        for i in 0x20..0x40 {
+            mw.mem[i] = TaintDim::Price; // a Price word sitting at src
+        }
+        let mut interp = interp_with(0x5e, 0);
+        let _ = interp.stack.push(EVMU256::from(0x20u64)); // length (bottom)
+        let _ = interp.stack.push(EVMU256::from(0x20u64)); // srcOffset
+        let _ = interp.stack.push(EVMU256::from(0x40u64)); // destOffset (top)
+        mw.stack = vec![generic(), generic(), generic()];
+        unsafe { mw.on_step(&mut interp, &mut h, &mut st); }
+        assert_eq!(mw.mem[0x40], TaintDim::Price, "MCOPY must carry the dim to dest");
+        assert_eq!(mw.mem[0x20], TaintDim::Price, "source region unchanged");
     }
 
     // The RETURNDATACOPY path (modern solc): copy the returndata dim shadow into memory
