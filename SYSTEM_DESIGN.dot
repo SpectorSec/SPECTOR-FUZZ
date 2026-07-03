@@ -1,0 +1,248 @@
+// =============================================================================
+// SPECTOR-FUZZ — Canonical System Design v3
+//
+// Lineage: v1 (Claude, code-grounded) -> v2 (DeepSeek, structural refactor) ->
+//          v3 (Claude, reconciled against `main` + held-local taint stack).
+//
+// Changes from v2 (DeepSeek):
+//   1. KEPT v2's interceptor(during-exec 014) vs post-exec oracle-suite split — better.
+//   2. KEPT v2's thick 015<->016 critical path.
+//   3. FLIPPED reflexive-valuation tagging from PROPOSED-red to BUILT.
+//      Verified wired: is_reflexive_valuation_selector cmp_linearity.rs:63 / :487 / :1091.
+//      Marked (LOCAL-ONLY, unpushed) — this is why v2 (diffing stale remote) missed it.
+//   4. FIXED o_erc20 -> amplify: was drawn BUILT; oracles do NOT touch the secant
+//      (oracles/*.rs has zero refs to located_dim/amplify/LedgerSecant). Now PROPOSED.
+//   5. CORRECTED the flag->scheduler label: flags DO feed located_dim->probe
+//      (feedbacks.rs:152-156); what's missing is scheduler-ENERGY boost. New 4th bus.
+//   6. DROPPED two speculative feedback edges with no code basis
+//      (o_reent->prov_src, mw_dos->o_temp).
+//
+// LINE STYLE CONTRACT:
+//   solid black  = BUILT (in code; (L) = held local/unpushed)
+//   dashed red   = PROPOSED / NOT WIRED
+//   dotted       = feedback / confirmation loop (BUILT)
+//   thick        = critical path (015<->016 bridge)
+// =============================================================================
+digraph SPECTOR_FUZZ_CANONICAL_V3 {
+    rankdir=TB;
+    splines=true;
+    compound=true;
+    newrank=true;
+    fontname="Helvetica";
+    nodesep=0.45;
+    ranksep=0.75;
+    labelloc="t";
+    fontsize=16;
+    label="SPECTOR-FUZZ — Canonical System Design v3 (2026-07-03, reconciled)";
+
+    node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // =========================================================================
+    // LEGEND
+    // =========================================================================
+    subgraph cluster_legend {
+        label="Legend";
+        style=filled; color="#ECEFF1"; fontsize=11;
+        L_built  [label="BUILT (in code)", shape=box, style=rounded];
+        L_local  [label="BUILT — held LOCAL (unpushed)", shape=box, style=rounded, color="#00695C", fontcolor="#00695C"];
+        L_prop   [label="PROPOSED (not wired)", shape=box, style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        L_crit   [label="CRITICAL PATH", shape=box, style=rounded, penwidth=3];
+        L_over   [label="Conceptual overlay (doc lens)", shape=note, style=filled, fillcolor="#F5F5F5"];
+        L_built -> L_local [style=invis];
+        L_local -> L_prop [style=invis];
+        L_prop -> L_crit [style=invis];
+    }
+
+    // =========================================================================
+    // DESIGN LINEAGE  (narrative intent)
+    // =========================================================================
+    subgraph cluster_lineage {
+        label="Design Lineage (narrative intent — not code)";
+        style=filled; color="#F5F5F5";
+        incidents [label="Historical DeFi Incidents\n(500+ reports, 2020-2026)\nreentrancy / flash-loan / oracle-manip"];
+        patterns  [label="Attacker operation chains\n(calls · order · identity · tx count)\nextracted per-incident, not per-CVE"];
+        incidents -> patterns [label="mined & classified"];
+    }
+
+    // =========================================================================
+    // PHASE 1 — STATIC BLUEPRINTING
+    // =========================================================================
+    subgraph cluster_phase1 {
+        label="Phase 1 — Static Blueprinting  (corpus_initializer.rs / topology.rs)";
+        style=filled; color="#E3F2FD";
+        abi_fp    [label="ABI Fingerprinting\nselector -> ProtocolFamily\n(ERC20 / ERC4626 / Chainlink)"];
+        auto_orac [label="Auto-Oracle Activation\nmaps selector -> oracle module"];
+        topology  [label="Topology Intelligence\nTopologyReport\nco-occurrence + ExploitClass scores"];
+        anti_topo [label="Anti-Topology Pre-flight\nmissing-guard hints\n(TopologyHints)"];
+        abi_fp -> auto_orac [label="family -> oracle seed"];
+        abi_fp -> topology  [label="family set -> overlap score"];
+        topology -> anti_topo [label="missing guard warning"];
+    }
+    patterns -> abi_fp [style=dashed, label="derived from"];
+
+    // =========================================================================
+    // PHASE 2a — EXECUTION: INTERCEPTOR MIDDLEWARE LAYER  (revm hook, DURING exec)
+    // =========================================================================
+    subgraph cluster_interceptor {
+        label="Phase 2a — Execution: Interceptor Middleware  (revm on_step, DURING exec)  [013/014/016 held LOCAL]";
+        style=filled; color="#F3E5F5";
+
+        subgraph cluster_013 {
+            label="013 — Injection + Provenance  (cmp_linearity.rs)";
+            style=filled; color="#FFF3E0";
+            prov_src  [label="Provenance SOURCE\nCALLDATALOAD (0x35) only\nbit = 1 << arg_idx\nCALLER/ORIGIN/VALUE = clean(0)"];
+            prov_tb   [label="TB.provenance: u64\nOR'd through opcodes"];
+            prov_map  [label="ArgStorageProvenance\nhost.arg_slot_provenance\n(same-contract only)"];
+            prov_src -> prov_tb [label="bits set"];
+            prov_tb -> prov_map [label="SSTORE records"];
+        }
+
+        subgraph cluster_014_mw {
+            label="014 — Oracle Middlewares (6 modules)";
+            style=filled; color="#E8F5E9";
+            mw_track [label="OracleTracker\n60-op proximity window\nCALL -> CMP -> CALL"];
+            mw_flash [label="FlashloanOracle\nborrow -> oracle x2 -> move"];
+            mw_stale [label="OracleStaleness\nTIMESTAMP -> CMP after CALL"];
+            mw_guard [label="EmptyStateGuard\nSLOAD+JUMPI before transfer"];
+            mw_dos   [label="DoSDetector\nSLOAD key before REVERT\n(reads tainted_storage)"];
+        }
+
+        subgraph cluster_016 {
+            label="016 — TaintDim Engine  (cmp_linearity.rs)  [held LOCAL]";
+            style=filled; color="#FFFDE7";
+            dim_lat  [label="TaintDim Lattice  (max via derived Ord)\nPrice(4) > Accum(3) > Bal(2) > Ts(1) > Generic(0)\n(scalar collapse — see decoupled buses)"];
+            dim_flow [label="Flow-type flags (static mut)\nPROXY_TAINT_FLOW\nPRICE_MANIPULATION_FLOW\nACCUMULATOR_INFLATION_FLOW\nPRICE_DIM_CMP_SEEN"];
+            dim_tag  [label="tag_oracle_return()  (L)\nChainlink (addr-gated) -> Price\n+ REFLEXIVE selectors -> Price:\nget_virtual_price / slot0 / pricePerShare /\nconvertToAssets / exchangeRateStored / get_dy\n+ carried across CALL return-data seam (⑥)", color="#00695C", fontcolor="#00695C"];
+            dim_tag -> dim_lat  [label="dim assigned at CALL return  (L)", color="#00695C", fontcolor="#00695C"];
+            dim_lat -> dim_flow [label="dim reaches sink -> flag set"];
+        }
+
+        cheat [label="Cheatcode Middleware\nprank / warp / deal / store\n(NestedAction bridge)"];
+    }
+
+    auto_orac -> mw_track [label="activates"];
+    auto_orac -> dim_tag  [label="registers oracle_selectors"];
+
+    // =========================================================================
+    // PHASE 2b — POST-EXECUTION: ORACLE SUITE  (~18 modules)
+    // =========================================================================
+    subgraph cluster_oracles {
+        label="Phase 2b — Post-Execution: Oracle Suite  (~18 modules, src/evm/oracles/)";
+        style=filled; color="#BBDEFB";
+        o_erc20  [label="ERC20Oracle\nfund extraction"];
+        o_fresh  [label="FreshnessOracle\nstale feed accepted"];
+        o_4626   [label="ERC4626Oracle\nshare-price manipulation"];
+        o_fee    [label="FeeOnTransferOracle\naccounting desync"];
+        o_rebase [label="RebasingOracle\nbalance desync"];
+        o_func   [label="FunctionOracle\nunauthorized privileged call"];
+        o_reent  [label="ReentrancyOracle\nreentrant call detection"];
+        o_inv    [label="InvariantOracle\nEchidna invariants / slot trip"];
+        o_arb    [label="ArbitraryCallOracle\nunvalidated external target"];
+        o_nft    [label="NFTOracle\nERC-721/1155 ownership leak"];
+        o_temp   [label="TemporalSkimOracle\nmulti-block divergence > 0.001 ETH"];
+        o_self   [label="SelfdestructOracle"];
+        o_v2     [label="V2PairOracle"];
+    }
+
+    // =========================================================================
+    // CAMPAIGN PLANNER
+    // =========================================================================
+    subgraph cluster_campaign {
+        label="Campaign Planner  (mutator.rs / campaign_planner.rs)";
+        style=filled; color="#E0F7FA";
+        planner  [label="plan_campaign_sampled(\n  temporal_skimming, reflexive_lever,\n  topology-rank)\n → multi-step sequences"];
+        scheduler [label="Scheduler\n(VMState vote / input prioritization)\nfeedback.rs:639"];
+        attacker [label="Attacker Bytecode Injection\nonERC721Received / executeOperation\ncallback surface seeds"];
+        planner -> attacker [label="staged actions"];
+        planner -> scheduler [label="sequence prioritized"];
+    }
+    topology -> planner [label="co-occurrence rank"];
+    anti_topo -> mw_guard [label="hint: missing guard"];
+
+    // =========================================================================
+    // 015 — PROMOTE -> LOCATE -> AMPLIFY
+    // =========================================================================
+    subgraph cluster_015 {
+        label="015 — Promote -> Locate -> Amplify  (LedgerSecant)";
+        style=filled; color="#FBE9E7";
+        promote [label="PROMOTE\na-priori: TopologyReport\na-posteriori: T10 ledger delta"];
+        locate  [label="LOCATE\nempirical secant sweep\n(provenance-filtered args)\n yields located_dim"];
+        amplify [label="AMPLIFY\nsigned secant derivative\n→ dimension-aware probe delta\nPrice=/256, Bal=/16, else=/64\nfloor: max(., BASE/1000 = 0.001 ETH)"];
+        promote -> locate [label="lever candidate"];
+        locate -> amplify [label="derivative sign + magnitude"];
+    }
+
+    // 013 -> LOCATE: provenance filtering
+    locate_f [label="LOCATE filter\n(skip arg if bit=0)\nFAIL-OPEN: None -> don't skip", shape=diamond, style=filled, fillcolor="#FFE0B2"];
+    prov_map -> locate_f [label="arg_slot_provenance"];
+    locate_f -> locate [label="filtered arg set"];
+
+    // 016 -> AMPLIFY: dimension-aware probe (CRITICAL PATH — thick)
+    dim_flow -> amplify [style=bold, penwidth=3, label="CRITICAL: located_dim -> probe_delta\n(feedbacks.rs:152-156 -> read_located_dim)\nPrice=/256 vs else=/64 → 4x resolution on the lever"];
+
+    // AMPLIFY -> planner: mutator bias feedback
+    amplify -> planner [label="signed derivative + dim probe → next mutation biased"];
+
+    // =========================================================================
+    // GHOST IDENTITIES (004) + TEMPORAL SKIMMING (005)
+    // =========================================================================
+    ghost    [label="Ghost Identities (004)\nTrustedCallerMetadata\npopulated by FunctionOracle", shape=note, style=filled, fillcolor="#D1C4E9"];
+    temporal [label="Temporal Skimming (005)\nwarp insertion + temporal skim oracle\ndivergence > 0.001 ETH\nWarp(10) between campaign steps", shape=note, style=filled, fillcolor="#B2DFDB"];
+
+    // =========================================================================
+    // DECOUPLED BUSES  (dashed red — signals exist, not routed) — Feature 017 scope
+    // =========================================================================
+    dim_flow -> temporal [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
+                          label="017 Wire B: Timestamp dim -> warp lever\nwarp is flag-gated (campaign_planner.rs:304), not dim-gated\nscalar .max() drops Ts under Price (017 Wire A fixes)"];
+    ghost    -> prov_src [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
+                          label="PROPOSED: caller identity -> provenance\nCALLER = clean(0) today\n(017 OUT-of-scope: correct within calldata threat model)"];
+    prov_map -> locate   [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
+                          label="017 Phase 2: cross-contract provenance\nsame-contract only today (mutator.rs:757)"];
+    dim_flow -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
+                          label="NEW (DeepSeek v2): flow-flag -> scheduler ENERGY\nflags DO feed located_dim->probe; do NOT boost\nscheduler vote weight. PRICE_MANIP->high, ACCUM->med"];
+
+    // =========================================================================
+    // LIQUIDATION — EXTRACTABILITY CONFIRMATION
+    // =========================================================================
+    liquid [label="LiquidationRouter::route_to_base()\n(liquidation_router.rs:11)\nDEX-native swap confirmation\nnet-realized ledger delta", shape=box3d, style=filled, fillcolor="#C8E6C9"];
+    o_erc20 -> liquid [label="detected tokens -> route discovery"];
+    o_nft   -> liquid [label="detected NFT -> liquidation"];
+
+    // CORRECTED: no oracle/liquidation -> secant feedback exists (oracles/*.rs has zero
+    // located_dim/amplify refs). Shared medium is the ledger objective, not a direct edge.
+    liquid -> amplify [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
+                       label="PROPOSED: profit confirmed -> boost AMPLIFY confidence\n(code: no path; secant reads ledger obj only, not oracle verdicts)"];
+
+    // =========================================================================
+    // SIX PRIMITIVE-LEAK TAXONOMY  (conceptual output lens — no primitives.rs)
+    // =========================================================================
+    subgraph cluster_prim {
+        label="Six Primitive-Leak Taxonomy  (conceptual output lens — no module)";
+        style=filled; color="#FFF3E0"; fontcolor="#666666";
+        p_ctrl [label="1  Control Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+        p_val  [label="2  Value Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+        p_msg  [label="3  Message Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+        p_perm [label="4  Permission Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+        p_inv  [label="5  Invariant Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+        p_own  [label="6  Ownership Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
+    }
+    o_reent -> p_ctrl [style=dashed, color="#666666", label="reentrant entry"];
+    o_erc20 -> p_val  [style=dashed, color="#666666", label="balance delta"];
+    o_4626  -> p_val  [style=dashed, color="#666666", label="share inflation"];
+    o_fee   -> p_val  [style=dashed, color="#666666", label="fee desync"];
+    o_rebase -> p_val [style=dashed, color="#666666", label="rebasing desync"];
+    o_arb   -> p_msg  [style=dashed, color="#666666", label="unvalidated target"];
+    o_func  -> p_perm [style=dashed, color="#666666", label="unauth privileged call"];
+    o_inv   -> p_inv  [style=dashed, color="#666666", label="invariant violation"];
+    o_nft   -> p_own  [style=dashed, color="#666666", label="ownership xfer"];
+    liquid  -> p_val  [style=dotted, color="#666666", label="confirms extractability"];
+    liquid  -> p_own  [style=dotted, color="#666666", label="confirms extractability"];
+
+    // =========================================================================
+    // CROSS-CLUSTER INVISIBLE RANK EDGES (layout only)
+    // =========================================================================
+    attacker -> cheat [style=invis];
+    cheat    -> mw_flash [style=invis];
+    mw_flash -> o_self [style=invis];
+}

@@ -14,7 +14,7 @@ The methodology: instead of labeling incidents by root cause (Reentrancy, Flash 
 | Attack Pattern (from incidents) | Fuzzer Architecture |
 |---|---|
 | Unprotected callbacks — attackers hijack `onERC721Received`, `executeOperation`, `uniswapV3SwapCallback` to inject payloads during protocol execution | Attacker bytecode injection on caller addresses + NestedAction system + host bridge that writes staged actions into EVM storage slots before executing the callback bytecode |
-| Arbitrary call / unverified input (74 incidents) — attackers supply target+calldata to drain via `transferFrom`, swaps, or vault withdrawals | NestedAction mutator biased 80% toward oracle-flagged targets; `OracleTargetMetadata` feeds back from oracles into mutation bias |
+| Arbitrary call / unverified input (74 incidents) — attackers supply target+calldata to drain via `transferFrom`, swaps, or vault withdrawals | NestedAction mutator draws oracle-flagged targets via `OracleTargetMetadata`; topology confidence steers mutation through a **configurable** `--topology-bias` multiplier (`1 + (conf/100)·bias`, default `0.0` = unbiased) |
 | Access control + flash loan + oracle manipulation combos — attackers sequence a borrow, a price move, and a privileged call | Campaign planner (`plan_campaign`) generates topology-ranked multi-step sequences; `TopologyReport` drives step ordering and same-contract prioritization |
 | Profit extraction via swaps — attackers convert drained tokens to ETH | LiquidationRouter (`route_to_base`) discovers exit routes; `liquidation_percent` on inputs triggers ERC20Oracle's post-execution `.sell()` calls |
 | Cross-contract identity spoofing (confused deputy) — attackers make `msg.sender` appear as a trusted router/vault to bypass `onlyRouter`, `onlyVault` modifiers | **Ghost Identities (Feature 004)** — `TrustedCallerMetadata` populated by `FunctionOracle` on successful privileged calls; mutator draws from trusted protocol addresses first, falls back to `WhaleAddressMetadata`. CLI: `--ghost-identities` |
@@ -77,7 +77,10 @@ Oracles activate automatically from selector detection — no manual configurati
 | *17 keywords* | Permission boundary | `FunctionOracle` |
 
 ### 3. Oracle Suite (`-d all`)
-All 14 DeFi Ghost properties are covered:
+~18 oracle modules (`src/evm/oracles/*`) cover the seven Ghost property classes. The
+suite grew during the oracle-layer audit — `FeeOnTransferOracle`, `RebasingOracle`,
+`TemporalSkimOracle`, `SelfDestructOracle`, and `V2PairOracle` are audit-era additions
+that close false-positive and archetype gaps the original 12 missed:
 
 | Oracle | Detects | Ghost |
 |--------|---------|-------|
@@ -86,12 +89,15 @@ All 14 DeFi Ghost properties are covered:
 | `ERC4626Oracle` | Share price manipulation / vault inflation | #5 |
 | `FunctionOracle` | Unauthorized privileged function call | #4 |
 | `ReentrancyOracle` | Control flow hijack mid-state | #2 |
-| `InvariantOracle` | Echidna `invariant_*` / failed slot tripped | #7 |
-| `ArbitraryCallOracle` | Unvalidated external call target | #6 |
+| `InvariantOracle` / `StateCompOracle` | Echidna `invariant_*` / failed slot / state-comparison tripped | #7 |
+| `ArbitraryCallOracle` (`arb_call` / `arb_transfer`) | Unvalidated external call target / transfer | #6 |
 | `NFTOracle` | ERC-721/1155 ownership leak | #6 |
 | `ApprovalOracle` | Unlimited approval granted to attacker | #4 |
-| `FeeOnTransferOracle` | Fee-on-transfer token accounting error | #1 |
-| `RebasingOracle` | Rebasing token balance desync | #5 |
+| `FeeOnTransferOracle` *(audit)* | Fee-on-transfer token accounting error / false-positive guard | #1 |
+| `RebasingOracle` *(audit)* | Rebasing token balance desync | #5 |
+| `TemporalSkimOracle` *(audit, Feat. 005)* | Multi-block state-priming divergence >0.001 ETH | #7 |
+| `SelfDestructOracle` *(audit)* | Contract self-destruct / code removal | #6 |
+| `V2PairOracle` *(audit)* | Uniswap-V2 pair `k`-invariant / reserve manipulation | #7 |
 | `CrossChainOracle` | Cross-chain message trust boundary | #6 |
 
 ### 4. Cheatcode Extensions & Nested Pranking
@@ -118,7 +124,7 @@ Every EVM stack value carries a shadow `{ t, nl, provenance: u64 }` tracking whi
 | `--injection-persist` | Persistent: taint survives across executions via `host.tainted_storage` |
 | `--injection-provenance` | Arg→slot mapping: enables LOCATE narrowing (Phase 6) |
 
-**Causal oracle gating:** When enabled, oracles only fire if taint analysis proves the output was caused by attacker-controlled input reaching a sensitive sink. Single gate line in `OracleFeedback::is_interesting()` — all 14 oracles benefit.
+**Causal oracle gating:** When enabled, oracles only fire if taint analysis proves the output was caused by attacker-controlled input reaching a sensitive sink. Single gate line in `OracleFeedback::is_interesting()` — every oracle benefits.
 
 ### 8. Taint-Informed Oracle Middleware (`--oracle-detection`, `--flashloan-detection`, etc.)
 
@@ -136,7 +142,56 @@ Six inline middlewares detect exploit patterns at opcode level — faster and mo
 
 The ledger secant's LOCATE phase normally sweeps all calldata args to find which bytes trigger oracle fires. With `--injection-provenance`, it skips args whose provenance bitmap shows zero storage contact with the pin contract — 3-10x fewer probe executions for typical DeFi targets.
 
-### 10. Topology Intelligence & Anti-Topology Pre-flight
+The provenance filter is a probe-budget **pre-screen, not the detector**: the actual lever
+is found empirically by the secant slope, and the filter is **fail-open** (absent provenance
+metadata ⇒ probe everything, never skip). Two known scoping boundaries — see *Known Scoping
+Boundaries* below.
+
+### 10. Dimension-Aware Taint (016 — TaintDim engine)
+
+Every shadow stack value carries an economic **dimension** alongside its taint bits:
+`TB{ t, nl, provenance: u64, dim: TaintDim }`. The dimension lattice, most-specific-wins:
+
+```
+Price(4) > Accumulator(3) > Balance(2) > Timestamp(1) > Generic(0)
+```
+
+Dimensions originate at typed sources (Chainlink/oracle returns → `Price`; `TIMESTAMP`/`NUMBER`
+→ `Timestamp`; balance reads → `Balance`) and at **reflexive valuation selectors** that
+self-identify by selector alone — `get_virtual_price`, `pricePerShare`, `slot0`,
+`exchangeRateStored`, `convertToAssets`, `getUnderlyingPrice`, `get_dy`, … tag their return
+`Price` without an address gate (Chainlink-style feeds still require the address gate). The
+dimension survives every dimension-preserving opcode (DIV/MUL/SHL/SHR/SAR/AND-mask/SIGNEXTEND),
+is destroyed by genuinely nonlinear ones (OR/XOR/BYTE/MOD/SHA3/EXP), and rides through memory
+movement (MSTORE/MLOAD/CALLDATACOPY/RETURNDATACOPY/MCOPY) and across the CALL return-data seam.
+
+**Flow flags** (`static mut`) record the located exploit shape: `PROXY_TAINT_FLOW`,
+`PRICE_MANIPULATION_FLOW`, `ACCUMULATOR_INFLATION_FLOW`, `PRICE_DIM_CMP_SEEN`.
+`publish_located_dim()` emits the single dominant dimension to the mutator, which scales its
+secant probe delta by dimension:
+
+| Dimension | Probe delta | Floor |
+|-----------|-------------|-------|
+| `Price` | `x1 / 256` | `max(·, BASE/1000)` = 0.001 ETH |
+| `Balance` | `x1 / 16` | `max(·, BASE/1000)` |
+| *else (Accumulator / Timestamp / Generic)* | `x1 / 64` | `max(·, BASE/1000)` |
+
+### Known Scoping Boundaries (computed-but-not-yet-wired)
+
+Three signals are *computed* but not yet *routed* to the decision that would consume them.
+These are deliberate current-state boundaries, not claimed capabilities:
+
+*   **Dimension → warp lever is decoupled.** The published `located_dim` never gates warp
+    engagement; warp is driven by `--temporal-skimming` + the structural planner, independent of
+    the `Timestamp` dimension. Compound *Price+Time* levers therefore need manual tuning.
+*   **Caller identity → provenance is decoupled.** Only `CALLDATALOAD` seeds provenance;
+    `CALLER`/`ORIGIN`/`CALLVALUE` are clean. Writes governed by `msg.sender` identity carry no
+    provenance (correct within the calldata-mutation threat model, but not tracked).
+*   **Provenance is same-contract only.** The LOCATE filter considers provenance for
+    `*addr == step.contract`; a lever whose storage effect lands on a *downstream* contract is
+    invisible to the pre-screen (though fail-open still probes it empirically).
+
+### 11. Topology Intelligence & Anti-Topology Pre-flight
 Every DeFi protocol exposes its shape through its ABI selector set. When two or more protocol families appear in the same target set, their intersection is almost always where the vulnerability lives. 
 
 SPECTOR-FUZZ implements static topology mapping at startup to analyze these shapes and guide both the oracle and mutation engines:
@@ -190,6 +245,9 @@ ityfuzz evm -t "build/*" -d all --run-forever -w ./findings
 | `--injection-detect` | Shallow taint: detect attacker-controlled CALL target/calldata |
 | `--injection-persist` | Persistent taint across executions (via tainted_storage) |
 | `--injection-provenance` | Arg→slot provenance mapping; enables LOCATE narrowing |
+| `--topology-bias <f>` | Topology→mutation steer strength `[0.0,1.0]`; default `0.0` (unbiased) |
+| `--temporal-skimming` | Multi-block state-priming: insert `Warp` between steps, flag divergence |
+| `--reflexive-lever` | Feature 015 reflexive-body amplification (yDAI-class valuation levers) |
 | `--oracle-detection` | Inline oracle-gated transfer detection (opcode proximity) |
 | `--flashloan-detection` | Inline flash loan manipulation detection |
 | `--oracle-staleness` | Inline missing oracle staleness check detection |
@@ -210,7 +268,8 @@ corpus_initializer.rs — detects token standards, oracle interfaces, privileged
 evm_fuzzer.rs — auto-activates matching oracles, registers taint middlewares
     ↓
 LibAFL mutation engine → revm fork execution
-    ├── Taint middlewares (013): cmp_linearity — tracks TB{t,nl,provenance} per stack val
+    ├── Taint middlewares (013): cmp_linearity — tracks TB{t,nl,provenance,dim} per stack val
+    ├── Dimension engine (016): TaintDim lattice → dimension-aware secant probe scaling
     ├── Oracle middlewares (014): inline oracle exploit detection (opcode-level)
     └── Core middlewares: cheatcodes, flashloan, reentrancy, sha3_bypass
     ↓
@@ -228,7 +287,7 @@ findings/
 ### The Exploit Loop: Middleware, Taint Tracking & Oracles
 Rather than executing code passively, SPECTOR-FUZZ runs a continuous feedback loop between the **Middleware** (the actors changing blockchain reality), the **Taint Engine** (the causality tracker), and the **Oracles** (the observers checking safety rules):
 *   **State Manipulation (Middleware)**: The mutation engine uses the **Cheatcode Middleware** and **Flashloan Middleware** to construct a custom execution scenario (e.g., borrowing $50M in a flashloan, warping time 3 days ahead, and pranking a whale caller).
-*   **Taint Tracking (Inline)**: The `cmp_linearity` middleware tracks `TB{t,nl,provenance}` for every stack value. Six **014 middlewares** hook CALL, SLOAD, REVERT, TIMESTAMP to detect oracle manipulation, stale oracles, empty-state guard missing, and DoS — all at opcode level. Six **static flags** capture the verdicts.
+*   **Taint Tracking (Inline)**: The `cmp_linearity` middleware tracks `TB{t,nl,provenance,dim}` for every stack value — the `dim` field (016) carries the economic dimension (Price/Accumulator/Balance/Timestamp) so the secant can scale its probe delta to the lever's magnitude. Six **014 middlewares** hook CALL, SLOAD, REVERT, TIMESTAMP to detect oracle manipulation, stale oracles, empty-state guard missing, and DoS — all at opcode level. **Static flags** capture the verdicts.
 *   **Causal Gate (Feedback)**: `Sha3WrappedFeedback` runs `CmpLinearityTaint` reexecution before `inner_feedback.is_interesting()`. The `INJECTION_CONFIRMED_EXPLOIT_PATH` flag gates `OracleFeedback` — oracles only fire if attacker causality is proven.
 *   **Observation (Oracles)**: Post-execution, the active **Oracle Suite** (like `ERC20Oracle`) scans the mutated EVM state. If an oracle detects a state leak (e.g., an unauthorized token balance increase), it triggers a validation callback.
 *   **Provenance-Enhanced LOCATE**: After an oracle fires, the ledger secant's LOCATE phase uses arg→slot provenance to skip probing non-contributing calldata bytes — 3-10x fewer executions.
