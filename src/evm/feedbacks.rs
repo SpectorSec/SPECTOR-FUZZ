@@ -15,8 +15,9 @@ use libafl::{
     schedulers::Scheduler,
     Error,
 };
-use libafl_bolts::Named;
+use libafl_bolts::{impl_serdeany, Named};
 use libafl::state::HasMetadata;
+use serde::{Deserialize, Serialize};
 
 use super::{input::EVMInput, types::EVMFuzzState};
 use crate::{
@@ -56,6 +57,17 @@ pub fn publish_ledger_objective(value: u128) {
 pub fn read_ledger_objective() -> u128 {
     LEDGER_OBJECTIVE.with(|c| c.get())
 }
+
+/// Feature 013 Phase 6 — arg-to-storage provenance for ledger secant LOCATE.
+/// Maps (contract, slot) → u64 bitmap of calldata arg indices that contributed
+/// to the SSTORE. Populated from `FuzzHost.arg_slot_provenance` after each
+/// CmpLinearityTaint reexecution. Read by `apply_ledger_secant` to skip
+/// sweeping args that never touch any storage slot for the pin contract.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ArgStorageProvenance {
+    pub per_slot: HashMap<(EVMAddress, EVMU256), u64>,
+}
+impl_serdeany!(ArgStorageProvenance);
 
 /// A wrapper around a feedback that also performs sha3 taint analysis
 /// when the feedback is interesting.
@@ -113,6 +125,12 @@ where
                 crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
                 unsafe {
                     crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+                }
+                // Feature 013 Phase 6: snapshot arg-slot provenance for the
+                // ledger secant LOCATE phase (reads it during mutation).
+                let prov = self.evm_executor.deref().borrow().host.arg_slot_provenance.clone();
+                if !prov.is_empty() {
+                    state.add_metadata(ArgStorageProvenance { per_slot: prov });
                 }
             }
 

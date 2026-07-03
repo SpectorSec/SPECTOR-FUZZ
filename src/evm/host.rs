@@ -443,6 +443,11 @@ where
     /// Used by the return-value taint in cmp_linearity::on_return to mark oracle
     /// return data as tainted in the shadow memory.
     pub oracle_selectors: HashMap<EVMAddress, Vec<[u8; 4]>>,
+    /// Feature 013 Phase 6 — arg-to-storage provenance bitmap.
+    /// Maps (contract, slot) → u64 where bit i indicates calldata arg index i
+    /// contributed to the SSTORE. Accumulated across executions (never reset).
+    /// Used by the ledger secant LOCATE phase to skip non-contributing args.
+    pub arg_slot_provenance: HashMap<(EVMAddress, EVMU256), u64>,
 }
 
 impl<SC> Debug for FuzzHost<SC>
@@ -525,6 +530,7 @@ where
             completed_call_trees: Vec::new(),
             tainted_storage: self.tainted_storage.clone(),
             oracle_selectors: self.oracle_selectors.clone(),
+            arg_slot_provenance: self.arg_slot_provenance.clone(),
         }
     }
 }
@@ -615,6 +621,7 @@ where
             completed_call_trees: Vec::new(),
             tainted_storage: HashMap::new(),
             oracle_selectors: HashMap::new(),
+            arg_slot_provenance: HashMap::new(),
         }
     }
 
