@@ -647,9 +647,41 @@ where
                 let a = pop!();
                 pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance, dim: a.dim });
             }
-            0x16..=0x18 => nonlinear!(2), // AND OR XOR
+            // AND — non-linear for the secant, but dimension-PRESERVING when one
+            // operand is a constant BITMASK. This is how packed storage words are
+            // unpacked (Uniswap V3 slot0: `value & 0xff…` isolates a sub-field), so
+            // lumping it with OR/XOR would strip the Price tag off sqrtPriceX96 the
+            // instant slot0() is decoded (finding ② tags it, ③ keeps it alive).
+            0x16 => {
+                let a = pop!();
+                let b = pop!();
+                let dim = match (a.dim, b.dim) {
+                    // value & const-mask → value's dimension survives the unpack
+                    (d, TaintDim::Generic) | (TaintDim::Generic, d) => d,
+                    // two specific dims masked together → most-specific-wins
+                    (x, y) => x.max(y),
+                };
+                let tainted = a.t || b.t;
+                pushtb!(TB { t: tainted, nl: tainted, provenance: a.provenance | b.provenance, dim });
+            }
+            0x17..=0x18 => nonlinear!(2), // OR XOR — genuine bit-mixing, dimension-destroying
             0x19 => nonlinear!(1),     // NOT
-            0x1a..=0x1d => nonlinear!(2), // BYTE SHL SHR SAR
+            0x1a => nonlinear!(2),     // BYTE — single-byte extraction destroys magnitude
+            // SHL / SHR / SAR — non-linear (truncating), but dimension-PRESERVING when
+            // the SHIFT AMOUNT is a constant: shifting by k is scaling by 2^±k, exactly
+            // the Q64.96 fixed-point conversion `sqrtPriceX96 >> 96`. Stack order is
+            // `shift` (top) then `value`, so the value operand carries the dimension.
+            0x1b..=0x1d => {
+                let _shift = pop!(); // shift amount (top of stack) — the scaling constant
+                let value = pop!();
+                let tainted = _shift.t || value.t;
+                pushtb!(TB {
+                    t: tainted,
+                    nl: tainted,
+                    provenance: _shift.provenance | value.provenance,
+                    dim: value.dim, // value's economic dimension survives the shift
+                });
+            }
             0x20 => {
                 // SHA3 — non-linear source.
                 popn!(2);
@@ -1128,6 +1160,70 @@ mod dim_propagation_tests {
         let mut c = interp_with(0x10, 2);
         unsafe { mw.on_step(&mut c, &mut h, &mut st); }
         assert!(unsafe { PRICE_DIM_CMP_SEEN }, "reflexive price must register as a Price-dim comparison");
+    }
+
+    // Finding ③ — SHR/SHL/SAR by a constant is dimension-preserving scaling
+    // (Q64.96: sqrtPriceX96 >> 96). Stack top is the shift amount, so seed
+    // [value, shift]; the value operand's dim must survive.
+    #[test]
+    fn shr_by_constant_preserves_price_dim() {
+        assert_eq!(step_dim(0x1c, &[price(), generic()]), TaintDim::Price); // SHR
+        assert_eq!(step_dim(0x1b, &[price(), generic()]), TaintDim::Price); // SHL
+        assert_eq!(step_dim(0x1d, &[price(), generic()]), TaintDim::Price); // SAR
+    }
+
+    // Finding ③ — AND with a constant bitmask preserves the value's dimension
+    // (packed slot0 unpack: value & 0xff…). Two generics stay Generic; BYTE/OR/XOR
+    // remain dimension-destroying and are covered by staying `nonlinear!`.
+    #[test]
+    fn and_mask_preserves_price_two_generics_generic() {
+        assert_eq!(step_dim(0x16, &[price(), generic()]), TaintDim::Price);
+        assert_eq!(step_dim(0x16, &[generic(), price()]), TaintDim::Price);
+        assert_eq!(step_dim(0x16, &[generic(), generic()]), TaintDim::Generic);
+    }
+
+    // Guard: OR/XOR/BYTE must NOT preserve dimension — they genuinely destroy
+    // magnitude and would create false Price signals if carved out.
+    #[test]
+    fn or_xor_byte_still_destroy_dim() {
+        assert_eq!(step_dim(0x17, &[price(), generic()]), TaintDim::Generic); // OR
+        assert_eq!(step_dim(0x18, &[price(), generic()]), TaintDim::Generic); // XOR
+        assert_eq!(step_dim(0x1a, &[price(), generic()]), TaintDim::Generic); // BYTE
+    }
+
+    // FULL ②+③ CHAIN: Uniswap V3 slot0() → sqrtPriceX96 unpacked via SHR by a
+    // constant → still Price → comparison fires PRICE_DIM_CMP_SEEN. This is the
+    // realistic V3 price-read path; pre-bridge it was Generic end-to-end.
+    #[test]
+    fn slot0_sqrtprice_unpacked_flows_to_price_cmp() {
+        unsafe { PRICE_DIM_CMP_SEEN = false; }
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // Return from slot0(): word0 = sqrtPriceX96 → Price (finding ②).
+        let ret = Bytes::from(vec![0u8; 32]);
+        tag_oracle_return(&mut mw.mem, &ret, &SLOT0_SEL);
+        assert_eq!(mw.mem[0], TaintDim::Price);
+
+        // MLOAD offset 0 → Price onto the shadow stack.
+        let mut m = interp_with(0x51, 0);
+        let _ = m.stack.push(EVMU256::ZERO);
+        mw.stack.push(generic());
+        unsafe { mw.on_step(&mut m, &mut h, &mut st); }
+        assert_eq!(mw.stack.last().unwrap().dim, TaintDim::Price);
+
+        // SHR by 96 (Q64.96 → integer price). Stack: [value:Price, shift:const].
+        mw.stack.push(generic()); // shift amount (top)
+        let mut s = interp_with(0x1c, 2);
+        unsafe { mw.on_step(&mut s, &mut h, &mut st); }
+        assert_eq!(mw.stack.last().unwrap().dim, TaintDim::Price, "SHR by const must keep Price (finding ③)");
+
+        // Comparison → Price-dim signal.
+        mw.stack.push(generic());
+        let mut c = interp_with(0x10, 2);
+        unsafe { mw.on_step(&mut c, &mut h, &mut st); }
+        assert!(unsafe { PRICE_DIM_CMP_SEEN }, "unpacked V3 price must register as a Price-dim comparison");
     }
 
     fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
