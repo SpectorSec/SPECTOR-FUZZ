@@ -616,7 +616,21 @@ where
             0x06..=0x07 => nonlinear!(2), // MOD SMOD — truly dimensionless
             0x08..=0x09 => nonlinear!(3), // ADDMOD MULMOD
             0x0a => nonlinear!(2),     // EXP
-            0x0b => nonlinear!(2),     // SIGNEXTEND
+            // SIGNEXTEND — non-linear at the sign boundary, but dimension-PRESERVING:
+            // widening a signed integer (int128→int256 in Curve get_dy, int24 `tick`
+            // sign-extended out of V3 slot0) does not change its economic meaning. Stack
+            // top is the byte-count constant; the value operand carries the dimension.
+            0x0b => {
+                let _size = pop!(); // byte index (top of stack) — the width constant
+                let value = pop!();
+                let tainted = _size.t || value.t;
+                pushtb!(TB {
+                    t: tainted,
+                    nl: tainted,
+                    provenance: _size.provenance | value.provenance,
+                    dim: value.dim,
+                });
+            }
             // LT GT SLT SGT EQ — the GATE. Record classification.
             0x10..=0x14 => {
                 let a = pop!();
@@ -644,7 +658,16 @@ where
                 });
             }
             0x15 => {
+                // ISZERO — a comparison against zero. LT/GT/EQ (0x10..=0x14) set
+                // PRICE_DIM_CMP_SEEN, but a raw Price flowing straight into ISZERO
+                // was uncounted: `require(price != 0)`, `if (price)` truthiness, and
+                // the negation half of `!(a < b)` all compile to ISZERO(price). A
+                // manipulated price gating one of those guards slipped past the
+                // price-manipulation flow. Flag it here too; dim passes through.
                 let a = pop!();
+                if a.t && a.dim == TaintDim::Price {
+                    PRICE_DIM_CMP_SEEN = true;
+                }
                 pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance, dim: a.dim });
             }
             // AND — non-linear for the secant, but dimension-PRESERVING when one
@@ -1224,6 +1247,45 @@ mod dim_propagation_tests {
         let mut c = interp_with(0x10, 2);
         unsafe { mw.on_step(&mut c, &mut h, &mut st); }
         assert!(unsafe { PRICE_DIM_CMP_SEEN }, "unpacked V3 price must register as a Price-dim comparison");
+    }
+
+    // ISZERO gate gap: a Price flowing directly into ISZERO (require(price != 0),
+    // `if (price)`, negated comparisons) must count as a price comparison — LT/GT/EQ
+    // already did, ISZERO previously did not.
+    #[test]
+    fn iszero_on_price_counts_as_price_cmp() {
+        unsafe { PRICE_DIM_CMP_SEEN = false; }
+        let mut mw = CmpLinearityTaint::new();
+        mw.stack = vec![price()];
+        let mut i = interp_with(0x15, 1);
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        unsafe { mw.on_step(&mut i, &mut h, &mut st); }
+        assert!(unsafe { PRICE_DIM_CMP_SEEN }, "ISZERO on a Price must register a price comparison");
+        assert_eq!(mw.stack.last().unwrap().dim, TaintDim::Price, "ISZERO passes dim through");
+    }
+
+    // The gate is on the DIMENSION, not merely taint: a tainted non-Price (Balance)
+    // through ISZERO must NOT masquerade as a price comparison.
+    #[test]
+    fn iszero_on_non_price_is_not_a_price_cmp() {
+        unsafe { PRICE_DIM_CMP_SEEN = false; }
+        let mut mw = CmpLinearityTaint::new();
+        mw.stack = vec![balance()]; // tainted, but Balance not Price
+        let mut i = interp_with(0x15, 1);
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        unsafe { mw.on_step(&mut i, &mut h, &mut st); }
+        assert!(!unsafe { PRICE_DIM_CMP_SEEN }, "ISZERO on a non-Price must NOT flag a price comparison");
+    }
+
+    // SIGNEXTEND widens a signed int (int128→int256, int24 tick) without changing its
+    // economic meaning — the value operand's dimension survives; the byte-count
+    // operand (stack top) is the constant.
+    #[test]
+    fn signextend_preserves_value_dim() {
+        assert_eq!(step_dim(0x0b, &[price(), generic()]), TaintDim::Price);
+        assert_eq!(step_dim(0x0b, &[generic(), generic()]), TaintDim::Generic);
     }
 
     fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
