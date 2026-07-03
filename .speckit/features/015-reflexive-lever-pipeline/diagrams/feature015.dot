@@ -1,0 +1,77 @@
+digraph Feature015 {
+  rankdir=TB;
+  bgcolor="#0d1117";
+  fontname="Helvetica";
+  fontcolor="#e6edf3";
+  labelloc="t";
+  fontsize=22;
+  label="Feature 015 — Reflexive-Lever Pipeline\nPROMOTE  →  LOCATE  →  AMPLIFY   (one flag: --reflexive-lever)";
+  node [fontname="Helvetica", fontcolor="#e6edf3", color="#30363d", penwidth=1.6];
+  edge [color="#8b949e", fontname="Helvetica", fontcolor="#c9d1d9", fontsize=11, penwidth=1.6];
+
+  /* ───────────────── THE BELLY GAP ───────────────── */
+  subgraph cluster_gap {
+    label="THE PROBLEM  ·  the belly gap";
+    fontsize=15; fontcolor="#f0883e"; color="#f0883e"; style="rounded"; penwidth=1.4;
+
+    gap_frame [shape=record, style="filled,rounded", fillcolor="#161b22", color="#388bfd", fontcolor="#e6edf3",
+      label="{ TUNABLE FRAME (all args are addressable slots) | { Borrow | Prime | Exploit } }"];
+    lever_hidden [shape=box, style="filled,rounded,dashed", fillcolor="#2d2410", color="#e3b341", fontcolor="#e3b341",
+      label="THE LEVER (add_liquidity / remove_liquidity_imbalance)\nskews the pool the vault prices against\n\n✕ chosen by the mutator deep in get_next_call\n✕ NOT a slot in the frame — no tuner can reach it"];
+    gap_frame -> lever_hidden [label="  lever lives BELOW the frame  ", style=dashed, color="#e3b341", fontcolor="#e3b341"];
+  }
+
+  /* ───────────────── PROMOTE ───────────────── */
+  promote [shape=box, style="filled,rounded", fillcolor="#1f6feb", color="#388bfd", fontcolor="#ffffff",
+    fontsize=16, label="P R O M O T E\nhoist the lever UP into the frame"];
+
+  apriori [shape=box, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#3fb950",
+    label="A-PRIORI  (Phase 1)\n\"I recognize this shape\"\nselector match / ExploitClass::ReflexiveSkew\n→ pre-place a KNOWN lever"];
+  aposteriori [shape=box, style="filled,rounded", fillcolor="#21152b", color="#bc8cff", fontcolor="#d2a8ff",
+    label="A-POSTERIORI  (Phase 2 / T10)\n\"I don't — watch the money\"\nrun frame, record per-STEP erc20 inflow;\nbiggest ledger mover = the candidate"];
+
+  lever_hidden -> promote [label="  close the gap  ", color="#f0883e", fontcolor="#f0883e"];
+  promote -> apriori [color="#3fb950"];
+  promote -> aposteriori [color="#bc8cff"];
+
+  /* ───────────────── PROMOTED FRAME ───────────────── */
+  promoted_frame [shape=record, style="filled,rounded", fillcolor="#161b22", color="#388bfd", fontcolor="#e6edf3",
+    label="{ PROMOTED FRAME   ·   promoted = [2]  (pinned, tunable) | { Borrow | Prime | <lev> ★ LEVER ★ | Exploit } }"];
+  apriori -> promoted_frame [color="#3fb950"];
+  aposteriori -> promoted_frame [color="#bc8cff"];
+
+  /* ───────────────── LOCATE ───────────────── */
+  locate [shape=box, style="filled,rounded", fillcolor="#161b22", color="#d29922", fontcolor="#e6edf3", fontsize=15,
+    label="L O C A T E\nwhich ARG of the lever is the knob?\nsweep args → measure Δ ledger / Δ arg\nkeep the steepest-sensitivity arg  →  arg_idx"];
+  promoted_frame:lev -> locate [label="  pinned step  ", color="#d29922"];
+
+  /* ───────────────── AMPLIFY ───────────────── */
+  amplify [shape=box, style="filled,rounded", fillcolor="#161b22", color="#db6d28", fontcolor="#e6edf3", fontsize=15,
+    label="A M P L I F Y\nturn the knob to the interior PROFIT PEAK\nsigned secant roots the DERIVATIVE (g1>0, g2<0)\nIdle → Probe1 → Probe2 → secant  (across mutate calls)"];
+  peak [shape=box, style="filled,rounded", fillcolor="#1a1200", color="#db6d28", fontcolor="#ffa657",
+    label="too little skew → no profit\nTOO MUCH → pool reverts / self-arb loss\nprofit lives at the PEAK in between"];
+  locate -> amplify [color="#db6d28"];
+  amplify -> peak [style=dashed, color="#db6d28", arrowhead=none];
+
+  /* ───────────────── THE LEDGER LOOP ───────────────── */
+  subgraph cluster_loop {
+    label="THE GRADIENT LOOP  ·  realized $ drives the search";
+    fontsize=15; fontcolor="#f85149"; color="#f85149"; style="rounded"; penwidth=1.4;
+
+    mut [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="MUTATOR\npin lever + set arg = x"];
+    exe [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="EXECUTOR\nrun whole frame atomically\n→ one ordered erc20 log"];
+    fb [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="FEEDBACK\nsum attacker NET inflow"];
+    obj [shape=box, style="filled,rounded", fillcolor="#2d0f0f", color="#f85149", fontcolor="#ffa198",
+      label="LEDGER_OBJECTIVE\nthe gradient"];
+
+    mut -> exe [label=" arg = x ", color="#f85149", fontcolor="#ffa198"];
+    exe -> fb [color="#f85149"];
+    fb -> obj [color="#f85149"];
+    obj -> mut [label=" choose next x ", color="#f85149", fontcolor="#ffa198", constraint=false];
+  }
+
+  amplify -> mut [label="  each probe = one iteration  ", color="#f85149", fontcolor="#ffa198"];
+}

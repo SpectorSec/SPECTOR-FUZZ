@@ -189,19 +189,27 @@ impl TopologyReport {
         if has(&ProtocolFamily::Callback) && has(&ProtocolFamily::ERC20) {
             scores.push((ExploitClass::ArbitraryCallDrain, 78));
         }
-        // Feature 015 — reflexive skew: an AMM/liquidity pool co-occurring with a vault
-        // or staking layer that reads the pool's (skewable) price mid-sequence. Ranked
-        // just under the specific two-family vault signals (95/90) but well above the
-        // bare AMMInvariant single-family signal (65), so reflexive targets prefer the
-        // promoted-lever plan. (Concrete promotion still keys on selector presence in
-        // the target cache — see campaign_planner — so this score drives prioritization,
-        // not the trigger itself.)
+        // Feature 015 — reflexive skew: a manipulable pricing surface co-occurring with a
+        // layer that reads that surface mid-sequence. Two shapes, both confirmed by corpus
+        // mining (.speckit/research/reflexive-lever-corpus-mining.md — 57 cross-step incidents):
+        //   (a) AMM/liquidity pool + vault/staking/lending that reads the pool price. The
+        //       canonical Curve-vault yDAI shape.
+        //   (b) lending-fork + flash loan with NO external AMM — the lending market IS the
+        //       skewable surface (mint/redeem/borrow warps cToken `exchangeRate`, consumed by
+        //       a later borrow). This is the mined MAJORITY (lending-dominated, ~40+ of 57),
+        //       so we fire ReflexiveSkew here too, just under FlashBorrowLeverage (90) so the
+        //       leverage class still leads while reflexive promotion is armed.
+        // Ranked above the bare AMMInvariant single-family signal (65) so reflexive targets
+        // prefer the promoted-lever plan. Concrete promotion still keys on selector presence
+        // in the target cache (see campaign_planner) — this score drives prioritization only.
         if has_amm
             && (has(&ProtocolFamily::ERC4626)
                 || has(&ProtocolFamily::Lending)
                 || has(&ProtocolFamily::Staking))
         {
             scores.push((ExploitClass::ReflexiveSkew, 88));
+        } else if has(&ProtocolFamily::Lending) && has(&ProtocolFamily::FlashLoan) {
+            scores.push((ExploitClass::ReflexiveSkew, 82));
         }
         if has(&ProtocolFamily::Rebasing) && has(&ProtocolFamily::ERC20) {
             scores.push((ExploitClass::DeflationaryToken, 78));
@@ -692,4 +700,54 @@ pub fn log_anti_topology(findings: &[AntiTopologyFinding]) {
         warn!("  [{:3}%] [{}] {}", f.confidence, f.rule, f.detail);
     }
     warn!("================================");
+}
+
+#[cfg(test)]
+mod reflexive_topology_tests {
+    use super::*;
+
+    fn analyze(fs: &[ProtocolFamily]) -> Vec<(ExploitClass, u8)> {
+        TopologyReport::analyze(fs.iter().cloned().collect()).ranked
+    }
+
+    /// Corpus-mined shape (b): a lending fork + flash loan with NO external AMM must still
+    /// rank ReflexiveSkew (the lending market is the skewable surface), just under
+    /// FlashBorrowLeverage. This is the generalization beyond the Curve-vault shape.
+    #[test]
+    fn lending_plus_flashloan_ranks_reflexive_skew() {
+        let ranked = analyze(&[ProtocolFamily::Lending, ProtocolFamily::FlashLoan]);
+        let reflex = ranked.iter().find(|(c, _)| *c == ExploitClass::ReflexiveSkew);
+        assert!(reflex.is_some(), "lending+flashloan must surface ReflexiveSkew");
+        assert_eq!(reflex.unwrap().1, 82, "lending-fork reflexive score");
+        // FlashBorrowLeverage (90) still leads it.
+        let lev = ranked.iter().find(|(c, _)| *c == ExploitClass::FlashBorrowLeverage);
+        assert!(lev.unwrap().1 > reflex.unwrap().1, "leverage class outranks reflexive");
+    }
+
+    /// The AMM-based shape (a) still fires at 88 and does not double-count with (b):
+    /// exactly one ReflexiveSkew entry even when lending+flashloan+amm all co-occur.
+    #[test]
+    fn amm_shape_fires_once_no_double_count() {
+        let ranked = analyze(&[
+            ProtocolFamily::UniswapV2,
+            ProtocolFamily::Lending,
+            ProtocolFamily::FlashLoan,
+        ]);
+        let reflex: Vec<_> = ranked
+            .iter()
+            .filter(|(c, _)| *c == ExploitClass::ReflexiveSkew)
+            .collect();
+        assert_eq!(reflex.len(), 1, "exactly one ReflexiveSkew entry (else-if guards dup)");
+        assert_eq!(reflex[0].1, 88, "AMM shape takes precedence at 88");
+    }
+
+    /// Negative: bare lending with no flash loan and no AMM must NOT invent a reflexive signal.
+    #[test]
+    fn bare_lending_no_reflexive() {
+        let ranked = analyze(&[ProtocolFamily::Lending]);
+        assert!(
+            !ranked.iter().any(|(c, _)| *c == ExploitClass::ReflexiveSkew),
+            "lending alone is not reflexive"
+        );
+    }
 }
