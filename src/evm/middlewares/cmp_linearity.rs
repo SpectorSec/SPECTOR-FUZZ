@@ -34,10 +34,11 @@ use crate::evm::{
 };
 
 /// Feature 016 Phase 1 — known oracle selectors for per-word-offset dim tagging.
-const LATEST_ROUND_DATA_SEL: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8c];
-const LATEST_ANSWER_SEL: [u8; 4] = [0x50, 0xd2, 0x5b, 0x3a];
-const GET_ROUND_DATA_SEL: [u8; 4] = [0x9a, 0x6a, 0xd7, 0x90];
-const PEEK_SEL: [u8; 4] = [0x59, 0xe1, 0x1b, 0xe5];
+/// Each is keccak256(canonical signature)[:4]; pinned by selector_constants_match_keccak.
+const LATEST_ROUND_DATA_SEL: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8c]; // latestRoundData()
+const LATEST_ANSWER_SEL: [u8; 4] = [0x50, 0xd2, 0x5b, 0xcd]; // latestAnswer()
+const GET_ROUND_DATA_SEL: [u8; 4] = [0x9a, 0x6f, 0xc8, 0xf5]; // getRoundData(uint80)
+const PEEK_SEL: [u8; 4] = [0x59, 0xe0, 0x2d, 0xd7]; // peek()
 
 const MAX_CALL_DEPTH: u64 = 3;
 const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -948,6 +949,21 @@ mod dim_propagation_tests {
     }
     fn generic() -> TB {
         TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic }
+    }
+
+    // Recompute each oracle selector from its canonical signature and compare to the
+    // hardcoded const. Would have caught the original latestAnswer/getRoundData/peek
+    // byte errors (3 of 4 were wrong -> those reads were never tagged with a dim).
+    #[test]
+    fn selector_constants_match_keccak() {
+        fn sel(sig: &str) -> [u8; 4] {
+            let h = revm_primitives::keccak256(sig.as_bytes());
+            [h[0], h[1], h[2], h[3]]
+        }
+        assert_eq!(LATEST_ROUND_DATA_SEL, sel("latestRoundData()"), "latestRoundData()");
+        assert_eq!(LATEST_ANSWER_SEL, sel("latestAnswer()"), "latestAnswer()");
+        assert_eq!(GET_ROUND_DATA_SEL, sel("getRoundData(uint80)"), "getRoundData(uint80)");
+        assert_eq!(PEEK_SEL, sel("peek()"), "peek()");
     }
 
     fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
