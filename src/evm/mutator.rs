@@ -730,6 +730,39 @@ where
                     state.metadata_map_mut().insert(s);
                     return false;
                 }
+
+                // Phase 0 provenance: skip args that never touch storage.
+                if !s.located {
+                    let skip = match input.get_campaign() {
+                        Some(campaign) => {
+                            let pin = match campaign.promoted.first() {
+                                Some(p) => *p,
+                                None => return false,
+                            };
+                            let step = match campaign.steps.get(pin) {
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            match state.metadata_map().get::<crate::evm::feedbacks::ArgStorageProvenance>() {
+                                Some(meta) => {
+                                    let bits = meta.per_slot.iter()
+                                        .filter(|((addr, _), _)| *addr == step.contract)
+                                        .map(|(_, b)| b)
+                                        .fold(0u64, |acc, b| acc | b);
+                                    bits & (1u64 << arg) == 0
+                                }
+                                None => false,
+                            }
+                        }
+                        None => false,
+                    };
+                    if skip {
+                        s.locate_cursor += 1;
+                        state.metadata_map_mut().insert(s);
+                        return false;
+                    }
+                }
+
                 // Baseline x1 = the step's current arg value; pin it for this episode.
                 let x1 = read_step_arg_u128(input.get_campaign(), pin_step, arg);
                 s.x1 = x1;

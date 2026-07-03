@@ -207,6 +207,11 @@ pub fn lin_tick(routed: bool) {
 struct TB {
     t: bool,
     nl: bool,
+    /// Bitmap of arg indices (after the 4-byte selector) that contributed to
+    /// this value. Bit i set = the u128 word at calldata offset 4+i*32 is in
+    /// the provenance chain. Propagated through linear/nonlinear ops via OR;
+    /// cleared at SLOAD/MLOAD (memory/storage lose provenance).
+    provenance: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -367,6 +372,7 @@ where
                     let x = pop!();
                     r.t |= x.t;
                     r.nl |= x.nl;
+                    r.provenance |= x.provenance;
                 }
                 pushtb!(r);
             }};
@@ -377,12 +383,14 @@ where
             ($n:expr) => {{
                 let mut t = false;
                 let mut nl = false;
+                let mut provenance = 0u64;
                 for _ in 0..$n {
                     let x = pop!();
                     t |= x.t;
                     nl |= x.nl;
+                    provenance |= x.provenance;
                 }
-                pushtb!(TB { t, nl: nl || t });
+                pushtb!(TB { t, nl: nl || t, provenance });
             }};
         }
         macro_rules! popn {
@@ -435,6 +443,7 @@ where
                 pushtb!(TB {
                     t: a.t || b.t,
                     nl: a.nl || b.nl || both,
+                    provenance: a.provenance | b.provenance,
                 });
             }
             0x03 => linear!(2),        // SUB
@@ -457,22 +466,26 @@ where
                         m.insert((interp.input.target_address, interp.bytecode.pc()), !nonlin);
                     }
                 }
-                pushtb!(TB { t: tainted, nl: nonlin });
+                pushtb!(TB { t: tainted, nl: nonlin, provenance: a.provenance | b.provenance });
             }
-            0x15 => linear!(1),        // ISZERO
+            0x15 => {
+                let a = pop!();
+                pushtb!(TB { t: a.t, nl: a.nl, provenance: a.provenance });
+            }
             0x16..=0x18 => nonlinear!(2), // AND OR XOR
             0x19 => nonlinear!(1),     // NOT
             0x1a..=0x1d => nonlinear!(2), // BYTE SHL SHR SAR
             0x20 => {
                 // SHA3 — non-linear source.
                 popn!(2);
-                pushtb!(TB { t: true, nl: true });
+                pushtb!(TB { t: true, nl: true, provenance: 0 });
             }
             0x30 => clean!(),
             0x31 => linear!(1),        // BALANCE
             0x32..=0x34 => clean!(),   // ORIGIN CALLER CALLVALUE
             0x35 => {
                 // CALLDATALOAD — the canonical LINEAR taint source.
+                // Sets provenance bit i when loading bytes from arg i offset.
                 pop!();
                 if !self.ctxs.is_empty() {
                     let ctx = self.ctxs.last().unwrap();
@@ -481,7 +494,11 @@ where
                         clean!();
                     } else {
                         let tainted = ctx.read_input(off, 32).contains(&true);
-                        pushtb!(TB { t: tainted, nl: false });
+                        let provenance = if tainted && off >= 4 {
+                            let arg_idx = (off - 4) / 32;
+                            if arg_idx < 64 { 1u64 << arg_idx } else { 0 }
+                        } else { 0 };
+                        pushtb!(TB { t: tainted, nl: false, provenance });
                     }
                 } else {
                     clean!();
@@ -512,17 +529,17 @@ where
             // this, temporal gates (reward = f(block.number)) are seen as untainted and
             // never routed to the secant. Other block ctx (COINBASE/GASLIMIT/CHAINID/…)
             // stay clean.
-            0x42 | 0x43 => pushtb!(TB { t: true, nl: false }),
+            0x42 | 0x43 => pushtb!(TB { t: true, nl: false, provenance: 0 }),
             0x41 | 0x44..=0x48 => clean!(),
             0x50 => {
                 pop!();
             }
             0x51 => {
-                // MLOAD — memory carries only taint; nl reset (simplification).
+                // MLOAD — memory carries only taint; nl and provenance reset (simplification).
                 pop!();
                 let off = as_u64(interp.stack.peek(0).expect("stack")) as usize;
                 let t = self.read_mem_tainted(off, 32);
-                pushtb!(TB { t, nl: false });
+                pushtb!(TB { t, nl: false, provenance: 0 });
             }
             0x52 => {
                 popn!(1);
@@ -554,21 +571,28 @@ where
                 if merged && persistent {
                     INJECTION_CONFIRMED_PROVENANCE = true;
                 }
-                pushtb!(TB { t: merged, nl: false });
+                pushtb!(TB { t: merged, nl: false, provenance: 0 });
             }
             0x55 | 0x5d => {
                 pop!();
                 let v = pop!();
                 let key = interp.stack.peek(0).expect("stack");
                 self.storage.insert(key, v.t);
+                let addr = interp.input.target_address;
                 if v.t {
                     host.tainted_storage.insert(
-                        (interp.input.target_address, key),
+                        (addr, key),
                         crate::evm::host::TaintProvenance {
                             tainted: true,
                             stored_value: interp.stack.peek(1).unwrap_or(EVMU256::ZERO),
                         },
                     );
+                }
+                if v.provenance != 0 {
+                    let entry = host.arg_slot_provenance
+                        .entry((addr, key))
+                        .or_insert(0);
+                    *entry |= v.provenance;
                 }
             }
             0x56 => {
