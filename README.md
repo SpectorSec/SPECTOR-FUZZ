@@ -108,7 +108,35 @@ Corpus entries for hook entry points:
 
 These represent free execution windows mid-protocol-state that the fuzzer explores automatically.
 
-### 6. Topology Intelligence & Anti-Topology Pre-flight
+### 7. Taint Injection Detection (`--injection-detect`, `--injection-persist`, `--injection-provenance`)
+
+Every EVM stack value carries a shadow `{ t, nl, provenance: u64 }` tracking which calldata arg indices influence each value. At SSTORE, provenance records which args touched that storage slot. Three CLI flags control depth:
+
+| Flag | What it does |
+|------|-------------|
+| `--injection-detect` | Shallow: detects attacker-controlled CALL target/calldata at call boundary |
+| `--injection-persist` | Persistent: taint survives across executions via `host.tainted_storage` |
+| `--injection-provenance` | Arg→slot mapping: enables LOCATE narrowing (Phase 6) |
+
+**Causal oracle gating:** When enabled, oracles only fire if taint analysis proves the output was caused by attacker-controlled input reaching a sensitive sink. Single gate line in `OracleFeedback::is_interesting()` — all 14 oracles benefit.
+
+### 8. Taint-Informed Oracle Middleware (`--oracle-detection`, `--flashloan-detection`, etc.)
+
+Six inline middlewares detect exploit patterns at opcode level — faster and more precise than post-hoc state diffs:
+
+| Flag | Middleware | Detects |
+|------|-----------|---------|
+| `--oracle-detection` | OracleTracker | Oracle CALL → comparison → value-moving CALL (60-op window) |
+| `--flashloan-detection` | FlashloanOracle | Borrow → oracle read ×2 → value movement |
+| `--oracle-staleness` | OracleStaleness | Missing TIMESTAMP check after oracle read |
+| `--empty-state-guard` | EmptyStateGuard | First-deposit inflation (no SLOAD+JUMPI before transfer) |
+| `--dos-detection` | DoSDetector | State-dependent revert on attacker-controlled storage |
+
+### 9. Provenance-Enhanced LOCATE (Automatic)
+
+The ledger secant's LOCATE phase normally sweeps all calldata args to find which bytes trigger oracle fires. With `--injection-provenance`, it skips args whose provenance bitmap shows zero storage contact with the pin contract — 3-10x fewer probe executions for typical DeFi targets.
+
+### 10. Topology Intelligence & Anti-Topology Pre-flight
 Every DeFi protocol exposes its shape through its ABI selector set. When two or more protocol families appear in the same target set, their intersection is almost always where the vulnerability lives. 
 
 SPECTOR-FUZZ implements static topology mapping at startup to analyze these shapes and guide both the oracle and mutation engines:
@@ -116,6 +144,7 @@ SPECTOR-FUZZ implements static topology mapping at startup to analyze these shap
 *   **Co-occurrence & Exploit Classification**: Matches co-occurring families to rank exploit classes and auto-activate corresponding oracles (e.g., `ERC-4626` + `Chainlink` triggers `ERC4626Oracle` with 95% confidence for price-gated vault inflation).
 *   **Anti-Topology Pre-flight Warnings**: Scans for the **absence** of critical safety mechanisms (e.g., a Chainlink oracle without a freshness/staleness check, or callbacks without reentrancy guards) and logs pre-flight warnings at startup.
 *   **Topology Mutation Boost ("Gamma Ray")**: Generates `TopologyHints` that boost mutation energy in the scheduler for input sequences matching predicted exploit paths, focusing pressure where bugs are most likely to exist.
+*   **Causal Oracle Gating**: Taint analysis runs before oracle feedback. If no injection chain is confirmed, oracles don't fire — eliminating phantom false positives where value moves coincidentally. Both `Sha3WrappedFeedback` and `OracleFeedback` are gated.
 
 ---
 
@@ -158,6 +187,14 @@ ityfuzz evm -t "build/*" -d all --run-forever -w ./findings
 | `-f` | Enable fund-loss detection layer (economic oracle) |
 | `--fetch-tx-data` | Pull constructor state from fork — required for non-trivial contracts |
 | `--run-forever` | Keep finding after first bug |
+| `--injection-detect` | Shallow taint: detect attacker-controlled CALL target/calldata |
+| `--injection-persist` | Persistent taint across executions (via tainted_storage) |
+| `--injection-provenance` | Arg→slot provenance mapping; enables LOCATE narrowing |
+| `--oracle-detection` | Inline oracle-gated transfer detection (opcode proximity) |
+| `--flashloan-detection` | Inline flash loan manipulation detection |
+| `--oracle-staleness` | Inline missing oracle staleness check detection |
+| `--empty-state-guard` | Inline first-deposit inflation guard detection |
+| `--dos-detection` | Inline state-dependent revert DoS detection |
 | `--concolic` | Symbolic execution for deeper path coverage |
 | `--onchain-storage-fetching dump` | Faster storage fetch for large contracts |
 
@@ -170,21 +207,31 @@ ABI fingerprint
     ↓
 corpus_initializer.rs — detects token standards, oracle interfaces, privileged fns
     ↓
-evm_fuzzer.rs — auto-activates matching oracles
+evm_fuzzer.rs — auto-activates matching oracles, registers taint middlewares
     ↓
-LibAFL mutation engine → revm fork execution (interceptor middlewares)
+LibAFL mutation engine → revm fork execution
+    ├── Taint middlewares (013): cmp_linearity — tracks TB{t,nl,provenance} per stack val
+    ├── Oracle middlewares (014): inline oracle exploit detection (opcode-level)
+    └── Core middlewares: cheatcodes, flashloan, reentrancy, sha3_bypass
     ↓
-Oracle layer — post-execution state observation
+Causal gate: CmpLinearityTaint reexecution → INJECTION_CONFIRMED_EXPLOIT_PATH → oracles
+    ↓
+Oracle layer — post-execution state observation (gated by taint verdict)
+    ↓
+Provenance-Enhanced LOCATE — skips non-contributing args using arg→slot bitmap
     ↓
 LiquidationRouter — confirms economic extractability via fork-native DEX routing
     ↓
 findings/
 ```
 
-### The Exploit Loop: Middleware & Oracles
-Rather than executing code passively, SPECTOR-FUZZ runs a continuous feedback loop between the **Middleware** (the actors changing blockchain reality) and the **Oracles** (the observers checking safety rules):
+### The Exploit Loop: Middleware, Taint Tracking & Oracles
+Rather than executing code passively, SPECTOR-FUZZ runs a continuous feedback loop between the **Middleware** (the actors changing blockchain reality), the **Taint Engine** (the causality tracker), and the **Oracles** (the observers checking safety rules):
 *   **State Manipulation (Middleware)**: The mutation engine uses the **Cheatcode Middleware** and **Flashloan Middleware** to construct a custom execution scenario (e.g., borrowing $50M in a flashloan, warping time 3 days ahead, and pranking a whale caller).
+*   **Taint Tracking (Inline)**: The `cmp_linearity` middleware tracks `TB{t,nl,provenance}` for every stack value. Six **014 middlewares** hook CALL, SLOAD, REVERT, TIMESTAMP to detect oracle manipulation, stale oracles, empty-state guard missing, and DoS — all at opcode level. Six **static flags** capture the verdicts.
+*   **Causal Gate (Feedback)**: `Sha3WrappedFeedback` runs `CmpLinearityTaint` reexecution before `inner_feedback.is_interesting()`. The `INJECTION_CONFIRMED_EXPLOIT_PATH` flag gates `OracleFeedback` — oracles only fire if attacker causality is proven.
 *   **Observation (Oracles)**: Post-execution, the active **Oracle Suite** (like `ERC20Oracle`) scans the mutated EVM state. If an oracle detects a state leak (e.g., an unauthorized token balance increase), it triggers a validation callback.
+*   **Provenance-Enhanced LOCATE**: After an oracle fires, the ledger secant's LOCATE phase uses arg→slot provenance to skip probing non-contributing calldata bytes — 3-10x fewer executions.
 *   **Economic Validation (Oracle ⇄ Router)**: The Oracle passes the detected tokens to the **Autonomous Liquidation Router**. The router executes dynamic swaps to see if those assets can be swapped to WETH/USDC on-chain.
 *   **Confirm & Report**: If the liquidator successfully extracts value, the oracle flags it as a verified economic exploit and outputs the finding.
 
