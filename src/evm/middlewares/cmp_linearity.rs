@@ -307,6 +307,13 @@ struct Ctx {
     tainted_record_idx: Option<usize>,
     callee: EVMAddress,
     callee_selector: [u8; 4],
+    // Feature 016 Phase 4 (return-data seam): where the caller expects this call's
+    // return data to land in ITS memory. Captured pre-execution in push_ctx; used in
+    // on_return (after pop_ctx restores caller mem) to splice the tagged return dims
+    // into the caller at the legacy CALL retOffset. Without this the dim tagged onto
+    // the callee's memory is discarded when pop_ctx swaps memory contexts back.
+    ret_offset: usize,
+    ret_len: usize,
 }
 
 impl Ctx {
@@ -330,6 +337,11 @@ pub struct CmpLinearityTaint {
     storage: HashMap<EVMU256, TaintDim>,
     stack: Vec<TB>,
     ctxs: Vec<Ctx>,
+    // Feature 016 Phase 4: shadow of the RETURNDATA buffer's dimensions, refreshed on
+    // every call return. RETURNDATACOPY reads from here instead of wiping to Generic,
+    // so a price fetched via `x = vault.getPricePerFullShare()` (which solc lowers to a
+    // CALL + RETURNDATACOPY) keeps its Price dim into the caller.
+    ret_dims: Vec<TaintDim>,
 }
 
 impl Default for CmpLinearityTaint {
@@ -339,6 +351,7 @@ impl Default for CmpLinearityTaint {
             storage: HashMap::new(),
             stack: Vec::new(),
             ctxs: Vec::new(),
+            ret_dims: Vec::new(),
         }
     }
 }
@@ -353,6 +366,7 @@ impl CmpLinearityTaint {
         self.storage.clear();
         self.stack.clear();
         self.ctxs.clear();
+        self.ret_dims.clear();
         lin_reset_verdict();
         unsafe {
             INJECTION_TAINTED_CALL_TARGET = false;
@@ -390,13 +404,27 @@ impl CmpLinearityTaint {
 
     fn push_ctx(&mut self, interp: &mut Interpreter, tainted_record_idx: Option<usize>) {
         let opcode = interp.bytecode.opcode();
-        let (arg_offset, arg_len) = match opcode {
-            0xf1 | 0xf2 => (interp.stack.peek(3).unwrap(), interp.stack.peek(4).unwrap()),
-            0xf4 | 0xfa => (interp.stack.peek(2).unwrap(), interp.stack.peek(3).unwrap()),
+        let (arg_offset, arg_len, ret_offset, ret_len) = match opcode {
+            // CALL / CALLCODE: gas addr value argOff argLen retOff retLen
+            0xf1 | 0xf2 => (
+                interp.stack.peek(3).unwrap(),
+                interp.stack.peek(4).unwrap(),
+                interp.stack.peek(5).unwrap_or(EVMU256::ZERO),
+                interp.stack.peek(6).unwrap_or(EVMU256::ZERO),
+            ),
+            // DELEGATECALL / STATICCALL: gas addr argOff argLen retOff retLen
+            0xf4 | 0xfa => (
+                interp.stack.peek(2).unwrap(),
+                interp.stack.peek(3).unwrap(),
+                interp.stack.peek(4).unwrap_or(EVMU256::ZERO),
+                interp.stack.peek(5).unwrap_or(EVMU256::ZERO),
+            ),
             _ => return,
         };
         let arg_offset = as_u64(arg_offset) as usize;
         let arg_len = as_u64(arg_len) as usize;
+        let ret_offset = as_u64(ret_offset) as usize;
+        let ret_len = as_u64(ret_len) as usize;
         let shared_storage = opcode == 0xf4 || opcode == 0xf2;
         let callee = convert_u256_to_h160(interp.stack.peek(1).unwrap_or(EVMU256::ZERO));
         let callee_selector = {
@@ -417,6 +445,8 @@ impl CmpLinearityTaint {
             tainted_record_idx,
             callee,
             callee_selector,
+            ret_offset,
+            ret_len,
         });
         self.mem.clear();
         if !shared_storage {
@@ -753,7 +783,23 @@ where
                 }
             }
             0x3d => clean!(),
-            0x3e => setup_mem!(),
+            0x3e => {
+                // RETURNDATACOPY(destOffset, offset, length) — copy the returndata dim
+                // shadow into memory. This is the modern-solc path for external returns
+                // (`x = vault.getPricePerFullShare()` lowers to CALL then RETURNDATACOPY);
+                // previously this wiped the destination to Generic, dropping the price dim.
+                popn!(3);
+                let dest = as_u64(interp.stack.peek(0).expect("stack")) as usize;
+                let src = as_u64(interp.stack.peek(1).expect("stack")) as usize;
+                let len = as_u64(interp.stack.peek(2).expect("stack")) as usize;
+                if let Some(end) = safe_mem_end(dest, len) {
+                    ensure!(self.mem, end);
+                    for i in 0..len {
+                        self.mem[dest + i] =
+                            self.ret_dims.get(src + i).copied().unwrap_or(TaintDim::Generic);
+                    }
+                }
+            }
             // TIMESTAMP (0x42) / NUMBER (0x43): the warp-controllable clock — a LINEAR
             // taint source for the warp secant (008), exactly like calldata. Without
             // this, temporal gates (reward = f(block.number)) are seen as untainted and
@@ -1015,22 +1061,48 @@ where
         //     contract returning it is tagged. This is the connective tissue that
         //     lets the dimension engine fire on Feature 015's manipulable targets
         //     without the planner pre-registering every vault/pool address.
-        if !self.ctxs.is_empty() {
-            if let Some(ctx) = self.ctxs.last() {
-                let address_gated = host
-                    .oracle_selectors
-                    .get(&ctx.callee)
-                    .map(|selectors| selectors.contains(&ctx.callee_selector))
-                    .unwrap_or(false);
-                if address_gated || is_reflexive_valuation_selector(&ctx.callee_selector) {
-                    tag_oracle_return(&mut self.mem, ret, &ctx.callee_selector);
-                }
+        //
+        // Feature 016 Phase 4 (return-data seam): tagging self.mem here is useless on
+        // its own — self.mem is the CALLEE's memory, which pop_ctx is about to discard.
+        // Instead build the tagged dims into the RETURNDATA shadow buffer, then (after
+        // pop_ctx restores the caller's memory) splice them into the caller at the CALL's
+        // retOffset. This is what actually carries a reflexive price across the call
+        // boundary; RETURNDATACOPY (0x3e) also reads self.ret_dims.
+        self.ret_dims.clear();
+        let (ret_offset, ret_len) = if let Some(ctx) = self.ctxs.last() {
+            let address_gated = host
+                .oracle_selectors
+                .get(&ctx.callee)
+                .map(|selectors| selectors.contains(&ctx.callee_selector))
+                .unwrap_or(false);
+            if address_gated || is_reflexive_valuation_selector(&ctx.callee_selector) {
+                let mut dims = vec![TaintDim::Generic; ret.len().min(MEMORY_LIMIT_BYTES)];
+                tag_oracle_return(&mut dims, ret, &ctx.callee_selector);
+                self.ret_dims = dims;
             }
-        }
+            (ctx.ret_offset, ctx.ret_len)
+        } else {
+            (0, 0)
+        };
 
         if let Some(tainted_idx) = self.pop_ctx() {
             if let Some(rec) = TAINTED_CALLS.get_mut(tainted_idx) {
                 rec.succeeded = true;
+            }
+        }
+
+        // Legacy CALL return path: the EVM copies min(retLen, returndata) into the
+        // caller's memory at retOffset. Mirror that for the dim shadow now that
+        // self.mem is the caller's memory again.
+        if !self.ret_dims.is_empty() && ret_len > 0 {
+            let n = self.ret_dims.len().min(ret_len);
+            if let Some(end) = safe_mem_end(ret_offset, n) {
+                if n > 0 {
+                    if self.mem.len() < end {
+                        self.mem.resize(end, TaintDim::Generic);
+                    }
+                    self.mem[ret_offset..end].copy_from_slice(&self.ret_dims[..n]);
+                }
             }
         }
     }
@@ -1056,6 +1128,14 @@ mod dim_propagation_tests {
     use super::*;
     use crate::evm::vm::EVMState;
     use libafl::schedulers::QueueScheduler;
+
+    // PRICE_DIM_CMP_SEEN / PRICE_MANIPULATION_FLOW are process-global `static mut`s;
+    // `cargo test` runs tests in parallel, so any test that resets one and later reads
+    // it must serialize against the others that write it. Acquire this first.
+    static PRICE_CMP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn price_cmp_guard() -> std::sync::MutexGuard<'static, ()> {
+        PRICE_CMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn price() -> TB {
         TB { t: true, nl: false, provenance: 0, dim: TaintDim::Price }
@@ -1161,6 +1241,7 @@ mod dim_propagation_tests {
     // reflexive targets.
     #[test]
     fn reflexive_price_flows_to_price_cmp() {
+        let _g = price_cmp_guard();
         unsafe { PRICE_DIM_CMP_SEEN = false; }
         let mut mw = CmpLinearityTaint::new();
         let mut h = host();
@@ -1219,6 +1300,7 @@ mod dim_propagation_tests {
     // realistic V3 price-read path; pre-bridge it was Generic end-to-end.
     #[test]
     fn slot0_sqrtprice_unpacked_flows_to_price_cmp() {
+        let _g = price_cmp_guard();
         unsafe { PRICE_DIM_CMP_SEEN = false; }
         let mut mw = CmpLinearityTaint::new();
         let mut h = host();
@@ -1254,6 +1336,7 @@ mod dim_propagation_tests {
     // already did, ISZERO previously did not.
     #[test]
     fn iszero_on_price_counts_as_price_cmp() {
+        let _g = price_cmp_guard();
         unsafe { PRICE_DIM_CMP_SEEN = false; }
         let mut mw = CmpLinearityTaint::new();
         mw.stack = vec![price()];
@@ -1269,6 +1352,7 @@ mod dim_propagation_tests {
     // through ISZERO must NOT masquerade as a price comparison.
     #[test]
     fn iszero_on_non_price_is_not_a_price_cmp() {
+        let _g = price_cmp_guard();
         unsafe { PRICE_DIM_CMP_SEEN = false; }
         let mut mw = CmpLinearityTaint::new();
         mw.stack = vec![balance()]; // tainted, but Balance not Price
@@ -1286,6 +1370,95 @@ mod dim_propagation_tests {
     fn signextend_preserves_value_dim() {
         assert_eq!(step_dim(0x0b, &[price(), generic()]), TaintDim::Price);
         assert_eq!(step_dim(0x0b, &[generic(), generic()]), TaintDim::Generic);
+    }
+
+    // Construct a Ctx as push_ctx would leave it right after a CALL: caller memory
+    // saved, callee selector + retOffset/retLen recorded.
+    fn call_ctx(selector: [u8; 4], ret_offset: usize, ret_len: usize, caller_mem_len: usize) -> Ctx {
+        Ctx {
+            mem: vec![TaintDim::Generic; caller_mem_len],
+            storage: std::collections::HashMap::new(),
+            stack: Vec::new(),
+            input_data: Vec::new(),
+            shared_storage: false,
+            tainted_record_idx: None,
+            callee: EVMAddress::repeat_byte(0x22),
+            callee_selector: selector,
+            ret_offset,
+            ret_len,
+        }
+    }
+
+    // THE RETURN-DATA SEAM (finding ⑥). Pre-fix, tag_oracle_return tagged the callee's
+    // memory which pop_ctx immediately discarded, so a reflexive price never reached the
+    // caller. This drives the real on_return path: after the CALL boundary, the Price
+    // dim must land in the CALLER's memory at retOffset (legacy path) AND populate the
+    // returndata shadow buffer (RETURNDATACOPY path).
+    #[test]
+    fn reflexive_return_survives_call_boundary() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // State just after `CALL vault.getPricePerFullShare()`, retOffset 0x80 / 32B.
+        mw.ctxs.push(call_ctx(GET_PRICE_PER_FULL_SHARE_SEL, 0x80, 0x20, 0xa0));
+        mw.mem = vec![TaintDim::Generic; 32]; // callee frame — pop_ctx discards it
+
+        let ret = Bytes::from(vec![0u8; 32]);
+        let mut interp = interp_with(0x00, 0);
+        unsafe { mw.on_return(&mut interp, &mut h, &mut st, &ret); }
+
+        // Caller memory at retOffset must now be Price (legacy CALL retOffset copy).
+        assert_eq!(
+            mw.mem.get(0x80).copied(),
+            Some(TaintDim::Price),
+            "reflexive price must land in caller memory at retOffset across the call boundary"
+        );
+        // And the returndata shadow must hold Price for the RETURNDATACOPY path.
+        assert_eq!(mw.ret_dims.first().copied(), Some(TaintDim::Price));
+    }
+
+    // A non-reflexive, non-oracle return must NOT leak a dim across the boundary, and
+    // must clear any stale returndata shadow.
+    #[test]
+    fn plain_return_does_not_leak_dim() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        mw.ret_dims = vec![TaintDim::Price; 32]; // stale from a previous call
+        mw.ctxs.push(call_ctx([0xde, 0xad, 0xbe, 0xef], 0x80, 0x20, 0xa0));
+
+        let ret = Bytes::from(vec![0u8; 32]);
+        let mut interp = interp_with(0x00, 0);
+        unsafe { mw.on_return(&mut interp, &mut h, &mut st, &ret); }
+
+        assert!(mw.ret_dims.is_empty(), "returndata shadow must be cleared for a plain return");
+        assert_eq!(mw.mem.get(0x80).copied(), Some(TaintDim::Generic), "no dim may leak to caller");
+    }
+
+    // The RETURNDATACOPY path (modern solc): copy the returndata dim shadow into memory
+    // at destOffset. Stack (top→bottom) is destOffset, offset, length.
+    #[test]
+    fn returndatacopy_carries_price_dim() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        mw.ret_dims = vec![TaintDim::Price; 32]; // as if just returned from a reflexive read
+
+        let mut interp = interp_with(0x3e, 0);
+        let _ = interp.stack.push(EVMU256::from(32u64)); // length (bottom)
+        let _ = interp.stack.push(EVMU256::ZERO); // offset into returndata
+        let _ = interp.stack.push(EVMU256::from(0x40u64)); // destOffset (top)
+        mw.stack = vec![generic(), generic(), generic()];
+        unsafe { mw.on_step(&mut interp, &mut h, &mut st); }
+
+        assert_eq!(
+            mw.mem.get(0x40).copied(),
+            Some(TaintDim::Price),
+            "RETURNDATACOPY must carry the returndata dim into memory"
+        );
+        // Beyond the copied 32 bytes stays Generic.
+        assert_eq!(mw.mem.get(0x60).copied().unwrap_or(TaintDim::Generic), TaintDim::Generic);
     }
 
     fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
