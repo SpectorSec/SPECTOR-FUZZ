@@ -1,0 +1,65 @@
+digraph TaintPipeline {
+    rankdir=LR;
+    bgcolor="#1a1b26";
+    fontcolor="white";
+    fontname="JetBrains Mono";
+    label="013 + 014 + Phase 0 — Full Taint Pipeline";
+    labeljust=left;
+    pad=0.5;
+
+    node [fontname="JetBrains Mono", fontcolor="white", shape=box, style=rounded, penwidth=2];
+    edge [fontcolor="#565f89", color="#565f89", fontname="JetBrains Mono", fontsize=10];
+
+    subgraph cluster_013 {
+        label="013 — Taint Injection Detection";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        provenance [label="CALLDATALOAD → TB.provenance\nbitmap of which args touched the stack" color="#73daca"];
+        sstore [label="SSTORE records provenance\nin host.arg_slot_provenance" color="#73daca"];
+        chain [label="injection_chain_verdict()\nwalk TAINTED_CALLS\n→ INJECTION_CONFIRMED_EXPLOIT_PATH" color="#e0af68"];
+        host_map [label="host.tainted_storage\npersistent cross-execution" color="#bb9af7"];
+    }
+
+    subgraph cluster_014 {
+        label="014 — Taint Oracle Middlewares";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        middlewares [label="6 middlewares (inline)\nhook CALL, SLOAD, REVERT, TIMESTAMP\nset static flags" color="#7aa2f7"];
+        flags [label="Static flags\nwrite-only verdicts" color="#e0af68"];
+    }
+
+    subgraph cluster_phase0 {
+        label="Phase 0 — Causal Oracle Gating";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        reexec [label="Sha3WrappedFeedback\nruns CmpLinearityTaint reexec\nBEFORE inner feedback" color="#f7768e"];
+        gate [label="OracleFeedback\nsingle gate line:\nif !injection_exploit_path_detected()\n    continue;" color="#f7768e"];
+        metadata [label="ArgStorageProvenance\ncollected after reexec" color="#f7768e"];
+    }
+
+    subgraph cluster_amplify {
+        label="015 — Provenance-Enhanced LOCATE";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        locate [label="LOCATE phase\nper-contract bitmap OR\n→ skip args with bit=0\n3-10x fewer probe execs" color="#9ece6a"];
+        amplify [label="AMPLIFY\nsigned secant derivative-root\nclimbs interior profit peak" color="#9ece6a"];
+    }
+
+    middlewares -> flags [label="  set during execution"];
+    flags -> reexec [label="  consumed at feedback time"];
+    host_map -> chain [label="  persistent taint data"];
+    provenance -> sstore [label="  recorded on storage write"];
+    sstore -> metadata [label="  snapshot per execution"];
+    reexec -> chain [label="  runs before gate"];
+    chain -> gate [label="  gates oracle feedback"];
+    metadata -> locate [label="  per-contract bitmap"];
+    locate -> amplify [label="  locates the knob → turns it"];
+}

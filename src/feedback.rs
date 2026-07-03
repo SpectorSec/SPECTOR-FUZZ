@@ -35,6 +35,7 @@ use crate::{
     state_input::StagedVMState,
     evm::types::CampaignIntermediateStates,
     evm::oracles::CampaignWarpStates,
+    evm::middlewares::cmp_linearity::TaintDim,
 };
 
 /// OracleFeedback is a wrapper around a set of oracles and producers.
@@ -785,6 +786,9 @@ pub struct LedgerSecantState {
     pub prev_x1: u128,
     pub prev_slope: Option<i128>,
     pub cooldown: u32,
+    /// Feature 016 Phase 3 — dimension of the located lever (Price/Balance/etc.).
+    /// Determines probe delta granularity in the Amplify phase.
+    pub located_dim: TaintDim,
 }
 
 impl_serdeany!(LedgerSecantState);

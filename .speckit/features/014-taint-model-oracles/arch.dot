@@ -1,0 +1,66 @@
+digraph Taint014 {
+    rankdir=TB;
+    bgcolor="#1a1b26";
+    fontcolor="white";
+    fontname="JetBrains Mono";
+    label="014 — Taint-Informed Oracle Middlewares";
+    labeljust=left;
+    pad=0.5;
+
+    node [fontname="JetBrains Mono", fontcolor="white", shape=box, style=rounded, penwidth=2];
+    edge [fontcolor="#565f89", color="#565f89", fontname="JetBrains Mono", fontsize=10];
+
+    subgraph cluster_middlewares {
+        label="Six Inline Middlewares (opcode-level hooks)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        return_taint [label="Phase 0: Return-value taint\nFILE: cmp_linearity.rs\nHOOKS: CALL + RETURN\nTags bytes from known oracle addresses" color="#7aa2f7"];
+
+        oracle_tracker [label="Phase 1: OracleTracker\nFILE: oracle_tracker.rs\nHOOKS: CALL, JUMPI, comparison\n60-op window:\noracle CALL → cmp → value CALL" color="#7aa2f7"];
+
+        flashloan [label="Phase 2: FlashloanOracle\nFILE: flashloan_oracle.rs\nHOOKS: CALL, BALANCE\nMulti-CALL sequence:\nborrow → oracle read ×2 → value move" color="#7aa2f7"];
+
+        staleness [label="Phase 3: OracleStaleness\nFILE: oracle_staleness.rs\nHOOKS: TIMESTAMP, CALL, JUMPI\n50-op window after oracle CALL\nmissing TIMESTAMP check → fire" color="#7aa2f7"];
+
+        empty_state [label="Phase 4: EmptyStateGuard\nFILE: empty_state_guard.rs\nHOOKS: CALL, SLOAD, JUMPI\n40 ops after deposit/mint/withdraw/redeem\nno SLOAD+JUMPI → fire" color="#7aa2f7"];
+
+        dos [label="Phase 5: DoSDetector\nFILE: dos_detector.rs\nHOOKS: SLOAD, REVERT\nSLOAD before REVERT — is slot\nin host.tainted_storage?" color="#7aa2f7"];
+    }
+
+    subgraph cluster_flags {
+        label="Static Flags (write-only verdicts)";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        inj_tainted_call [label="INJECTION_TAINTED_CALL_TARGET" color="#e0af68"];
+        inj_tainted_calldata [label="INJECTION_TAINTED_CALLDATA" color="#e0af68"];
+        tracked_oracle_gate [label="ORACLE_GATED_TRANSFER_DETECTED" color="#e0af68"];
+        tracked_flashloan [label="FLASHLOAN_MANIPULATION_DETECTED" color="#e0af68"];
+        tracked_stale [label="STALE_ORACLE_DETECTED" color="#e0af68"];
+        tracked_empty [label="EMPTY_STATE_GUARD_MISSING" color="#e0af68"];
+        tracked_dos [label="DOS_STATE_DEPENDENT_DETECTED" color="#e0af68"];
+    }
+
+    subgraph cluster_deps {
+        label="Dependencies";
+        style=dashed;
+        color="#3b4261";
+        fontcolor="#a9b1d6";
+
+        tainted_storage [label="host.tainted_storage\n(013 Phase 3)" color="#bb9af7"];
+        oracle_selectors [label="host.oracle_selectors\nfrom ABI scan" color="#bb9af7"];
+    }
+
+    dos -> tainted_storage [label="  reads 013"];
+    return_taint -> oracle_selectors [label="  reads"];
+    return_taint -> oracle_tracker [label="  feeds proximity"];
+    oracle_tracker -> tracked_oracle_gate;
+    flashloan -> tracked_flashloan;
+    staleness -> tracked_stale;
+    empty_state -> tracked_empty;
+    dos -> tracked_dos;
+    return_taint -> oracle_tracker [style=invis];
+}
