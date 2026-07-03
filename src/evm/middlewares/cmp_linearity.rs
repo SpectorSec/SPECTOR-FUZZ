@@ -40,6 +40,41 @@ const LATEST_ANSWER_SEL: [u8; 4] = [0x50, 0xd2, 0x5b, 0xcd]; // latestAnswer()
 const GET_ROUND_DATA_SEL: [u8; 4] = [0x9a, 0x6f, 0xc8, 0xf5]; // getRoundData(uint80)
 const PEEK_SEL: [u8; 4] = [0x59, 0xe0, 0x2d, 0xd7]; // peek()
 
+/// Feature 016 Phase 2 — the 015↔016 BRIDGE. Reflexive valuation reads that
+/// Feature 015 targets (Promote→Locate→Amplify). Unlike Chainlink, these are
+/// SELF-IDENTIFYING by selector alone: any contract exposing `get_virtual_price()`
+/// is, by ABI convention, returning a manipulable price-per-share. So they are
+/// recognized ADDRESS-AGNOSTICALLY in on_return (no host.oracle_selectors entry
+/// needed) — the manipulated price gets a Price dim → secant probes /256 not /64
+/// → PRICE_MANIPULATION_FLOW can fire on the yDAI class. All keccak-pinned by
+/// selector_constants_match_keccak.
+const GET_VIRTUAL_PRICE_SEL: [u8; 4] = [0xbb, 0x7b, 0x8b, 0x80]; // get_virtual_price()  (Curve)
+const PRICE_PER_SHARE_SEL: [u8; 4] = [0x99, 0x53, 0x0b, 0x06]; // pricePerShare()  (Yearn v2)
+const GET_PRICE_PER_FULL_SHARE_SEL: [u8; 4] = [0x77, 0xc7, 0xb8, 0xfc]; // getPricePerFullShare()  (Yearn v1 / yDAI)
+const EXCHANGE_RATE_STORED_SEL: [u8; 4] = [0x18, 0x2d, 0xf0, 0xf5]; // exchangeRateStored()  (Compound cToken)
+const EXCHANGE_RATE_CURRENT_SEL: [u8; 4] = [0xbd, 0x6d, 0x89, 0x4d]; // exchangeRateCurrent()  (Compound cToken)
+const CONVERT_TO_ASSETS_SEL: [u8; 4] = [0x07, 0xa2, 0xd1, 0x3a]; // convertToAssets(uint256)  (ERC4626)
+const GET_UNDERLYING_PRICE_SEL: [u8; 4] = [0xfc, 0x57, 0xd4, 0xdf]; // getUnderlyingPrice(address)  (Compound oracle)
+const GET_DY_SEL: [u8; 4] = [0x5e, 0x0d, 0x44, 0x3f]; // get_dy(int128,int128,uint256)  (Curve)
+const SLOT0_SEL: [u8; 4] = [0x38, 0x50, 0xc7, 0xbd]; // slot0()  (Uniswap V3 → word0 = sqrtPriceX96)
+
+/// Membership test for the address-agnostic reflexive bridge. Any selector here is
+/// tagged by tag_oracle_return regardless of the callee address.
+fn is_reflexive_valuation_selector(selector: &[u8; 4]) -> bool {
+    matches!(
+        *selector,
+        GET_VIRTUAL_PRICE_SEL
+            | PRICE_PER_SHARE_SEL
+            | GET_PRICE_PER_FULL_SHARE_SEL
+            | EXCHANGE_RATE_STORED_SEL
+            | EXCHANGE_RATE_CURRENT_SEL
+            | CONVERT_TO_ASSETS_SEL
+            | GET_UNDERLYING_PRICE_SEL
+            | GET_DY_SEL
+            | SLOT0_SEL
+    )
+}
+
 const MAX_CALL_DEPTH: u64 = 3;
 const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -418,6 +453,16 @@ fn tag_oracle_return(mem: &mut Vec<TaintDim>, ret: &Bytes, selector: &[u8; 4]) {
     } else if *selector == LATEST_ANSWER_SEL {
         &[(0, TaintDim::Price)]
     } else if *selector == PEEK_SEL {
+        &[(0, TaintDim::Price)]
+    } else if *selector == SLOT0_SEL {
+        // Uniswap V3 slot0(): word0 = sqrtPriceX96 (Price). The remaining packed
+        // words (tick, observationIndex, cardinality, feeProtocol, unlocked) are
+        // Generic and left untagged — only the price component carries a dim.
+        &[(0, TaintDim::Price)]
+    } else if is_reflexive_valuation_selector(selector) {
+        // get_virtual_price / pricePerShare / getPricePerFullShare / exchangeRate* /
+        // convertToAssets / getUnderlyingPrice / get_dy — all return a single
+        // price-per-share / exchange-rate word.
         &[(0, TaintDim::Price)]
     } else {
         &[(0, TaintDim::Generic)]
@@ -903,14 +948,27 @@ where
             return;
         }
 
-        // Feature 014 Phase 0: mark oracle return data as tainted in memory.
-        // Check the returning call's callee against known oracle selectors.
+        // Feature 014 Phase 0 + Feature 016 Phase 2 (015↔016 bridge): mark oracle /
+        // reflexive-valuation return data with an economic dimension in memory.
+        //
+        // Two gating regimes:
+        //   * Chainlink-style oracles are ADDRESS-gated — trusted only when the
+        //     callee address is registered in host.oracle_selectors AND the
+        //     selector matches (you must know which aggregator you called).
+        //   * Reflexive valuation reads (get_virtual_price/pricePerShare/slot0/…)
+        //     are ADDRESS-AGNOSTIC — the selector alone is self-identifying, so any
+        //     contract returning it is tagged. This is the connective tissue that
+        //     lets the dimension engine fire on Feature 015's manipulable targets
+        //     without the planner pre-registering every vault/pool address.
         if !self.ctxs.is_empty() {
             if let Some(ctx) = self.ctxs.last() {
-                if let Some(selectors) = host.oracle_selectors.get(&ctx.callee) {
-                    if selectors.contains(&ctx.callee_selector) {
-                        tag_oracle_return(&mut self.mem, ret, &ctx.callee_selector);
-                    }
+                let address_gated = host
+                    .oracle_selectors
+                    .get(&ctx.callee)
+                    .map(|selectors| selectors.contains(&ctx.callee_selector))
+                    .unwrap_or(false);
+                if address_gated || is_reflexive_valuation_selector(&ctx.callee_selector) {
+                    tag_oracle_return(&mut self.mem, ret, &ctx.callee_selector);
                 }
             }
         }
@@ -964,6 +1022,112 @@ mod dim_propagation_tests {
         assert_eq!(LATEST_ANSWER_SEL, sel("latestAnswer()"), "latestAnswer()");
         assert_eq!(GET_ROUND_DATA_SEL, sel("getRoundData(uint80)"), "getRoundData(uint80)");
         assert_eq!(PEEK_SEL, sel("peek()"), "peek()");
+        // Feature 016 Phase 2 — the reflexive valuation vocabulary (015↔016 bridge).
+        assert_eq!(GET_VIRTUAL_PRICE_SEL, sel("get_virtual_price()"), "get_virtual_price()");
+        assert_eq!(PRICE_PER_SHARE_SEL, sel("pricePerShare()"), "pricePerShare()");
+        assert_eq!(GET_PRICE_PER_FULL_SHARE_SEL, sel("getPricePerFullShare()"), "getPricePerFullShare()");
+        assert_eq!(EXCHANGE_RATE_STORED_SEL, sel("exchangeRateStored()"), "exchangeRateStored()");
+        assert_eq!(EXCHANGE_RATE_CURRENT_SEL, sel("exchangeRateCurrent()"), "exchangeRateCurrent()");
+        assert_eq!(CONVERT_TO_ASSETS_SEL, sel("convertToAssets(uint256)"), "convertToAssets(uint256)");
+        assert_eq!(GET_UNDERLYING_PRICE_SEL, sel("getUnderlyingPrice(address)"), "getUnderlyingPrice(address)");
+        assert_eq!(GET_DY_SEL, sel("get_dy(int128,int128,uint256)"), "get_dy(int128,int128,uint256)");
+        assert_eq!(SLOT0_SEL, sel("slot0()"), "slot0()");
+    }
+
+    // The bridge's gating discipline: reflexive valuation reads are recognized
+    // address-agnostically, but Chainlink-style oracles are NOT (they stay
+    // address-gated in on_return). A stray selector must match nothing.
+    #[test]
+    fn reflexive_selectors_recognized_chainlink_not() {
+        for s in [
+            GET_VIRTUAL_PRICE_SEL,
+            PRICE_PER_SHARE_SEL,
+            GET_PRICE_PER_FULL_SHARE_SEL,
+            EXCHANGE_RATE_STORED_SEL,
+            EXCHANGE_RATE_CURRENT_SEL,
+            CONVERT_TO_ASSETS_SEL,
+            GET_UNDERLYING_PRICE_SEL,
+            GET_DY_SEL,
+            SLOT0_SEL,
+        ] {
+            assert!(is_reflexive_valuation_selector(&s), "reflexive selector {:x?} not recognized", s);
+        }
+        // Chainlink oracles must remain address-gated — never self-identifying.
+        assert!(!is_reflexive_valuation_selector(&LATEST_ROUND_DATA_SEL));
+        assert!(!is_reflexive_valuation_selector(&LATEST_ANSWER_SEL));
+        // A random selector matches nothing.
+        assert!(!is_reflexive_valuation_selector(&[0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    // Each single-word reflexive valuation read tags its return word0 as Price.
+    #[test]
+    fn reflexive_return_tagged_price() {
+        for s in [
+            GET_VIRTUAL_PRICE_SEL,
+            PRICE_PER_SHARE_SEL,
+            GET_PRICE_PER_FULL_SHARE_SEL,
+            EXCHANGE_RATE_STORED_SEL,
+            EXCHANGE_RATE_CURRENT_SEL,
+            CONVERT_TO_ASSETS_SEL,
+            GET_UNDERLYING_PRICE_SEL,
+            GET_DY_SEL,
+            SLOT0_SEL,
+        ] {
+            let mut mem: Vec<TaintDim> = Vec::new();
+            let ret = Bytes::from(vec![0u8; 32]);
+            tag_oracle_return(&mut mem, &ret, &s);
+            assert_eq!(mem[0], TaintDim::Price, "selector {:x?} word0 should be Price", s);
+        }
+    }
+
+    // Uniswap V3 slot0(): word0 = sqrtPriceX96 (Price); the packed remainder
+    // (tick, observationIndex, …) is NOT fabricated into a price.
+    #[test]
+    fn slot0_only_word0_is_price() {
+        let mut mem: Vec<TaintDim> = Vec::new();
+        let ret = Bytes::from(vec![0u8; 160]); // 5 packed words
+        tag_oracle_return(&mut mem, &ret, &SLOT0_SEL);
+        assert_eq!(mem[0], TaintDim::Price, "sqrtPriceX96 word0 must be Price");
+        // Sparse tagging: only word0 is written, so the vector stops at 32 bytes.
+        // The packed remainder (tick, observationIndex, …) is absent → read as
+        // Generic by omission, never fabricated into a price.
+        assert_eq!(mem.len(), 32, "only word0 should be tagged for slot0");
+        assert_eq!(
+            mem.get(32).copied().unwrap_or(TaintDim::Generic),
+            TaintDim::Generic,
+            "tick word1 must read as Generic"
+        );
+    }
+
+    // END-TO-END BRIDGE PROOF: a reflexive price return flows through memory
+    // (MLOAD) into a comparison and is registered as a Price-dim comparison —
+    // exactly the signal PRICE_MANIPULATION_FLOW keys on. Pre-bridge, this read
+    // was untagged (Generic) and PRICE_DIM_CMP_SEEN never fired for yDAI-class
+    // reflexive targets.
+    #[test]
+    fn reflexive_price_flows_to_price_cmp() {
+        unsafe { PRICE_DIM_CMP_SEEN = false; }
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // Return from get_virtual_price(): tag memory word0 = Price.
+        let ret = Bytes::from(vec![0u8; 32]);
+        tag_oracle_return(&mut mw.mem, &ret, &GET_VIRTUAL_PRICE_SEL);
+        assert_eq!(mw.mem[0], TaintDim::Price);
+
+        // MLOAD offset 0 → shadow TB carries Price out of memory.
+        let mut m = interp_with(0x51, 0);
+        let _ = m.stack.push(EVMU256::ZERO); // offset operand on real stack
+        mw.stack.push(generic()); // shadow operand MLOAD consumes
+        unsafe { mw.on_step(&mut m, &mut h, &mut st); }
+        assert_eq!(mw.stack.last().unwrap().dim, TaintDim::Price, "MLOAD of tagged price keeps Price");
+
+        // LT against a scalar → the engine records a Price-dim comparison.
+        mw.stack.push(generic()); // second comparison operand
+        let mut c = interp_with(0x10, 2);
+        unsafe { mw.on_step(&mut c, &mut h, &mut st); }
+        assert!(unsafe { PRICE_DIM_CMP_SEEN }, "reflexive price must register as a Price-dim comparison");
     }
 
     fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
