@@ -237,15 +237,10 @@ pub enum TaintDim {
     Price = 4,
 }
 
-fn dim_priority(d: TaintDim) -> u8 {
-    match d {
-        TaintDim::Price => 5,
-        TaintDim::Accumulator => 4,
-        TaintDim::Balance => 3,
-        TaintDim::Timestamp => 2,
-        TaintDim::Generic => 1,
-    }
-}
+// Most-specific-wins is the enum's own `Ord`: the `#[repr(u8)]` discriminants are
+// laid out Generic(0) < Timestamp < Balance < Accumulator < Price(4), so `a.max(b)`
+// picks the more specific dimension. Single source of truth — no separate priority
+// table to drift out of sync with the variant order.
 
 #[derive(Clone, Copy, Debug)]
 struct TB {
@@ -459,7 +454,7 @@ where
             };
         }
         // OR fields over n popped slots, push one — LINEAR transfer.
-        // Dim: most-specific-wins (highest dim_priority).
+        // Dim: most-specific-wins via TaintDim's Ord (a.dim.max(b.dim)).
         macro_rules! linear {
             ($n:expr) => {{
                 let mut r = TB::default();
@@ -468,9 +463,7 @@ where
                     r.t |= x.t;
                     r.nl |= x.nl;
                     r.provenance |= x.provenance;
-                    if dim_priority(x.dim) > dim_priority(r.dim) {
-                        r.dim = x.dim;
-                    }
+                    r.dim = r.dim.max(x.dim); // most-specific-wins via TaintDim Ord
                 }
                 pushtb!(r);
             }};
@@ -544,11 +537,37 @@ where
                     t: a.t || b.t,
                     nl: a.nl || b.nl || both,
                     provenance: a.provenance | b.provenance,
-                    dim: if dim_priority(a.dim) > dim_priority(b.dim) { a.dim } else { b.dim },
+                    dim: a.dim.max(b.dim),
                 });
             }
             0x03 => linear!(2),        // SUB
-            0x04..=0x07 => nonlinear!(2), // DIV SDIV MOD SMOD
+            // DIV / SDIV — non-linear for the secant (breaks the linear model), but
+            // dimension-PRESERVING: division is how on-chain prices are constructed
+            // (price = numerator / denominator), so lumping it with SHA3/EXP under
+            // `nonlinear!` (which resets dim → Generic) silently strips the Price tag
+            // off every self-computed AMM spot price / pricePerShare before it reaches
+            // the secant. Keep `nl` set; carry the numerator's dimension when the
+            // denominator is just a scaling factor. See dim_propagation_tests.
+            0x04 | 0x05 => {
+                let a = pop!(); // numerator (top of stack)
+                let b = pop!(); // denominator
+                let dim = match (a.dim, b.dim) {
+                    // price / scalar → price ; scalar / supply → supply's dim
+                    (d, TaintDim::Generic) | (TaintDim::Generic, d) => d,
+                    // same specific axis divided out → dimensionless ratio
+                    (x, y) if x == y => TaintDim::Generic,
+                    // two different specific dims → most-specific-wins
+                    (x, y) => x.max(y),
+                };
+                let tainted = a.t || b.t;
+                pushtb!(TB {
+                    t: tainted,
+                    nl: tainted, // non-linear whenever a tainted operand feeds the DIV
+                    provenance: a.provenance | b.provenance,
+                    dim,
+                });
+            }
+            0x06..=0x07 => nonlinear!(2), // MOD SMOD — truly dimensionless
             0x08..=0x09 => nonlinear!(3), // ADDMOD MULMOD
             0x0a => nonlinear!(2),     // EXP
             0x0b => nonlinear!(2),     // SIGNEXTEND
@@ -575,7 +594,7 @@ where
                     t: tainted,
                     nl: nonlin,
                     provenance: a.provenance | b.provenance,
-                    dim: if dim_priority(a.dim) > dim_priority(b.dim) { a.dim } else { b.dim },
+                    dim: a.dim.max(b.dim),
                 });
             }
             0x15 => {
@@ -653,7 +672,7 @@ where
                     match safe_mem_end(off, 32) {
                         Some(end) => {
                             if self.mem.len() < end { TaintDim::Generic }
-                            else { *self.mem[off..end].iter().max_by_key(|d| dim_priority(**d)).unwrap_or(&TaintDim::Generic) }
+                            else { *self.mem[off..end].iter().max().unwrap_or(&TaintDim::Generic) }
                         }
                         None => TaintDim::Generic,
                     }
@@ -690,7 +709,7 @@ where
                     .unwrap_or((false, TaintDim::Generic));
                 let local_dim = self.storage.get(&key).copied().unwrap_or(TaintDim::Generic);
                 let merged = persistent || local_dim != TaintDim::Generic;
-                let dim = if dim_priority(host_dim) > dim_priority(local_dim) { host_dim } else { local_dim };
+                let dim = host_dim.max(local_dim); // most-specific-wins via TaintDim Ord
                 self.storage.insert(key, dim);
                 if merged && persistent {
                     INJECTION_CONFIRMED_PROVENANCE = true;
@@ -912,5 +931,130 @@ where
 
     fn as_any_mut(&mut self) -> &mut dyn any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod dim_propagation_tests {
+    //! Feature 016 regression probe: does the economic dimension tag survive the
+    //! arithmetic that actually *computes* a price? Drives the real `on_step`
+    //! opcode dispatch (not a reimplementation) over a seeded shadow stack.
+    use super::*;
+    use crate::evm::vm::EVMState;
+    use libafl::schedulers::QueueScheduler;
+
+    fn price() -> TB {
+        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Price }
+    }
+    fn generic() -> TB {
+        TB { t: false, nl: false, provenance: 0, dim: TaintDim::Generic }
+    }
+
+    fn host() -> FuzzHost<QueueScheduler<EVMFuzzState>> {
+        let mut h = FuzzHost::new(QueueScheduler::new(), "work_dir".to_string());
+        h.evmstate = EVMState::new();
+        h
+    }
+
+    // Minimal interpreter positioned at a single opcode `op`, with `n` dummy
+    // values on the REAL stack so on_step's length-resync (cmp_linearity.rs:530)
+    // does not truncate the seeded shadow stack.
+    fn interp_with(op: u8, n: usize) -> Interpreter {
+        let addr = EVMAddress::repeat_byte(0x11);
+        let bc = revm_interpreter::bytecode::Bytecode::new_raw(revm_primitives::Bytes::from(vec![op]));
+        let input = revm_interpreter::interpreter::InputsImpl {
+            target_address: addr,
+            bytecode_address: Some(addr),
+            caller_address: addr,
+            input: revm_interpreter::CallInput::Bytes(revm_primitives::Bytes::new()),
+            call_value: EVMU256::ZERO,
+        };
+        let mut interp = Interpreter::new(
+            revm_interpreter::interpreter::SharedMemory::new(),
+            revm_interpreter::interpreter::ExtBytecode::new(bc),
+            input,
+            false,
+            revm_primitives::hardfork::SpecId::PRAGUE,
+            10_000_000_000,
+        );
+        for i in 0..n {
+            let _ = interp.stack.push(EVMU256::from(i as u64 + 1));
+        }
+        interp
+    }
+
+    // Apply one opcode over a shadow stack seeded with `inputs`, return the dim of
+    // the resulting top-of-stack.
+    fn step_dim(op: u8, inputs: &[TB]) -> TaintDim {
+        let mut mw = CmpLinearityTaint::new();
+        mw.stack = inputs.to_vec();
+        let mut interp = interp_with(op, inputs.len());
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+        unsafe { mw.on_step(&mut interp, &mut h, &mut st); }
+        mw.stack.last().expect("shadow result").dim
+    }
+
+    fn balance() -> TB {
+        TB { t: true, nl: false, provenance: 0, dim: TaintDim::Balance }
+    }
+
+    #[test]
+    fn mul_preserves_price_dim() {
+        // price * 1e18  (MUL 0x02, linear: one operand tainted) → dim survives.
+        assert_eq!(step_dim(0x02, &[price(), generic()]), TaintDim::Price);
+    }
+
+    #[test]
+    fn div_price_over_scalar_preserves_price() {
+        // THE FIX: a Price value (oracle answer / stored price) normalized by a
+        // constant keeps Price. Numerator is top-of-stack, so seed [scalar, price].
+        // Pre-fix this returned Generic (DIV was `nonlinear!`); post-fix → Price.
+        assert_eq!(step_dim(0x04, &[generic(), price()]), TaintDim::Price);
+    }
+
+    #[test]
+    fn div_same_dimension_is_dimensionless() {
+        // price / price is a genuine dimensionless ratio — Generic is correct, and
+        // we must NOT invent a Price here.
+        assert_eq!(step_dim(0x04, &[price(), price()]), TaintDim::Generic);
+    }
+
+    #[test]
+    fn div_balance_over_balance_stays_generic() {
+        // Honest boundary: an AMM spot price is reserveA/reserveB = balance/balance.
+        // The "price" meaning is emergent, not present in the operands — so the fix
+        // does NOT fabricate Price from two balances. Price must be seeded upstream
+        // (tag_oracle_return / SLOAD of a stored price), not synthesized by DIV.
+        assert_eq!(step_dim(0x04, &[balance(), balance()]), TaintDim::Generic);
+    }
+
+    #[test]
+    fn oracle_price_decimal_normalization_survives() {
+        // Realistic end-to-end: an oracle answer (Price) decimal-normalized as
+        // (answer * 1e8) / 1e18, driven opcode-by-opcode through the real engine.
+        // Pre-fix the trailing DIV wiped Price → Generic (secant probes /64); the
+        // carve-out keeps Price → secant probes /256 as intended.
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // MUL: [answer:Price, 1e8:Generic] → product:Price
+        mw.stack = vec![price(), generic()];
+        let mut m = interp_with(0x02, 2);
+        unsafe { mw.on_step(&mut m, &mut h, &mut st); }
+        assert_eq!(mw.stack.last().unwrap().dim, TaintDim::Price, "MUL should keep Price");
+
+        // DIV: product(Price) / 1e18(Generic). Numerator (product) is on top; push
+        // the Generic divisor last so the real stack has 2 operands.
+        mw.stack.push(generic());
+        let mut d = interp_with(0x04, 2);
+        unsafe { mw.on_step(&mut d, &mut h, &mut st); }
+
+        assert_eq!(
+            mw.stack.last().unwrap().dim,
+            TaintDim::Price,
+            "normalized oracle price must reach the secant as Price (/256), not Generic (/64)"
+        );
     }
 }
