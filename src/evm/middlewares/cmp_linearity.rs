@@ -315,9 +315,16 @@ impl Default for TB {
 #[derive(Clone, Debug)]
 struct Ctx {
     mem: Vec<TaintDim>,
+    // 017 Phase 2 (cross-CALL provenance): the caller's memory-provenance shadow,
+    // saved here so pop_ctx can restore it symmetrically with `mem`.
+    mem_prov: Vec<u64>,
     storage: HashMap<EVMU256, TaintDim>,
     stack: Vec<TB>,
     input_data: Vec<TaintDim>,
+    // 017 Phase 2: the callee's inherited calldata provenance, snapshotted from the
+    // caller's `mem_prov` over the forwarded argOffset..argLen at push_ctx. Read by the
+    // callee's CALLDATALOAD to inherit origin-anchored bits instead of re-minting local ones.
+    input_prov: Vec<u64>,
     shared_storage: bool,
     tainted_record_idx: Option<usize>,
     callee: EVMAddress,
@@ -344,6 +351,19 @@ impl Ctx {
         }
         res
     }
+
+    /// 017 Phase 2: OR the inherited provenance bits over a `length`-byte calldata window
+    /// starting at `start`. Returns 0 when the window has no inherited bits (fail-safe:
+    /// the callee then falls back to the origin-anchored mint, preserving existing behavior).
+    fn read_input_prov(&self, start: usize, length: usize) -> u64 {
+        let length = length.min(MEMORY_LIMIT_BYTES);
+        let available = self.input_prov.len();
+        if start >= available || length == 0 {
+            return 0;
+        }
+        let end = start.saturating_add(length).min(available);
+        self.input_prov[start..end].iter().fold(0u64, |acc, b| acc | *b)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -357,6 +377,12 @@ pub struct CmpLinearityTaint {
     // so a price fetched via `x = vault.getPricePerFullShare()` (which solc lowers to a
     // CALL + RETURNDATACOPY) keeps its Price dim into the caller.
     ret_dims: Vec<TaintDim>,
+    // 017 Phase 2 (cross-CALL provenance): memory-provenance shadow, a per-byte twin of
+    // `mem`. Written on MSTORE/MSTORE8 with the stored value's `TB.provenance`; read at
+    // push_ctx (write_input_prov) to forward origin-anchored bits into a callee's calldata.
+    // Never read by MLOAD (that stays provenance-lossy, preserving depth-0 byte-identity);
+    // its sole consumer is the CALL boundary.
+    mem_prov: Vec<u64>,
 }
 
 impl Default for CmpLinearityTaint {
@@ -367,6 +393,7 @@ impl Default for CmpLinearityTaint {
             stack: Vec::new(),
             ctxs: Vec::new(),
             ret_dims: Vec::new(),
+            mem_prov: Vec::new(),
         }
     }
 }
@@ -378,6 +405,7 @@ impl CmpLinearityTaint {
 
     pub fn full_reset(&mut self) {
         self.mem.clear();
+        self.mem_prov.clear();
         self.storage.clear();
         self.stack.clear();
         self.ctxs.clear();
@@ -413,6 +441,22 @@ impl CmpLinearityTaint {
             let end = start.saturating_add(length).min(available);
             if end > start {
                 res[..end - start].copy_from_slice(&self.mem[start..end]);
+            }
+        }
+        res
+    }
+
+    /// 017 Phase 2: snapshot the provenance shadow over the forwarded calldata region
+    /// (argOffset..argLen) into the callee's `input_prov`. Provenance-typed twin of
+    /// `write_input`; a region with no bits yields all-zero (callee falls back to mint).
+    fn write_input_prov(&self, start: usize, length: usize) -> Vec<u64> {
+        let length = length.min(MEMORY_LIMIT_BYTES);
+        let mut res = vec![0u64; length];
+        let available = self.mem_prov.len();
+        if start < available && length > 0 {
+            let end = start.saturating_add(length).min(available);
+            if end > start {
+                res[..end - start].copy_from_slice(&self.mem_prov[start..end]);
             }
         }
         res
@@ -454,7 +498,10 @@ impl CmpLinearityTaint {
         };
         self.ctxs.push(Ctx {
             input_data: self.write_input(arg_offset, arg_len),
+            // 017 Phase 2: forward origin-anchored provenance over the same calldata window.
+            input_prov: self.write_input_prov(arg_offset, arg_len),
             mem: self.mem.clone(),
+            mem_prov: self.mem_prov.clone(),
             storage: self.storage.clone(),
             stack: self.stack.clone(),
             shared_storage,
@@ -465,6 +512,7 @@ impl CmpLinearityTaint {
             ret_len,
         });
         self.mem.clear();
+        self.mem_prov.clear();
         if !shared_storage {
             self.storage.clear();
         }
@@ -474,6 +522,7 @@ impl CmpLinearityTaint {
     fn pop_ctx(&mut self) -> Option<usize> {
         if let Some(ctx) = self.ctxs.pop() {
             self.mem = ctx.mem;
+            self.mem_prov = ctx.mem_prov;
             self.stack = ctx.stack;
             if !ctx.shared_storage {
                 self.storage = ctx.storage;
@@ -777,11 +826,21 @@ where
                     if off == 0 {
                         clean!();
                     } else {
-                        let tainted = ctx.read_input(off, 32).iter().any(|d| *d != TaintDim::Generic);
-                        let provenance = if tainted && off >= 4 {
+                        let dim_tainted = ctx.read_input(off, 32).iter().any(|d| *d != TaintDim::Generic);
+                        // 017 Phase 2: prefer origin-anchored bits forwarded from the caller
+                        // (populated only at call_depth > 0). When none are inherited we fall
+                        // back to the origin-frame mint — at the top frame `input_prov` is empty,
+                        // so this is byte-identical to pre-Phase-2 for single-contract executions.
+                        let inherited = ctx.read_input_prov(off, 32);
+                        let provenance = if inherited != 0 {
+                            inherited
+                        } else if dim_tainted && off >= 4 {
                             let arg_idx = (off - 4) / 32;
                             if arg_idx < 64 { 1u64 << arg_idx } else { 0 }
                         } else { 0 };
+                        // provenance != 0 implies attacker-derived → tainted; preserve that
+                        // invariant even if the dim shadow collapsed to Generic-but-tainted.
+                        let tainted = dim_tainted || inherited != 0;
                         pushtb!(TB { t: tainted, nl: false, provenance, dim: TaintDim::Generic, ts_seen: false });
                     }
                 } else {
@@ -861,6 +920,10 @@ where
                     ensure!(self.mem, end);
                     let fill = vec![if v.t { v.dim } else { TaintDim::Generic }; 32];
                     self.mem[off..end].copy_from_slice(fill.as_slice());
+                    // 017 Phase 2: stamp the value's provenance across the word so it can be
+                    // forwarded to a callee's calldata at the next CALL boundary.
+                    if self.mem_prov.len() < end { self.mem_prov.resize(end, 0u64); }
+                    self.mem_prov[off..end].fill(v.provenance);
                 }
             }
             0x53 => {
@@ -870,6 +933,9 @@ where
                 if let Some(end) = safe_mem_end(off, 1) {
                     ensure!(self.mem, end);
                     self.mem[off] = if v.t { v.dim } else { TaintDim::Generic };
+                    // 017 Phase 2: single-byte provenance stamp.
+                    if self.mem_prov.len() < end { self.mem_prov.resize(end, 0u64); }
+                    self.mem_prov[off] = v.provenance;
                 }
             }
             0x54 | 0x5c => {
@@ -1422,9 +1488,11 @@ mod dim_propagation_tests {
     fn call_ctx(selector: [u8; 4], ret_offset: usize, ret_len: usize, caller_mem_len: usize) -> Ctx {
         Ctx {
             mem: vec![TaintDim::Generic; caller_mem_len],
+            mem_prov: Vec::new(),
             storage: std::collections::HashMap::new(),
             stack: Vec::new(),
             input_data: Vec::new(),
+            input_prov: Vec::new(),
             shared_storage: false,
             tainted_record_idx: None,
             callee: EVMAddress::repeat_byte(0x22),
@@ -1479,6 +1547,104 @@ mod dim_propagation_tests {
 
         assert!(mw.ret_dims.is_empty(), "returndata shadow must be cleared for a plain return");
         assert_eq!(mw.mem.get(0x80).copied(), Some(TaintDim::Generic), "no dim may leak to caller");
+    }
+
+    // ── 017 Phase 2 — Cross-CALL provenance routing ──────────────────────────
+    //
+    // An attacker arg authored at the top level must keep its ORIGIN bit as it
+    // rides through memory (MSTORE) and across a CALL boundary into the callee's
+    // calldata, rather than the callee re-minting a fresh local bit from its own
+    // argument layout. Pre-Phase-2 the callee's CALLDATALOAD invented `1<<arg_idx`
+    // in its own coordinate system, so a single execution was N disconnected
+    // provenance islands.
+    #[test]
+    fn provenance_crosses_call_boundary() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // Caller MSTOREs an attacker-authored value (top-level arg bit 3) at memory
+        // offset 4 — where the callee's arg0 lands (calldata offset 4, after the
+        // 4-byte selector). Shadow stack seeds only the value TB; on_step's
+        // length-resync appends the offset slot to match the real 2-deep stack.
+        let attacker = TB { t: true, nl: false, provenance: 1u64 << 3, dim: TaintDim::Generic, ts_seen: false };
+        mw.mem = vec![TaintDim::Generic; 0x40];
+        mw.stack = vec![attacker];
+        let mut mstore = interp_with(0x52, 0);
+        let _ = mstore.stack.push(EVMU256::from(0xdeadu64)); // value operand (peek1)
+        let _ = mstore.stack.push(EVMU256::from(4u64));      // dest offset (peek0)
+        unsafe { mw.on_step(&mut mstore, &mut h, &mut st); }
+        assert_eq!(
+            mw.mem_prov.get(4).copied(),
+            Some(1u64 << 3),
+            "MSTORE must stamp the value's provenance into the memory shadow"
+        );
+
+        // Forward that memory window into a callee frame exactly as push_ctx does
+        // (input_prov = write_input_prov over the argOffset..argLen window), then
+        // enter the callee: its memory shadow starts fresh.
+        let mut ctx = call_ctx([0xaa, 0xbb, 0xcc, 0xdd], 0, 0, 0);
+        ctx.input_prov = mw.write_input_prov(0, 0x40);
+        mw.ctxs.push(ctx);
+        mw.mem.clear();
+        mw.mem_prov.clear();
+
+        // Callee CALLDATALOAD(arg0 @ offset 4) must inherit the ORIGIN bit 3, NOT a
+        // locally re-minted arg-0 bit (1<<0).
+        let mut cdl = interp_with(0x35, 0);
+        let _ = cdl.stack.push(EVMU256::from(4u64));
+        unsafe { mw.on_step(&mut cdl, &mut h, &mut st); }
+        let out = *mw.stack.last().expect("CALLDATALOAD result");
+        assert_eq!(out.provenance, 1u64 << 3, "callee must inherit the origin arg-3 bit across the CALL boundary");
+        assert!(out.t, "inherited provenance implies tainted");
+    }
+
+    // The origin anchor: at the top frame (input_prov empty) CALLDATALOAD still
+    // mints `1<<arg_idx` from the local calldata layout. This is the byte-identical
+    // depth-0 path that keeps every single-contract exploit and Phase-1 test intact.
+    #[test]
+    fn depth_zero_still_mints() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        // Origin frame: calldata dim-tainted at arg index 2 (offset 4 + 2*32 = 0x44),
+        // but NO inherited provenance (input_prov left empty).
+        let mut ctx = call_ctx([0xaa, 0xbb, 0xcc, 0xdd], 0, 0, 0);
+        ctx.input_data = vec![TaintDim::Generic; 0x44 + 32];
+        for b in 0x44..0x44 + 32 {
+            ctx.input_data[b] = TaintDim::Balance; // any non-Generic dim → dim_tainted
+        }
+        mw.ctxs.push(ctx);
+
+        let mut cdl = interp_with(0x35, 0);
+        let _ = cdl.stack.push(EVMU256::from(0x44u64));
+        unsafe { mw.on_step(&mut cdl, &mut h, &mut st); }
+        let out = *mw.stack.last().expect("CALLDATALOAD result");
+        assert_eq!(out.provenance, 1u64 << 2, "depth-0 must mint the origin arg-2 bit");
+        assert!(out.t, "dim-tainted origin calldata is tainted");
+    }
+
+    // Fail-closed: forwarding untainted bytes (input_prov all zero, input_data all
+    // Generic) must NOT fabricate a provenance bit. The inherit branch only fires
+    // when a real origin bit was carried; clean plumbing stays clean.
+    #[test]
+    fn clean_calldata_no_inherit() {
+        let mut mw = CmpLinearityTaint::new();
+        let mut h = host();
+        let mut st = EVMFuzzState::default();
+
+        let mut ctx = call_ctx([0xaa, 0xbb, 0xcc, 0xdd], 0, 0, 0);
+        ctx.input_data = vec![TaintDim::Generic; 0x40];
+        ctx.input_prov = vec![0u64; 0x40];
+        mw.ctxs.push(ctx);
+
+        let mut cdl = interp_with(0x35, 0);
+        let _ = cdl.stack.push(EVMU256::from(4u64));
+        unsafe { mw.on_step(&mut cdl, &mut h, &mut st); }
+        let out = *mw.stack.last().expect("CALLDATALOAD result");
+        assert_eq!(out.provenance, 0, "clean forwarded calldata must not fabricate a provenance bit");
+        assert!(!out.t, "clean forwarded calldata must not be tainted");
     }
 
     // MCOPY (EIP-5656) must carry the dim shadow memory→memory (struct/array copies),
