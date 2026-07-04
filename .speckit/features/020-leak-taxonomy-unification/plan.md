@@ -1,9 +1,13 @@
 # Plan — Feature 020 — Leak Taxonomy Unification (LeakClass SSOT)
 
-**Status:** Specified (not yet coded)
+**Status:** 020-A BUILT + PUSHED (commit 03805a4). 020-B BUILT (SnapshotDelta oracle, unit-green). 020-C pending (needs 019-C producer).
 **Checkpoints resolved:** 20.1 ✓, 20.2 ✓, 20.3 ✓, 20.4 ✓ (SnapshotDelta decision), 20.5 ✓
 **Last updated:** 2026-07-04
 **Held:** LOCAL
+
+### Build log
+- **020-A** (commit 03805a4, pushed): `LeakClass` SSOT enum + `PromotionCandidate.kind` (serde-default Value). 6 unit tests + full lib regression green. Accessors carry `#[allow(dead_code)]` (selection routing is 020-C).
+- **020-B** (built, this session): `src/evm/oracles/snapshot_delta.rs` (`SnapshotDeltaOracle`, pure `detect_relocations` core + 5 unit tests); `OWNERSHIP_BUG_IDX = 20`; `OracleType::Ownership` (+ `as_str`/`from_str`/`from_strs` "all", NOT high_confidence); `Config.ownership_oracle` wired at both mod.rs construction sites; registered in `evm_fuzzer.rs` under `-d ownership_leak`/`-d ownership`/`-d all`; `LeakClass::Ownership.oracles() -> &[OracleType::Ownership]`. Watch set v1 = EIP-1967 impl/admin/beacon slots + `watch_slot`-registered owner slots; fires on pre≠post relocation (no-op re-write suppressed). 6+7 unit tests green.
 
 ---
 

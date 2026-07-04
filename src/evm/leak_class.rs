@@ -55,8 +55,8 @@ impl LeakClass {
     ];
 
     /// Detection oracle(s) for this primitive. Returns a slice, not a single value, because a
-    /// primitive legitimately spans several oracles (Value, Invariant). `Ownership` returns empty
-    /// until 020-B adds `OracleType::Ownership` (the `SnapshotDelta` oracle).
+    /// primitive legitimately spans several oracles (Value, Invariant). `Ownership` maps to the
+    /// `SnapshotDelta` oracle (`OracleType::Ownership`), added in 020-B.
     #[allow(dead_code)]
     pub fn oracles(&self) -> &'static [OracleType] {
         use OracleType::*;
@@ -66,7 +66,7 @@ impl LeakClass {
             LeakClass::Message => &[ArbitraryCall],
             LeakClass::Permission => &[Function],
             LeakClass::Invariant => &[Invariant, StateComparison, Echidna],
-            LeakClass::Ownership => &[], // 020-B → &[OracleType::Ownership] (SnapshotDelta)
+            LeakClass::Ownership => &[Ownership], // 020-B: SnapshotDelta oracle
         }
     }
 
@@ -136,21 +136,19 @@ mod tests {
 
     #[test]
     fn built_primitives_map_to_oracles() {
-        // The five primitives with shipped detection all resolve to a non-empty oracle set.
-        // Ownership is intentionally empty until 020-B introduces the SnapshotDelta oracle.
-        for lc in [
-            LeakClass::ControlFlow,
-            LeakClass::Value,
-            LeakClass::Message,
-            LeakClass::Permission,
-            LeakClass::Invariant,
-        ] {
+        // Every primitive now resolves to a non-empty oracle set — Ownership gained its
+        // SnapshotDelta home in 020-B.
+        for lc in LeakClass::ALL {
             assert!(!lc.oracles().is_empty(), "{lc:?} should map to >=1 oracle");
         }
-        assert!(
-            LeakClass::Ownership.oracles().is_empty(),
-            "Ownership has no oracle until 020-B (SnapshotDelta)"
-        );
+    }
+
+    #[test]
+    fn ownership_binds_to_snapshot_delta_oracle() {
+        // 020-B: Ownership's detection home is the SnapshotDelta oracle (OracleType::Ownership),
+        // and — per the Information Availability Law — it stays post-hoc (no inline middleware).
+        assert_eq!(LeakClass::Ownership.oracles(), &[OracleType::Ownership]);
+        assert!(LeakClass::Ownership.middleware().is_none());
     }
 
     #[test]

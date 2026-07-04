@@ -86,6 +86,7 @@ pub mod invariant;
 pub mod nft;
 pub mod reentrancy;
 pub mod selfdestruct;
+pub mod snapshot_delta;
 pub mod state_comp;
 pub mod typed_bug;
 pub mod v2_pair;
@@ -110,6 +111,10 @@ pub static REBASING_BUG_IDX: u64 = 16;
 pub static ERC4626_BUG_IDX: u64 = 17;
 pub static FRESHNESS_BUG_IDX: u64 = 18;
 pub static TEMPORAL_SKIM_BUG_IDX: u64 = 19;
+/// Feature 020-B — Ownership/Authority Relocation (SnapshotDelta oracle). Distinct idx from
+/// FUNCTION_BUG_IDX so an `upgradeTo` by a non-admin can legitimately surface both a permission
+/// leak (the call) and an ownership leak (the authority move).
+pub static OWNERSHIP_BUG_IDX: u64 = 20;
 
 /// Divide a U512 by another U512 and return a string with the decimal point at
 /// the correct position For example, 1000 / 3 = 333.333, then a = 1000e6, b =

@@ -540,6 +540,7 @@ pub(crate) enum OracleType {
     CrossChain,
     Rebasing,
     Function,
+    Ownership,
 }
 
 impl OracleType {
@@ -561,6 +562,7 @@ impl OracleType {
             OracleType::CrossChain => "crosschain",
             OracleType::Rebasing => "rebasing",
             OracleType::Function => "function",
+            OracleType::Ownership => "ownership",
         }
     }
 
@@ -582,6 +584,7 @@ impl OracleType {
             "crosschain" => OracleType::CrossChain,
             "rebasing" => OracleType::Rebasing,
             "function" => OracleType::Function,
+            "ownership" | "ownership_leak" => OracleType::Ownership,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -613,6 +616,7 @@ impl OracleType {
                     OracleType::CrossChain,
                     OracleType::Rebasing,
                     OracleType::Function,
+                    OracleType::Ownership,
                 ];
             }
             if detector == "high_confidence" {
@@ -963,6 +967,7 @@ pub fn evm_main(mut args: EvmArgs) {
         replay_file: args.replay_file,
         flashloan_oracle,
         selfdestruct_oracle: oracle_types.contains(&OracleType::SelfDestruct),
+        ownership_oracle: oracle_types.contains(&OracleType::Ownership),
         reentrancy_oracle: oracle_types.contains(&OracleType::Reentrancy),
         work_dir: args.work_dir.clone(),
         write_relationship: args.write_relationship,
@@ -1186,6 +1191,7 @@ fn test_evm_offchain_setup() {
         replay_file: args.replay_file,
         flashloan_oracle,
         selfdestruct_oracle: oracle_types.contains(&OracleType::SelfDestruct),
+        ownership_oracle: oracle_types.contains(&OracleType::Ownership),
         reentrancy_oracle: oracle_types.contains(&OracleType::Reentrancy),
         work_dir: args.work_dir.clone(),
         write_relationship: args.write_relationship,

@@ -79,6 +79,9 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub replay_file: Option<String>,
     pub flashloan_oracle: Rc<RefCell<IERC20OracleFlashloan>>,
     pub selfdestruct_oracle: bool,
+    /// Feature 020-B — SnapshotDelta oracle (LeakClass::Ownership). Selected by
+    /// `-d ownership_leak` / `-d ownership` / `-d all`.
+    pub ownership_oracle: bool,
     pub reentrancy_oracle: bool,
     // pub state_comp_oracle: Option<String>,
     // pub state_comp_matching: Option<String>,
@@ -160,6 +163,7 @@ impl<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> Debug
             .field("replay_file", &self.replay_file)
             // .field("flashloan_oracle", &self.flashloan_oracle)
             .field("selfdestruct_oracle", &self.selfdestruct_oracle)
+            .field("ownership_oracle", &self.ownership_oracle)
             // .field("state_comp_oracle", &self.state_comp_oracle)
             // .field("state_comp_matching", &self.state_comp_matching)
             .field("work_dir", &self.work_dir)

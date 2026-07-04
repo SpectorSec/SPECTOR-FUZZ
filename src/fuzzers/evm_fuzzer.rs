@@ -701,6 +701,16 @@ pub fn evm_fuzzer(
         ))));
     }
 
+    // Feature 020-B — SnapshotDelta oracle (LeakClass::Ownership). Post-hoc governance-state gate:
+    // fires when an authority-bearing storage slot (EIP-1967 proxy slots + registered owner slots)
+    // is relocated across a tx. Distinct bug type from the permission leak.
+    if config.ownership_oracle {
+        use crate::evm::oracles::snapshot_delta::SnapshotDeltaOracle;
+        oracles.push(Rc::new(RefCell::new(SnapshotDeltaOracle::new(
+            artifacts.address_to_name.clone(),
+        ))));
+    }
+
     if config.reentrancy_oracle {
         oracles.push(Rc::new(RefCell::new(ReentrancyOracle::new(
             artifacts.address_to_name.clone(),
