@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::evm::abi::{ABIAddressToInstanceMap, BoxedABI};
 use crate::evm::input::{CampaignSequence, ConciseEVMInput, EVMInputTy};
+use crate::evm::leak_class::LeakClass;
 use crate::evm::topology::{ExploitClass, TopologyReport};
 use crate::evm::types::{EVMAddress, EVMU256};
 
@@ -100,6 +101,12 @@ pub struct PromotionCandidate {
     pub contract: EVMAddress,
     pub selector: [u8; 4],
     pub best_inflow: u128,
+    /// Feature 020 — WHY this candidate was promoted. The a-posteriori path is value-inflow, so it
+    /// records `Value`; 019-C, when it lands, records `Permission` for a routed permission leak.
+    /// `#[serde(default)]` → pre-020 corpora (no `kind`) deserialize as `Value` (Default), keeping
+    /// serialized-corpus round-trip byte-compatible.
+    #[serde(default)]
+    pub kind: LeakClass,
     pub set: bool,
 }
 

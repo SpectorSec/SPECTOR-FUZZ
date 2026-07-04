@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::{input::EVMInput, types::EVMFuzzState};
 use crate::{
     evm::{input::{ConciseEVMInput, EVMInputTy}, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
+    evm::leak_class::LeakClass,
     evm::planner::{CampaignInflowBoundaries, PromotionCandidate},
     generic_vm::vm_state::VMStateT,
     input::VMInputT,
@@ -396,6 +397,8 @@ impl<SC> TokenBalanceFeedback<SC> {
                 contract,
                 selector,
                 best_inflow: inflow,
+                // 020: this path is value-inflow driven. 019-C records Permission instead.
+                kind: LeakClass::Value,
                 set: true,
             });
         }

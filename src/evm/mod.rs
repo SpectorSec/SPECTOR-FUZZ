@@ -10,6 +10,7 @@ pub mod cov_stage;
 pub mod feedbacks;
 pub mod host;
 pub mod input;
+pub mod leak_class;
 pub mod middlewares;
 pub mod minimizer;
 pub mod mutator;
@@ -522,7 +523,7 @@ impl EVMTargetType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OracleType {
+pub(crate) enum OracleType {
     ERC20,
     Pair,
     Reentrancy,
