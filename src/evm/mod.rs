@@ -286,6 +286,14 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     dimension_warp: bool,
 
+    /// Feature 019 Phase A: enable the Causal Identity permission-leak materiality gate.
+    /// Registers the inline `PermissionLeakTracer` and switches the permission-leak
+    /// oracle to require a material sink (SSTORE pre≠post or a value-CALL) in the
+    /// privileged contract before firing — suppressing no-op privileged calls such as
+    /// `burn(0x0, 0)`. Additive; off by default (pre-019 behavior).
+    #[arg(long, default_value = "false")]
+    causal_identity: bool,
+
     /// Feature 013 Phase 1: shallow injection detection at CALL boundaries.
     /// When enabled, the reexecution taint engine reads shadow-stack and memory taint
     /// at each CALL/DELEGATECALL/STATICCALL boundary and sets static flags for
@@ -989,6 +997,7 @@ pub fn evm_main(mut args: EvmArgs) {
         // campaign_orchestrator + impact_eth_gradient OR'd with args.reflexive_lever).
         reflexive_lever: args.reflexive_lever,
         dimension_warp: args.dimension_warp,
+        causal_identity: args.causal_identity,
         injection_detect: args.injection_detect,
         injection_persist: args.injection_persist,
         injection_provenance: args.injection_provenance,
@@ -1211,6 +1220,7 @@ fn test_evm_offchain_setup() {
         // impact_eth_gradient (OR'd with args.reflexive_lever at their fields).
         reflexive_lever: args.reflexive_lever,
         dimension_warp: args.dimension_warp,
+        causal_identity: args.causal_identity,
         injection_detect: args.injection_detect,
         injection_persist: args.injection_persist,
         injection_provenance: args.injection_provenance,

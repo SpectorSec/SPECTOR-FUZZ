@@ -49,6 +49,7 @@ use crate::{
             middleware::Middleware,
             oracle_staleness::OracleStaleness,
             oracle_tracker::OracleTracker,
+            permission_leak::PermissionLeakTracer,
             reentrancy::ReentrancyTracer,
             sha3_bypass::{Sha3Bypass, Sha3TaintAnalysis},
             value_capture::ValueCaptureMiddleware,
@@ -219,6 +220,17 @@ pub fn evm_fuzzer(
         // (EVMState::fee_observations). Without it the oracle sees nothing.
         debug!("fee-on-transfer inline detector enabled");
         fuzz_host.add_middlewares(Rc::new(RefCell::new(FeeOnTransferDetector::new())));
+    }
+
+    if config.causal_identity {
+        // Feature 019 Phase A: inline materiality tracker feeds the FunctionOracle's
+        // permission-leak gate (EVMState::permission_leak_metadata). Records SSTORE
+        // pre≠post deltas and value-CALLs so the oracle can suppress no-op privileged
+        // calls (the burn(0,0) false positive). Order vs cmp_linearity is irrelevant —
+        // cmp_linearity runs on a separate reexecution pass (feedbacks.rs:138); this
+        // reads the accumulated taint bus best-effort, gating on the same-pass delta.
+        debug!("causal-identity permission-leak detector enabled");
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(PermissionLeakTracer::new())));
     }
 
     // Feature 014 Phase 1: oracle-gated value movement detection.
@@ -629,6 +641,8 @@ pub fn evm_fuzzer(
         let attackers: std::collections::HashSet<EVMAddress> =
             state.callers_pool.iter().cloned().collect();
         let mut fn_oracle = FunctionOracle::new(artifacts.address_to_name.clone());
+        // Feature 019 Phase A: switch on the materiality gate when --causal-identity is set.
+        fn_oracle.set_causal_identity(config.causal_identity);
         for (contract, selector, fn_name) in &artifacts.privileged_functions {
             // Allow only non-attacker callers (i.e., the deployer).
             // Any address in callers_pool is a fuzzer-controlled attacker.

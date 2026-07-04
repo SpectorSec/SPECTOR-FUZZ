@@ -34,6 +34,10 @@ pub struct FunctionOracle {
     /// Human-readable function name for each (contract, selector) pair.
     names: HashMap<(EVMAddress, [u8; 4]), String>,
     pub address_to_name: HashMap<EVMAddress, String>,
+    /// Feature 019 Phase A — when true, apply the materiality gate: an unauthorized
+    /// privileged call is a leak only if the privileged contract had a material sink
+    /// this tx (`PermissionLeakTracer` evidence). Off = pre-019 behavior, byte-identical.
+    causal_identity: bool,
 }
 
 impl FunctionOracle {
@@ -42,7 +46,13 @@ impl FunctionOracle {
             rules: HashMap::new(),
             names: HashMap::new(),
             address_to_name,
+            causal_identity: false,
         }
+    }
+
+    /// Enable the Feature 019 materiality gate (driven by `--causal-identity`).
+    pub fn set_causal_identity(&mut self, enabled: bool) {
+        self.causal_identity = enabled;
     }
 
     /// Register a privileged function. Only `allowed_callers` may call it
@@ -186,6 +196,17 @@ impl
 
         // If caller is in either allowed set, no violation
         if allowed_static.contains(&caller) || allowed_dynamic.map(|set| set.contains(&caller)).unwrap_or(false) {
+            return vec![];
+        }
+
+        // Feature 019 Phase A — materiality gate. An unauthorized privileged call that
+        // changed nothing material (e.g. `DAI.burn(0x0, 0)`) is a no-op, not a permission
+        // leak. Require the privileged contract to have had a material sink this tx —
+        // an SSTORE with pre≠post, or a value-CALL — as recorded by PermissionLeakTracer.
+        // Fail-CLOSED: absent materiality → not a leak. Gated on --causal-identity so
+        // that with the flag off the oracle is byte-identical to pre-019 (the middleware
+        // is not registered, so the metadata would be empty and unconditionally suppress).
+        if self.causal_identity && !ctx.post_state.permission_leak_metadata.contract_material(&contract) {
             return vec![];
         }
 

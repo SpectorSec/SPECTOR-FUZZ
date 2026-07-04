@@ -31,6 +31,7 @@ pub enum MiddlewareType {
     CmpLinearity,
     CallPrinter,
     Reentrancy,
+    PermissionLeak,
     IntegerOverflow,
     Cheatcode,
     ValueCapture,
