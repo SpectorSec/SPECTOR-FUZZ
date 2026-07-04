@@ -9,10 +9,12 @@
 //! Phasing (see `.speckit/features/020-leak-taxonomy-unification/`):
 //!   020-A — this enum + the reason-aware `PromotionCandidate.kind` field (byte-identical).
 //!   020-B — `OracleType::Ownership` + the `SnapshotDelta` oracle (gives Ownership a real home).
-//!   020-C — `mutator.rs` branches amplification on `PromotionCandidate.kind`.
+//!   020-C — `OracleType::from_strs` routes `-d <class>` selection through `oracles()`/`as_str()`
+//!           (this makes the SSOT drive detection); `mutator.rs` kind-aware amplification is
+//!           deferred to 019-C (needs a `Permission` producer — no dead branch until then).
 //!
-//! Until selection routing lands, the derived accessors are not yet consumed — hence
-//! `#[allow(dead_code)]` on them. `Default`/the variants ARE consumed today (PromotionCandidate).
+//! `ALL`/`oracles()`/`as_str()` are consumed by `-d` routing; `from_str()` (legacy-alias parse)
+//! and `middleware()` (attach law) are not yet wired, hence their `#[allow(dead_code)]`.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +45,7 @@ pub enum LeakClass {
 }
 
 impl LeakClass {
-    /// All six primitives, for iteration.
-    #[allow(dead_code)]
+    /// All six primitives, for iteration. Consumed by `OracleType::from_strs` (`-d` routing).
     pub const ALL: [LeakClass; 6] = [
         LeakClass::ControlFlow,
         LeakClass::Value,
@@ -56,8 +57,7 @@ impl LeakClass {
 
     /// Detection oracle(s) for this primitive. Returns a slice, not a single value, because a
     /// primitive legitimately spans several oracles (Value, Invariant). `Ownership` maps to the
-    /// `SnapshotDelta` oracle (`OracleType::Ownership`), added in 020-B.
-    #[allow(dead_code)]
+    /// `SnapshotDelta` oracle (`OracleType::Ownership`), added in 020-B. Consumed by `-d` routing.
     pub fn oracles(&self) -> &'static [OracleType] {
         use OracleType::*;
         match self {
@@ -86,7 +86,6 @@ impl LeakClass {
     }
 
     /// The ONE canonical config string — used by `-d <class>` selection and JSON template tags.
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             LeakClass::ControlFlow => "control_flow_leak",

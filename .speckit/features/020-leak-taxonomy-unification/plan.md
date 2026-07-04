@@ -1,13 +1,15 @@
 # Plan — Feature 020 — Leak Taxonomy Unification (LeakClass SSOT)
 
-**Status:** 020-A BUILT + PUSHED (commit 03805a4). 020-B BUILT (SnapshotDelta oracle, unit-green). 020-C pending (needs 019-C producer).
+**Status:** 020-A BUILT + PUSHED (03805a4). 020-B BUILT + PUSHED (5504d53). 020-C: `-d` routing BUILT; mutator kind-amplification DEFERRED to 019-C (needs a Permission producer).
 **Checkpoints resolved:** 20.1 ✓, 20.2 ✓, 20.3 ✓, 20.4 ✓ (SnapshotDelta decision), 20.5 ✓
 **Last updated:** 2026-07-04
 **Held:** LOCAL
 
 ### Build log
 - **020-A** (commit 03805a4, pushed): `LeakClass` SSOT enum + `PromotionCandidate.kind` (serde-default Value). 6 unit tests + full lib regression green. Accessors carry `#[allow(dead_code)]` (selection routing is 020-C).
-- **020-B** (built, this session): `src/evm/oracles/snapshot_delta.rs` (`SnapshotDeltaOracle`, pure `detect_relocations` core + 5 unit tests); `OWNERSHIP_BUG_IDX = 20`; `OracleType::Ownership` (+ `as_str`/`from_str`/`from_strs` "all", NOT high_confidence); `Config.ownership_oracle` wired at both mod.rs construction sites; registered in `evm_fuzzer.rs` under `-d ownership_leak`/`-d ownership`/`-d all`; `LeakClass::Ownership.oracles() -> &[OracleType::Ownership]`. Watch set v1 = EIP-1967 impl/admin/beacon slots + `watch_slot`-registered owner slots; fires on pre≠post relocation (no-op re-write suppressed). 6+7 unit tests green.
+- **020-B** (commit 5504d53, pushed): `src/evm/oracles/snapshot_delta.rs` (`SnapshotDeltaOracle`, pure `detect_relocations` core + 5 unit tests); `OWNERSHIP_BUG_IDX = 20`; `OracleType::Ownership` (+ `as_str`/`from_str`/`from_strs` "all", NOT high_confidence); `Config.ownership_oracle` wired at both mod.rs construction sites; registered in `evm_fuzzer.rs` under `-d ownership_leak`/`-d ownership`/`-d all`; `LeakClass::Ownership.oracles() -> &[OracleType::Ownership]`. Watch set v1 = EIP-1967 impl/admin/beacon slots + `watch_slot`-registered owner slots; fires on pre≠post relocation (no-op re-write suppressed). 169 lib tests green.
+- **020-C — routing half** (built, this session): `OracleType::from_strs` now expands a CANONICAL `LeakClass` string (`value_leak`/`permission_leak`/`ownership_leak`/…) via `LeakClass::oracles()` — the SSOT drives detection selection. Matched on `as_str()` ONLY (never the legacy per-oracle aliases), so bare names (`fee_on_transfer`→[FeeOnTransfer], `function`→[Function]) stay byte-identical; guarded by golden test `detector_routing_legacy_vs_class`. `ALL`/`oracles()`/`as_str()` `#[allow(dead_code)]` removed (now consumed). 170 lib tests green.
+  - **020-C — mutator kind-amplification half: DEFERRED to 019-C.** `maybe_pin_aposteriori_lever`/`apply_ledger_secant` remain kind-agnostic. Rationale: today the ONLY `PromotionCandidate` producer (`feedbacks.rs:396`) sets `kind = Value`; a `Permission` branch (pin-but-skip-numeric-secant + admin call-tree permute) would be unreachable dead code until 019-C's found→PromotionCandidate wire emits `kind = Permission`. The consumer branch lands **with** that producer, tested end-to-end, per the phasing rule "don't write dead code." The `kind` field is already carried on the struct (020-A) so the producer/consumer can be added together with zero further schema change.
 
 ---
 

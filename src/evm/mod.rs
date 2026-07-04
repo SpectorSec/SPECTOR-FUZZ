@@ -632,6 +632,20 @@ impl OracleType {
                 ];
             }
 
+            // Feature 020-C — LeakClass SSOT drives selection. A CANONICAL class string
+            // (e.g. "value_leak", "permission_leak", "ownership_leak") expands to that
+            // primitive's full oracle set via `LeakClass::oracles()`. Matched on `as_str()`
+            // ONLY — never the legacy per-oracle aliases in `LeakClass::from_str` — so bare
+            // oracle names ("fee_on_transfer", "function") keep their exact single-oracle
+            // mapping and existing `-d <oracle>` invocations stay byte-identical.
+            if let Some(lc) = crate::evm::leak_class::LeakClass::ALL
+                .iter()
+                .find(|lc| lc.as_str() == detector)
+            {
+                results.extend_from_slice(lc.oracles());
+                continue;
+            }
+
             results.push(OracleType::from_str(detector));
         }
         results
@@ -1270,6 +1284,7 @@ fn test_evm_offchain_setup() {
 #[cfg(test)]
 mod test {
     use super::parse_constructor_args_string;
+    use super::OracleType;
 
     #[test]
     fn test_parse_constructor_args_string() {
@@ -1278,5 +1293,31 @@ mod test {
                 .to_string();
         let ret = parse_constructor_args_string(input);
         // println!("constructor args: {:?}", ret);
+    }
+
+    /// Feature 020-C golden test: legacy bare-oracle `-d` strings resolve BYTE-IDENTICALLY
+    /// (single oracle each), while canonical LeakClass strings expand to the primitive's full
+    /// oracle set. Guards against the split-brain regression where routing a bare name through
+    /// the class would silently widen its oracle set.
+    #[test]
+    fn detector_routing_legacy_vs_class() {
+        // Legacy bare oracle names — unchanged single-oracle mapping.
+        assert_eq!(OracleType::from_strs("function"), vec![OracleType::Function]);
+        assert_eq!(OracleType::from_strs("reentrancy"), vec![OracleType::Reentrancy]);
+        // Critically: "fee_on_transfer" stays a SINGLE oracle, NOT the 3-oracle Value class.
+        assert_eq!(OracleType::from_strs("fee_on_transfer"), vec![OracleType::FeeOnTransfer]);
+
+        // Canonical class strings expand via LeakClass::oracles() (the SSOT).
+        assert_eq!(OracleType::from_strs("permission_leak"), vec![OracleType::Function]);
+        assert_eq!(
+            OracleType::from_strs("value_leak"),
+            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing]
+        );
+        assert_eq!(OracleType::from_strs("ownership_leak"), vec![OracleType::Ownership]);
+        assert_eq!(OracleType::from_strs("control_flow_leak"), vec![OracleType::Reentrancy]);
+
+        // Aggregate keywords are untouched by the class layer and still include Ownership (020-B).
+        assert!(OracleType::from_strs("all").contains(&OracleType::Ownership));
+        assert!(!OracleType::from_strs("high_confidence").contains(&OracleType::Ownership));
     }
 }
