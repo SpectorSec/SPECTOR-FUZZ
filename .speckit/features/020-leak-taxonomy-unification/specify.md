@@ -5,6 +5,8 @@
 **Last updated:** 2026-07-04
 **Held:** LOCAL (builds on 019 Phase A permission-leak gate; restructures the shared PromotionCandidate → coordinate with 019-C)
 
+> **Rename note (2026-07-07):** `MiddlewareType::PermissionLeak` (and its module `permission_leak.rs`) renamed to **`MiddlewareType::FunctionAuth` / `function_auth.rs`** — the naming law this spec formalizes (identity = oracle-rooted, not primitive-rooted; a `LeakClass` primitive is a category that can house many oracles). Phase-B middleware will likewise be `ArbitraryCall`, not `MessageLeak`. The `-d permission_leak` config string (the primitive's canonical name) is unchanged. Original names below preserved as authored.
+
 ---
 
 ## Overview

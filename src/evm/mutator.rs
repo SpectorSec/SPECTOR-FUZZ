@@ -2,6 +2,7 @@ use std::fmt::Debug;
 
 use bytes::Bytes;
 use libafl::{
+    corpus::Corpus,
     inputs::Input,
     mutators::MutationResult,
     prelude::{HasMaxSize, HasRand, Mutator, State},
@@ -669,6 +670,13 @@ where
             if !cand.set {
                 return false;
             }
+            // Feature 023 Phase 3: the reflexive lever amplifies VALUE candidates only. A
+            // structural (Permission) candidate marks a Prime step to LOCK, not a magnitude to
+            // grow; the lock mechanism is a later phase, so here we simply do not amplify it. This
+            // keeps the value path byte-identical (all pre-023 candidates were Value).
+            if cand.kind != crate::evm::leak_class::LeakClass::Value {
+                return false;
+            }
             (cand.contract, cand.selector)
         };
         // Pin the matching step in the current campaign, if any and not already pinned.
@@ -757,7 +765,16 @@ where
                                 Some(s) => s,
                                 None => return false,
                             };
-                            match state.metadata_map().get::<crate::evm::feedbacks::ArgStorageProvenance>() {
+                            let prov_map = if let Some(cur) = *state.corpus().current() {
+                                if let Ok(tc) = state.corpus().get(cur) {
+                                    tc.borrow().metadata_map().get::<crate::evm::feedbacks::ArgStorageProvenance>().cloned()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            match prov_map {
                                 Some(meta) => {
                                     let bits = meta.per_slot.iter()
                                         .filter(|((addr, _), _)| *addr == step.contract)
@@ -967,7 +984,40 @@ where
                     // The removed anchor read observed_values (ABI-return words), which
                     // misread approve's bool `true` as profit and skewed chains toward
                     // approve→approve. Economic truth now lives solely at the ledger.
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, &mut plan_rand) {
+                    // Feature 024 — post-hoc → planner socket: if a STRUCTURAL (permission-leak)
+                    // candidate is set, pass its (contract, selector) so the planner re-seeds that
+                    // Prime step every iteration (the "hold"). kind==Value candidates are handled by
+                    // the reflexive lever, not here, so this stays None on the value path.
+                    let structural_pin = state
+                        .metadata_map()
+                        .get::<PromotionCandidate>()
+                        .filter(|c| c.set && c.kind == crate::evm::leak_class::LeakClass::Permission)
+                        .map(|c| (c.contract, c.selector));
+                    // §7d content re-point: pick a topology-classified capital-source token for the
+                    // Borrow slot — a borrowable whose contract exposes FlashLoan/Lending/ERC4626
+                    // (per-contract families). None ⇒ planner keeps the blind `.first()` behavior.
+                    let borrow_authority = state
+                        .metadata_map()
+                        .get::<TopologyHints>()
+                        .and_then(|h| {
+                            cache
+                                .borrowable_tokens
+                                .iter()
+                                .find(|t| {
+                                    h.contract_families.get(*t).map_or(false, |fams| {
+                                        fams.iter().any(|f| {
+                                            matches!(
+                                                f,
+                                                crate::evm::topology::ProtocolFamily::FlashLoan
+                                                    | crate::evm::topology::ProtocolFamily::Lending
+                                                    | crate::evm::topology::ProtocolFamily::ERC4626
+                                            )
+                                        })
+                                    })
+                                })
+                                .copied()
+                        });
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, borrow_authority, &mut plan_rand) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This

@@ -28,7 +28,7 @@ use tracing::{debug, error};
 
 use super::{
     input::EVMInput,
-    middlewares::{permission_leak::PermissionLeakData, reentrancy::ReentrancyData},
+    middlewares::{function_auth::FunctionAuthData, reentrancy::ReentrancyData},
     types::EVMFuzzState,
 };
 use crate::{evm::tokens::SwapData, generic_vm::vm_state};
@@ -269,11 +269,11 @@ pub struct EVMState {
     #[serde(skip)]
     pub reentrancy_metadata: ReentrancyData,
     /// Feature 019 Phase A — per-execution materiality evidence for the Causal
-    /// Identity permission-leak gate. Populated by `PermissionLeakTracer` (SSTORE
+    /// Identity permission-leak gate. Populated by `FunctionAuthTracer` (SSTORE
     /// pre≠post / value-CALL), read by `FunctionOracle` to suppress no-op privileged
     /// calls (the `burn(0,0)` false positive). `#[serde(skip)]` → per-execution reset.
     #[serde(skip)]
-    pub permission_leak_metadata: PermissionLeakData,
+    pub permission_leak_metadata: FunctionAuthData,
     #[serde(skip)]
     pub swap_data: SwapData,
     /// ERC-721 / ERC-1155 Transfer events: (token_contract, from, to, token_id)

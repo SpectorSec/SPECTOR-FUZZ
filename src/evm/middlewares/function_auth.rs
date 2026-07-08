@@ -1,6 +1,6 @@
 use std::{
     any,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
 };
 
 use libafl::schedulers::Scheduler;
@@ -12,6 +12,27 @@ use crate::evm::{
     middlewares::middleware::{Middleware, MiddlewareType},
     types::{EVMAddress, EVMFuzzState, EVMU256},
 };
+
+/// Feature 023 Phase 1a — the campaign step index currently executing. The campaign executor
+/// (`executor.rs` step loop) publishes it before each step's `execute`, so this inline
+/// middleware can attribute a structural (permission-leak) move to the step that produced it —
+/// the `phase` coordinate the verdict router (023) needs. Transient within one execution:
+/// always written before read within a single `execute`, and cleared (`None`) outside a
+/// campaign, so it carries nothing across iterations. `static mut` matches the codebase's
+/// exec-time signal idiom (temporal_*, injection statics); execution is single-threaded.
+static mut CURRENT_CAMPAIGN_STEP: Option<usize> = None;
+
+/// Executor hook: set the currently-executing campaign step index (`None` outside a campaign).
+pub fn set_campaign_step(step: Option<usize>) {
+    unsafe {
+        CURRENT_CAMPAIGN_STEP = step;
+    }
+}
+
+/// Inline reader: the step whose execution is running now, if any.
+pub fn current_campaign_step() -> Option<usize> {
+    unsafe { CURRENT_CAMPAIGN_STEP }
+}
 
 /// Feature 019 Phase A — Causal Identity Engine, Permission-Leak half.
 ///
@@ -37,9 +58,9 @@ use crate::evm::{
 /// gate can only *suppress* fires (no-op calls); a genuine unauthorized mint always
 /// changes state, so there is no false-negative risk.
 #[derive(Serialize, Debug, Clone, Default)]
-pub struct PermissionLeakTracer;
+pub struct FunctionAuthTracer;
 
-impl PermissionLeakTracer {
+impl FunctionAuthTracer {
     pub fn new() -> Self {
         Self
     }
@@ -50,7 +71,7 @@ impl PermissionLeakTracer {
 /// per-execution reset (state is restored from the input at the top of `execute`,
 /// vm.rs:1453) that `reentrancy_metadata`/`fee_observations` rely on.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct PermissionLeakData {
+pub struct FunctionAuthData {
     /// (contract, slot) pairs whose `SSTORE` wrote a value differing from the
     /// pre-image this execution — a material storage mutation.
     pub material_writes: HashSet<(EVMAddress, EVMU256)>,
@@ -67,9 +88,15 @@ pub struct PermissionLeakData {
     /// simply absent. Requiring taint here would false-negative those inputs. The
     /// materiality *delta* (`pre ≠ new`) is the gate; taint enriches the evidence.
     pub tainted_material: HashSet<(EVMAddress, EVMU256)>,
+    /// Feature 023 Phase 1a: campaign step index (from `current_campaign_step()`) where each
+    /// contract's material move was FIRST recorded this execution — the phase coordinate used
+    /// to phase-tag the structural verdict. `or_insert` = first-write-wins. Empty outside a
+    /// campaign (cursor `None`).
+    #[serde(default)]
+    pub material_at_step: HashMap<EVMAddress, usize>,
 }
 
-impl PermissionLeakData {
+impl FunctionAuthData {
     /// True iff `contract` had any material sink (storage delta or value move) this
     /// execution. The `FunctionOracle` materiality gate reads exactly this.
     pub fn contract_material(&self, contract: &EVMAddress) -> bool {
@@ -77,7 +104,7 @@ impl PermissionLeakData {
     }
 }
 
-impl<SC> Middleware<SC> for PermissionLeakTracer
+impl<SC> Middleware<SC> for FunctionAuthTracer
 where
     SC: Scheduler<State = EVMFuzzState> + Clone,
 {
@@ -124,6 +151,9 @@ where
 
                 let meta = &mut host.evmstate.permission_leak_metadata;
                 meta.material_writes.insert((addr, slot));
+                if let Some(s) = current_campaign_step() {
+                    meta.material_at_step.entry(addr).or_insert(s);
+                }
                 if tainted {
                     meta.tainted_material.insert((addr, slot));
                 }
@@ -137,7 +167,11 @@ where
                 let value = interp.stack.peek(2).unwrap();
                 if value != EVMU256::ZERO {
                     let addr = interp.input.target_address;
-                    host.evmstate.permission_leak_metadata.value_moves.insert(addr);
+                    let meta = &mut host.evmstate.permission_leak_metadata;
+                    meta.value_moves.insert(addr);
+                    if let Some(s) = current_campaign_step() {
+                        meta.material_at_step.entry(addr).or_insert(s);
+                    }
                 }
             }
             _ => {}
@@ -145,7 +179,10 @@ where
     }
 
     fn get_type(&self) -> MiddlewareType {
-        MiddlewareType::PermissionLeak
+        // Identity is oracle-rooted: this middleware hardens OracleType::Function. The
+        // `permission_leak_metadata` state field + `-d permission_leak` CLI string keep the
+        // detection-DOMAIN name (permission leak); identity vs domain are deliberately distinct.
+        MiddlewareType::FunctionAuth
     }
 
     fn as_any(&self) -> &dyn any::Any {
@@ -211,7 +248,7 @@ mod tests {
         let mut interp = interp_at(0x55);
         let _ = interp.stack.push(EVMU256::from(new)); // peek(1) = new value
         let _ = interp.stack.push(slot); // peek(0) = slot
-        let mut mw = PermissionLeakTracer::new();
+        let mut mw = FunctionAuthTracer::new();
         let mut st = EVMFuzzState::default();
         unsafe {
             mw.on_step(&mut interp, &mut h, &mut st);
@@ -227,7 +264,7 @@ mod tests {
         let _ = interp.stack.push(EVMU256::from(value)); // peek(2) = value
         let _ = interp.stack.push(EVMU256::from(0u64)); // peek(1) = addr
         let _ = interp.stack.push(EVMU256::from(21000u64)); // peek(0) = gas
-        let mut mw = PermissionLeakTracer::new();
+        let mut mw = FunctionAuthTracer::new();
         let mut st = EVMFuzzState::default();
         unsafe {
             mw.on_step(&mut interp, &mut h, &mut st);
@@ -309,6 +346,31 @@ mod tests {
         assert!(
             !h.evmstate.permission_leak_metadata.contract_material(&target()),
             "a value-0 CALL is not a material value move"
+        );
+    }
+
+    /// Feature 023 Phase 1a: a material move is phase-tagged with the executing campaign step,
+    /// and with no step set (outside a campaign) it carries no phase. Kept in one test so the
+    /// shared step cursor is driven deterministically (this is the only test that sets it).
+    #[test]
+    fn material_move_phase_tagged_by_step() {
+        // Inside step 2 → the material move is stamped with step 2.
+        super::set_campaign_step(Some(2));
+        let h2 = run_call(1);
+        assert_eq!(
+            h2.evmstate
+                .permission_leak_metadata
+                .material_at_step
+                .get(&target()),
+            Some(&2usize),
+            "a material move during step 2 must be phase-tagged with step 2"
+        );
+        // Outside a campaign (cursor None) → no phase recorded.
+        super::set_campaign_step(None);
+        let h0 = run_call(1);
+        assert!(
+            h0.evmstate.permission_leak_metadata.material_at_step.is_empty(),
+            "with no campaign step set, a material move carries no phase"
         );
     }
 }

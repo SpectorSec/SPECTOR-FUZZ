@@ -23,7 +23,7 @@ use super::{input::EVMInput, types::EVMFuzzState};
 use crate::{
     evm::{input::{ConciseEVMInput, EVMInputTy}, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
     evm::leak_class::LeakClass,
-    evm::planner::{CampaignInflowBoundaries, PromotionCandidate},
+    evm::planner::{CampaignInflowBoundaries, PromotionCandidate, TaintProvenanceTag},
     generic_vm::vm_state::VMStateT,
     input::VMInputT,
     r#const::INFANT_STATE_INITIAL_VOTES,
@@ -123,56 +123,14 @@ where
     {
         // checks if the inner feedback is interesting
         if self.enabled {
-            // Phase 0: run injection taint analysis BEFORE oracles fire so
-            // INJECTION_CONFIRMED_EXPLOIT_PATH is live when they evaluate.
             #[cfg(feature = "concolic_secant_dispatch")]
             if !input.is_step() {
-                // Reset per-execution static flags for all 013/014 features.
                 crate::evm::middlewares::cmp_linearity::injection_reset_static();
                 crate::evm::middlewares::oracle_tracker::OracleTracker::reset_static();
                 crate::evm::middlewares::oracle_staleness::OracleStaleness::reset_static();
                 crate::evm::middlewares::empty_state_guard::EmptyStateGuard::reset_static();
                 crate::evm::middlewares::flashloan_oracle::FlashloanOracle::reset_static();
                 crate::evm::middlewares::dos_detector::DoSDetector::reset_static();
-
-                let lin = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
-                ));
-                (self.evm_executor.deref().borrow_mut())
-                    .reexecute_with_middleware(input, state, lin);
-                // Feature 013 Phase 2+5: four-link chain verdict.
-                crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
-                unsafe {
-                    crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
-                }
-                // Feature 016 Phase 3: publish the detected dimension flow type.
-                {
-                    use crate::evm::middlewares::cmp_linearity::{
-                        PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
-                        TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
-                    };
-                    let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
-                        TaintDim::Price
-                    } else if unsafe { ACCUMULATOR_INFLATION_FLOW } {
-                        TaintDim::Accumulator
-                    } else if unsafe { PROXY_TAINT_FLOW } {
-                        TaintDim::Generic  // proxy tag — not a dimension itself
-                    } else {
-                        TaintDim::Generic
-                    };
-                    publish_located_dim(dim);
-                    // Feature 017 Wire B: publish Timestamp-dim-located alongside located_dim.
-                    // True when any SSTORE wrote a value with ts_seen=true during reexecution.
-                    unsafe {
-                        TIMESTAMP_DIM_LOCATED = TIMESTAMP_TAINT_WRITTEN;
-                    }
-                }
-                // Feature 013 Phase 6: snapshot arg-slot provenance for the
-                // ledger secant LOCATE phase (reads it during mutation).
-                let prov = self.evm_executor.deref().borrow().host.arg_slot_provenance.clone();
-                if !prov.is_empty() {
-                    state.add_metadata(ArgStorageProvenance { per_slot: prov });
-                }
             }
 
             match self
@@ -201,10 +159,6 @@ where
                             state,
                             self.sha3_taints.clone(),
                         );
-
-                        // Feature 009a + 013: CmpLinearityTaint reexecution already
-                        // completed above (before inner feedback), populating both the
-                        // linearity verdict and injection chain. No second reexecution.
                     }
                     Ok(true)
                 }
@@ -228,6 +182,55 @@ where
     where
         OT: ObserversTuple<EVMFuzzState>,
     {
+        #[cfg(feature = "concolic_secant_dispatch")]
+        if self.enabled {
+            if let Some(input) = testcase.input().as_ref() {
+                if !input.is_step() {
+                    // Reset per-execution static flags for all 013/014 features.
+                    crate::evm::middlewares::cmp_linearity::injection_reset_static();
+                    crate::evm::middlewares::oracle_tracker::OracleTracker::reset_static();
+                    crate::evm::middlewares::oracle_staleness::OracleStaleness::reset_static();
+                    crate::evm::middlewares::empty_state_guard::EmptyStateGuard::reset_static();
+                    crate::evm::middlewares::flashloan_oracle::FlashloanOracle::reset_static();
+                    crate::evm::middlewares::dos_detector::DoSDetector::reset_static();
+
+                    let lin = std::rc::Rc::new(std::cell::RefCell::new(
+                        crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
+                    ));
+                    (self.evm_executor.deref().borrow_mut())
+                        .reexecute_with_middleware(input, state, lin);
+                    // Feature 013 Phase 2+5: four-link chain verdict.
+                    crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
+                    unsafe {
+                        crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+                    }
+                    // Feature 016 Phase 3: publish the detected dimension flow type.
+                    {
+                        use crate::evm::middlewares::cmp_linearity::{
+                            PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
+                            TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
+                        };
+                        let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
+                            TaintDim::Price
+                        } else if unsafe { ACCUMULATOR_INFLATION_FLOW } {
+                            TaintDim::Accumulator
+                        } else {
+                            TaintDim::Generic
+                        };
+                        publish_located_dim(dim);
+                        unsafe {
+                            TIMESTAMP_DIM_LOCATED = TIMESTAMP_TAINT_WRITTEN;
+                        }
+                    }
+                    // Feature 013 Phase 6: snapshot arg-slot provenance for the
+                    // ledger secant LOCATE phase, and attach directly to the testcase!
+                    let prov = self.evm_executor.deref().borrow().host.arg_slot_provenance.clone();
+                    if !prov.is_empty() {
+                        testcase.add_metadata(ArgStorageProvenance { per_slot: prov });
+                    }
+                }
+            }
+        }
         self.inner_feedback.as_mut().append_metadata(state, observers, testcase)
     }
 }
@@ -381,6 +384,66 @@ impl<SC> TokenBalanceFeedback<SC> {
         let selector = step.data.as_ref().map(|d| d.function).unwrap_or_default();
         let contract = step.contract;
 
+        // Feature 021 (Taint↔Promotion Weld) — the taint half of the AND-gate. `best_inflow_step`
+        // already enforced materiality (inflow above the a-posteriori floor); the ledger call is
+        // real. Now require the causal receipt: was that ledger move DELIVERED by attacker input?
+        // `injection_causal_link_confirmed()` is fail-OPEN when the taint analysis did not run
+        // (non-concolic builds / step inputs), so this can only ever *reduce* promotions, never
+        // add reach. When the analysis RAN and found no provenance, we suppress: a material state
+        // change with no attacker-delivery path is a source-less phantom (the burn(0)/mint(0)
+        // family). Suppress BEFORE the high-water check so a phantom never sets the incumbent.
+        let mut analysis_ran =
+            crate::evm::middlewares::cmp_linearity::injection_analysis_ran();
+        let mut causally_linked =
+            crate::evm::middlewares::cmp_linearity::injection_causal_link_confirmed();
+
+        #[cfg(feature = "concolic_secant_dispatch")]
+        if !analysis_ran {
+            let lin = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
+            ));
+            let mut executor_borrow = self.evm_executor.as_ref().unwrap().borrow_mut();
+            executor_borrow.reexecute_with_middleware(input, state, lin);
+            crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
+            unsafe {
+                crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+            }
+            // Publish JIT dimension
+            {
+                use crate::evm::middlewares::cmp_linearity::{
+                    PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
+                    TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
+                };
+                let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
+                    TaintDim::Price
+                } else if unsafe { ACCUMULATOR_INFLATION_FLOW } {
+                    TaintDim::Accumulator
+                } else {
+                    TaintDim::Generic
+                };
+                publish_located_dim(dim);
+                unsafe {
+                    TIMESTAMP_DIM_LOCATED = TIMESTAMP_TAINT_WRITTEN;
+                }
+            }
+            analysis_ran = true;
+            causally_linked = crate::evm::middlewares::cmp_linearity::injection_causal_link_confirmed();
+        }
+
+        if analysis_ran && !causally_linked {
+            tracing::info!(
+                "[weld] suppressed SOURCE-LESS candidate: step={} contract={:?} selector=0x{} \
+                 inflow={} (materiality present, taint provenance ABSENT)",
+                idx, contract, hex::encode(selector), inflow
+            );
+            return;
+        }
+        let taint_provenance = TaintProvenanceTag {
+            causally_linked,
+            analysis_ran,
+            dim: read_located_dim(),
+        };
+
         // High-water: only a strictly larger delta unseats the incumbent candidate.
         let incumbent = state
             .metadata_map()
@@ -397,8 +460,13 @@ impl<SC> TokenBalanceFeedback<SC> {
                 contract,
                 selector,
                 best_inflow: inflow,
-                // 020: this path is value-inflow driven. 019-C records Permission instead.
+                // 020: value-inflow driven; structural (Permission) is produced by the
+                // FunctionOracle fire site (Feature 023, function.rs).
                 kind: LeakClass::Value,
+                // 021: the causal receipt proving this ledger move was attacker-delivered.
+                taint_provenance,
+                // 023: the belly-call step this inflow was attributed to.
+                phase: Some(idx),
                 set: true,
             });
         }

@@ -170,6 +170,9 @@ where
                     }
 
                     for (i, step_ci) in steps.iter().enumerate().take(steps.len() - 1) {
+                        // Feature 023 Phase 1a: publish the executing step so the inline
+                        // FunctionAuthTracer can attribute a structural move to its step.
+                        crate::evm::middlewares::function_auth::set_campaign_step(Some(i));
                         let (mut step_input, _) = step_ci.to_input(current_state.clone());
                         // Apply warp delta before execute, so vm.rs:598 picks up the warped env
                         if let Some(delta) = campaign.warps.iter().find(|(idx, _)| *idx == i).map(|(_, d)| d) {
@@ -195,6 +198,9 @@ where
                     }
 
                     let last_idx = steps.len() - 1;
+                    // Feature 023 Phase 1a: last step is the current phase for the exploit-step
+                    // execute below (and the controlled-probe re-execs, which run the last step).
+                    crate::evm::middlewares::function_auth::set_campaign_step(Some(last_idx));
                     // Warp delta for the exploit step (the planner's base; the secant
                     // refines it below via controlled probes).
                     let mut warp_delta: u64 = campaign
@@ -289,6 +295,9 @@ where
             }
         }
 
+        // Feature 023 Phase 1a: single input (not a campaign step) → no phase to attribute.
+        #[cfg(feature = "evm")]
+        crate::evm::middlewares::function_auth::set_campaign_step(None);
         let res = self.vm.deref().borrow_mut().execute(input, state);
         // the execution result is added to the fuzzer state
         // later the feedback/objective can run oracle on this result

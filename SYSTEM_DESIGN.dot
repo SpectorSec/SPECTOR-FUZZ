@@ -1,19 +1,33 @@
 // =============================================================================
-// SPECTOR-FUZZ — Canonical System Design v4
+// SPECTOR-FUZZ — Canonical System Design v5
 //
 // Lineage: v1 (Claude, code-grounded) -> v2 (DeepSeek, structural refactor) ->
 //          v3 (Claude, reconciled against `main`) ->
-//          v4 (DeepSeek, 017 Coupled Signal Buses built + integration_test feature).
+//          v4 (DeepSeek, 017 Coupled Signal Buses built + integration_test feature) ->
+//          v5 (Claude, 2026-07-06: Phase 0 Corpus-Priors layer + 019/020 reconciled) ->
+//          v5.1 (Claude, 2026-07-07: JIT causal-path gate node [day-zero, now default] +
+//               reflexive-loop RETURN edge receipt — triangulated intent/code/symptom;
+//               taxonomy edges reconciled to LeakClass SSOT: leak_class.rs oracles() —
+//               ERC4626 + NFT are ORPHANS (bound to no class), Invariant covers 3 oracles).
 //
-// Changes from v3:
-//   1. FLIPPED dim_flow -> temporal from dashed-red to BUILT (017 Wire B:
-//      TIMESTAMP_DIM_LOCATED flag + --dimension-warp CLI gate, planner warp lever).
-//   2. KEPT three remaining dashed-red edges as PROPOSED
-//      (ghost->provenance, cross-contract provenance, dim_flow->scheduler energy)
-//      — each is gated behind a missing primitive or deferred Phase 2.
-//   3. Added Accumulator probe granularity (017): probe_delta at /256 same as Price.
-//   4. Moved 14 RPC-dependent tests behind `integration_test` feature flag
-//      for clean local runs (148 passed, 0 failed, 14 ignored).
+// Changes from v4:
+//   1. NEW Phase 0 — Corpus Priors cluster. The old cluster_lineage was marked
+//      "narrative intent — not code." It is NOW CODE: exploit_analytics.duckdb
+//      (315 clean exploits) -> archetype_catalog.json (SHAPE prior, per-product
+//      weighted swappable skeletons) + divergence_diagnostic.json (ORACLE prior,
+//      resolution-floor coverage map). Two-tier prior: shape (local/sparse) ANTI-
+//      correlated with oracle (global/dense). Wires INTO planner + auto_orac.
+//   2. 019 Causal Identity Engine: FunctionAuth MW built (Phase A) -> hardens
+//      FunctionOracle (kills burn(0) phantom). ArbitraryCall MW proposed (Phase B,
+//      gated on the SAME cross-contract-provenance edge as mutator.rs:757).
+//   3. 020 Leak Taxonomy: the six-primitive lens is NO LONGER conceptual — it is a
+//      real LeakClass SSOT enum; SnapshotDeltaOracle (idx 20, Ownership) built.
+//   4. Inventory corrected: oracle suite 13-drawn -> 20 real; middlewares 5 -> ~14.
+//
+// DEPENDENCY-GAP NOTE (why a design catches what per-file review misses): the
+// archetype/divergence artifacts EXIST but feed NOTHING — the planner still reads
+// only thin topology co-occurrence rank (line: topology -> planner). The missing
+// EDGE is the whole gap. Drawn as dashed-red PROPOSED-READY: data built, load unbuilt.
 //
 // LINE STYLE CONTRACT:
 //   solid black  = BUILT (in code; (L) = held local/unpushed)
@@ -31,7 +45,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     ranksep=0.75;
     labelloc="t";
     fontsize=16;
-    label="SPECTOR-FUZZ — Canonical System Design v4 (2026-07-03, 017 built)";
+    label="SPECTOR-FUZZ — Canonical System Design v5 (2026-07-06, Phase-0 Corpus Priors + 019/020)";
 
     node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
     edge [fontname="Helvetica", fontsize=9];
@@ -56,12 +70,26 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     // DESIGN LINEAGE  (narrative intent)
     // =========================================================================
     subgraph cluster_lineage {
-        label="Design Lineage (narrative intent — not code)";
+        label="Design Lineage (narrative intent — now realized as Phase 0)";
         style=filled; color="#F5F5F5";
         incidents [label="Historical DeFi Incidents\n(500+ reports, 2020-2026)\nreentrancy / flash-loan / oracle-manip"];
         patterns  [label="Attacker operation chains\n(calls · order · identity · tx count)\nextracted per-incident, not per-CVE"];
         incidents -> patterns [label="mined & classified"];
     }
+
+    // =========================================================================
+    // PHASE 0 — CORPUS PRIORS  (data layer — NOW CODE, was "narrative intent")
+    // =========================================================================
+    subgraph cluster_phase0 {
+        label="Phase 0 — Corpus Priors  (data layer — BUILT: duckdb + catalog + diagnostic)";
+        style=filled; color="#E1F5FE";
+        corpus_db [label="exploit_analytics.duckdb  (BUILT)\n315 clean exploits · 12 PRODUCT tables\nproduct × vuln(labels.category) × phase_frame\n+ attack_flows.jsonl narratives (312)"];
+        arche_cat [label="archetype_catalog.json  (BUILT)\nper-product WEIGHTED swappable skeletons\n(product, vuln, phase_sig) · w=P(arch|product)\n= SHAPE prior (local, sparse; sharp=Lending)"];
+        diverge   [label="divergence_diagnostic.json  (BUILT)\nresolution-floor coverage map\nCONGRUENT 119 / SURFACE 119 / FLOOR 40 / BLIND 22\n= ORACLE prior (global, dense; vuln→res-class)"];
+        corpus_db -> arche_cat [label="cluster (product,vuln,phase_sig)"];
+        corpus_db -> diverge   [label="vuln res-class × phase_sig 'L' visible?"];
+    }
+    patterns -> corpus_db [label="mined · cleaned · traced · phase-framed"];
 
     // =========================================================================
     // PHASE 1 — STATIC BLUEPRINTING
@@ -97,13 +125,17 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
         }
 
         subgraph cluster_014_mw {
-            label="014 — Oracle Middlewares (6 modules)";
+            label="014 — Inline Middlewares (~14 modules, src/evm/middlewares/)";
             style=filled; color="#E8F5E9";
             mw_track [label="OracleTracker\n60-op proximity window\nCALL -> CMP -> CALL"];
             mw_flash [label="FlashloanOracle\nborrow -> oracle x2 -> move"];
             mw_stale [label="OracleStaleness\nTIMESTAMP -> CMP after CALL"];
             mw_guard [label="EmptyStateGuard\nSLOAD+JUMPI before transfer"];
             mw_dos   [label="DoSDetector\nSLOAD key before REVERT\n(reads tainted_storage)"];
+            mw_perm  [label="FunctionAuth MW  (019 Phase A · BUILT)\nfunction_auth.rs · FunctionAuthTracer · type FunctionAuth\ninline frame-auth context -> o_func · kills burn(0) phantom\n(identity oracle-rooted; permission_leak_metadata field keeps domain name)", color="#1B5E20", fontcolor="#1B5E20"];
+            mw_arb   [label="ArbitraryCall MW  (019 Phase B · PROPOSED)\narbitrary_call.rs (not built) · hardens o_arb\ncross-contract arg provenance -> o_arb\n(oracle-rooted identity; Message-Leak PRIMITIVE = p_msg)",
+                      style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+            mw_misc  [label="FeeOnTransferDetector · ValueCapture\nSha3Bypass · CallPrinter"];
         }
 
         subgraph cluster_016 {
@@ -126,21 +158,23 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     // PHASE 2b — POST-EXECUTION: ORACLE SUITE  (~18 modules)
     // =========================================================================
     subgraph cluster_oracles {
-        label="Phase 2b — Post-Execution: Oracle Suite  (~18 modules, src/evm/oracles/)";
+        label="Phase 2b — Post-Execution: Oracle Suite  (20 modules, idx 0-20, src/evm/oracles/)";
         style=filled; color="#BBDEFB";
-        o_erc20  [label="ERC20Oracle\nfund extraction"];
-        o_fresh  [label="FreshnessOracle\nstale feed accepted"];
-        o_4626   [label="ERC4626Oracle\nshare-price manipulation"];
-        o_fee    [label="FeeOnTransferOracle\naccounting desync"];
-        o_rebase [label="RebasingOracle\nbalance desync"];
-        o_func   [label="FunctionOracle\nunauthorized privileged call"];
-        o_reent  [label="ReentrancyOracle\nreentrant call detection"];
-        o_inv    [label="InvariantOracle\nEchidna invariants / slot trip"];
-        o_arb    [label="ArbitraryCallOracle\nunvalidated external target"];
-        o_nft    [label="NFTOracle\nERC-721/1155 ownership leak"];
-        o_temp   [label="TemporalSkimOracle\nmulti-block divergence > 0.001 ETH"];
-        o_self   [label="SelfdestructOracle"];
-        o_v2     [label="V2PairOracle"];
+        o_erc20  [label="ERC20Oracle (0)\nfund extraction"];
+        o_fresh  [label="FreshnessOracle (18)\nstale feed accepted"];
+        o_4626   [label="ERC4626Oracle (17)\nshare-price manipulation"];
+        o_fee    [label="FeeOnTransferOracle (13)\naccounting desync"];
+        o_rebase [label="RebasingOracle (16)\nbalance desync"];
+        o_func   [label="FunctionOracle (1)\nunauthorized privileged call\n[019: hardened by FunctionAuth MW]"];
+        o_reent  [label="ReentrancyOracle (9)\nreentrant call detection"];
+        o_inv    [label="InvariantOracle (10)\nEchidna invariants / slot trip"];
+        o_arb    [label="ArbitraryCallOracle (8)\nunvalidated external target"];
+        o_nft    [label="NFTOracle (12)\nERC-721/1155 ownership leak"];
+        o_temp   [label="TemporalSkimOracle (19)\nmulti-block divergence > 0.001 ETH"];
+        o_self   [label="SelfdestructOracle (5)"];
+        o_v2     [label="V2PairOracle (2)"];
+        o_own    [label="SnapshotDeltaOracle (20)  [020-B]\nEIP-1967 ownership hijack\nLeakClass::Ownership"];
+        o_appr   [label="ApprovalOracle (14) · CrosschainOracle (15)\nArbTransferOracle (3) · IntegerOverflow (11)\nTypedBug (4) · Echidna (6) · StateComp (7)"];
     }
 
     // =========================================================================
@@ -157,6 +191,12 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     }
     topology -> planner [label="co-occurrence rank"];
     anti_topo -> mw_guard [label="hint: missing guard"];
+
+    // ---- Phase 0 priors -> engine (THE dependency gap: artifacts built, load unbuilt) ----
+    arche_cat -> planner   [style="dashed", color="#D32F2F", fontcolor="#D32F2F", penwidth=2,
+                            label="PROPOSED-READY: sample archetype by weight\n= SHAPE prior seeds plan_campaign_sampled\n(artifacts BUILT; planner load unbuilt)\nREPLACES thin topology co-occurrence rank"];
+    diverge   -> auto_orac [style="dashed", color="#D32F2F", fontcolor="#D32F2F",
+                            label="PROPOSED: vuln→oracle routing\n= ORACLE prior activates the right module\n(SURFACE→permission_leak; blind reentrancy→reentrancy MW)"];
 
     // =========================================================================
     // 015 — PROMOTE -> LOCATE -> AMPLIFY
@@ -213,10 +253,17 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
                        label="PROPOSED: profit confirmed -> boost AMPLIFY confidence\n(code: no path; secant reads ledger obj only, not oracle verdicts)"];
 
     // =========================================================================
-    // SIX PRIMITIVE-LEAK TAXONOMY  (conceptual output lens — no primitives.rs)
+    // SIX PRIMITIVE-LEAK TAXONOMY  (LeakClass SSOT — leak_class.rs; edges = oracles())
+    //   v5.1 reconcile: Value=[FeeOnTransfer,ERC20,Rebasing]  Invariant=[Invariant,StateComp,Echidna]
+    //   Ownership=[Ownership]  Control=[Reentrancy]  Message=[ArbitraryCall]  Permission=[Function].
+    //   ERC4626 + NFT bind to NO class (red orphans). middleware() is Option<MiddlewareType> = 1 MW/primitive.
     // =========================================================================
+    // 019 inline middlewares harden the post-hoc oracles with during-exec info
+    mw_perm -> o_func [color="#1B5E20", fontcolor="#1B5E20", label="019A BUILT: inline frame-auth\n→ materiality guard (no burn(0))"];
+    mw_arb  -> o_arb  [style="dashed", color="#D32F2F", fontcolor="#D32F2F", label="019B PROPOSED: cross-contract\nprovenance (same gate as mutator.rs:757)"];
+
     subgraph cluster_prim {
-        label="Six Primitive-Leak Taxonomy  (conceptual output lens — no module)";
+        label="Six Primitive-Leak Taxonomy  (020: LeakClass SSOT enum — a real binding, not conceptual)";
         style=filled; color="#FFF3E0"; fontcolor="#666666";
         p_ctrl [label="1  Control Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
         p_val  [label="2  Value Leak", shape=note, style=filled, fillcolor="#FFFDE7"];
@@ -227,13 +274,15 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     }
     o_reent -> p_ctrl [style=dashed, color="#666666", label="reentrant entry"];
     o_erc20 -> p_val  [style=dashed, color="#666666", label="balance delta"];
-    o_4626  -> p_val  [style=dashed, color="#666666", label="share inflation"];
+    o_4626  -> p_val  [style=dashed, color="#D32F2F", fontcolor="#D32F2F", label="ORPHAN (v5.1): ERC4626 NOT in\nLeakClass.oracles() SSOT — intended Value,\nunbound dropped-edge"];
     o_fee   -> p_val  [style=dashed, color="#666666", label="fee desync"];
     o_rebase -> p_val [style=dashed, color="#666666", label="rebasing desync"];
     o_arb   -> p_msg  [style=dashed, color="#666666", label="unvalidated target"];
     o_func  -> p_perm [style=dashed, color="#666666", label="unauth privileged call"];
     o_inv   -> p_inv  [style=dashed, color="#666666", label="invariant violation"];
-    o_nft   -> p_own  [style=dashed, color="#666666", label="ownership xfer"];
+    o_appr  -> p_inv  [style=dashed, color="#666666", label="SSOT: Invariant ALSO covers\nStateComparison(7) + Echidna(6)\n(both live in this node)"];
+    o_nft   -> p_own  [style=dashed, color="#D32F2F", fontcolor="#D32F2F", label="ORPHAN (v5.1): NFT NOT in\nLeakClass.oracles() SSOT — intended Ownership,\nunbound dropped-edge"];
+    o_own   -> p_own  [color="#666666", label="020-B: EIP-1967 slot delta (BUILT home)"];
     liquid  -> p_val  [style=dotted, color="#666666", label="confirms extractability"];
     liquid  -> p_own  [style=dotted, color="#666666", label="confirms extractability"];
 
@@ -243,4 +292,30 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     attacker -> cheat [style=invis];
     cheat    -> mw_flash [style=invis];
     mw_flash -> o_self [style=invis];
+
+    // =========================================================================
+    // v5.1 ADDENDUM (2026-07-07) — DAY-ZERO JIT GATE + REFLEXIVE-LOOP RETURN EDGE
+    //   Two triangulated receipts (intent ∧ code ∧ symptom). NOTE: cross-contract
+    //   provenance (prov_map->locate), ghost identity (ghost->prov_src), and
+    //   dim->scheduler energy (dim_flow->scheduler) were ALREADY drawn above — the
+    //   doc already held that intent. Only these two were genuinely missing.
+    // =========================================================================
+
+    // (A) JIT Causal-Path Gate — the suppressor the diagram never depicted.
+    //     #[cfg(concolic_secant_dispatch)] was EXCLUDED from default features in EVERY
+    //     prior build (absent/uncompiled, NOT dead code). Added to default 2026-07-07 = DAY ZERO.
+    jit_gate [label="JIT Causal-Path Gate  (feedback.rs:300)  [BUILT 2026-07-07 → default · DAY ZERO]\n#[cfg(concolic_secant_dispatch)] · re-executes bug input w/ CmpLinearityTaint\nregister ONLY if attacker provenance reaches the sink; else SUPPRESS\n(kills burn(0) = sink-without-source). Absent from ALL prior campaigns.",
+              shape=diamond, style=filled, fillcolor="#B2DFDB", color="#00695C", fontcolor="#00695C", penwidth=2];
+    o_func  -> jit_gate [color="#00695C", fontcolor="#00695C", label="bug_idx fires\n(feedback.rs:292 loops ALL oracles through the gate)"];
+    prov_tb -> jit_gate [style=dotted, color="#00695C", fontcolor="#00695C", label="re-run taint reads provenance"];
+    jit_gate -> promote [style=dotted, color="#00695C", fontcolor="#00695C", label="PASS (provenance-backed)\n→ register + a-posteriori ledger promote"];
+
+    // (B) Reflexive-loop RETURN edge — the arrow that wasn't on the PNG. Code-traced 2026-07-07:
+    //     the loop CLOSES, but through the MUTATOR, not the scheduler.
+    //       produce: feedbacks.rs:459 global high-water PromotionCandidate (best_inflow)
+    //       consume: mutator.rs:667 reads it EVERY iter, pins matching campaign step
+    //       gap:     PowerABIScheduler (evm/scheduler.rs:305) never boosts energy for
+    //                inputs containing the promoted (contract,selector)
+    promote -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F", penwidth=2,
+                          label="DROPPED EDGE — reflexive-loop RETURN arrow (triangulated)\nintent: lever is a convergence loop  ·  code: PowerABIScheduler:305 ignores candidate\nsymptom: 3x front-loaded cost — drills only when scheduler coincidentally serves a match\nloop currently closes via MUTATOR (mutator.rs:667), NOT scheduler energy"];
 }

@@ -118,7 +118,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     /// as the --temporal-skimming flag. Additive path.
     pub dimension_warp: bool,
     /// Feature 019 Phase A: Causal Identity permission-leak materiality gate. When set,
-    /// registers `PermissionLeakTracer` and switches `FunctionOracle` to require a
+    /// registers `FunctionAuthTracer` and switches `FunctionOracle` to require a
     /// material sink (SSTORE pre≠post / value-CALL) before firing — killing the
     /// `burn(0,0)` no-op false positive. Off = pre-019 behavior.
     pub causal_identity: bool,

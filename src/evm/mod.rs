@@ -288,7 +288,7 @@ pub struct EvmArgs {
     dimension_warp: bool,
 
     /// Feature 019 Phase A: enable the Causal Identity permission-leak materiality gate.
-    /// Registers the inline `PermissionLeakTracer` and switches the permission-leak
+    /// Registers the inline `FunctionAuthTracer` and switches the permission-leak
     /// oracle to require a material sink (SSTORE pre≠post or a value-CALL) in the
     /// privileged contract before firing — suppressing no-op privileged calls such as
     /// `burn(0x0, 0)`. Additive; off by default (pre-019 behavior).

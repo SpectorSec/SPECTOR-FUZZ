@@ -1,0 +1,54 @@
+// =============================================================================
+// INTEGRATION SUB-DIAGRAM 3 of 3  —  mw_msg -> o_arb  (019 Phase B, the BLOCKED edge)
+// Blows up the dashed-red SYSTEM_DESIGN edge. Doubles as the "what unblocks Phase B" spec.
+// Sites: middlewares/arbitrary_call.rs (NOT built) · arg_slot_provenance (same-contract only)
+//        mutator.rs:757 · o_arb = arb_call.rs (idx 8). Line contract as before.
+// =============================================================================
+digraph integration_messageleak_arb {
+    rankdir=LR; compound=true; fontname="Helvetica"; fontsize=15; labelloc="t";
+    label="INTEGRATION 3/3 — ArbitraryCall MW → ArbitraryCallOracle  (019 Phase B · BLOCKED)\nthe genuinely-gated edge: needs cross-contract provenance FIRST · then the MW";
+    node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---------------- BUILT today (019 Phase A + the primitive limit) ----------------
+    subgraph cluster_built {
+        label="BUILT (019 Phase A) — but same-contract only"; style=filled; color="#E8F5E9";
+        permmw  [label="FunctionAuth MW (function_auth.rs)\nreads arg_slot_provenance\n✓ Phase A shipped", color="#1B5E20", fontcolor="#1B5E20"];
+        prov    [label="arg_slot_provenance : (addr,slot)→bits\ncmp_linearity.rs:1023\nSAME-CONTRACT ONLY", color="#1B5E20", fontcolor="#1B5E20"];
+        o_arb   [label="ArbitraryCallOracle (arb_call.rs, idx 8)\nunvalidated external target\n= p_msg (Message Leak)"];
+    }
+
+    // ---------------- THE BLOCKER (missing primitive) ----------------
+    subgraph cluster_block {
+        label="THE BLOCKER — the missing primitive (drawn dashed-red on the system map)";
+        style=filled; color="#FBE9E7";
+        gate [label="cross-contract provenance MISSING\nmutator.rs:757 = same-contract only\nprovenance dies at the CALL boundary", shape=diamond, style=filled, fillcolor="#FFCDD2", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---------------- TO-BUILD (dashed red, ORDERED: primitive → MW → wire) ----------------
+    subgraph cluster_build {
+        label="TO-BUILD — ordered: ① primitive unblocks, then ② MW, then ③ wire  [dashed red]";
+        style=filled; color="#FFF3E0";
+        xprov  [label="① extend provenance ACROSS the CALL seam\ncarry arg bits into callee's calldata window\n(the 017-Phase-2 inherited-provenance idea,\n cmp_linearity.rs:864-876 already OR's inherited bits)",
+                style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        msgmw  [label="② ArbitraryCall MW  (arbitrary_call.rs — DOES NOT EXIST)\ntemplate = function_auth.rs\nfires when attacker-tainted data becomes a\nCALL TARGET/selector across a contract boundary",
+                style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        wire   [label="③ ArbitraryCall MW → o_arb\ninline signal → materiality guard on\n'unvalidated external target'",
+                style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---- dependency order ----
+    prov  -> gate  [label="stops at boundary", color="#D32F2F"];
+    gate  -> xprov [label="① UNBLOCK", style="dashed", color="#D32F2F", penwidth=2];
+    permmw -> msgmw [label="② reuse template", style="dashed", color="#D32F2F"];
+    xprov -> msgmw [label="cross-contract bits available", style="dashed", color="#D32F2F"];
+    msgmw -> wire  [style="dashed", color="#D32F2F"];
+    wire  -> o_arb [label="③ inline info → verdict", style="dashed", color="#D32F2F"];
+
+    // ---- consumer ----
+    o_arb -> pmsg [label="Message Leak primitive"];
+    pmsg [shape=note, style=filled, fillcolor="#FFFDE7", label="p_msg — Message Leak\n(LeakClass SSOT, 020)"];
+
+    checklist [shape=note, style=filled, fillcolor="#FFFDE7", fontsize=10,
+      label="BUILD UNIT (this edge = 3 ORDERED changes, gated):\l ① cross-contract provenance — extend arg_slot_provenance across CALL\l    (partial groundwork exists: cmp_linearity.rs:864-876 inherited bits)\l ② arbitrary_call.rs MW — NEW, clone function_auth.rs shape\l ③ wire MW → o_arb (arb_call) as its inline materiality source\l ORDER MATTERS: ① is the prerequisite; ②③ are cheap once ① lands.\l This is the ONLY blocked edge of the three — same gate as the\l system-map dashed 'cross-contract provenance' (mutator.rs:757).\l NOTE: message_leak also = the SURFACE decoy-vs-bug confirm for arbitrary-call.\l"];
+}

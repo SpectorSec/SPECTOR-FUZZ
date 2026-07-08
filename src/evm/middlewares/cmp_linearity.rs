@@ -159,6 +159,39 @@ pub fn injection_exploit_path_detected() -> bool {
     unsafe { !INJECTION_ANALYSIS_RAN || INJECTION_CONFIRMED_EXPLOIT_PATH }
 }
 
+/// Feature 021 (Taint↔Promotion Weld) — the taint half of the a-posteriori promotion
+/// AND-gate. Returns `true` when THIS execution is causally linked to attacker input, by
+/// either principled signal:
+///   • **value-confirmed storage provenance** — an attacker-tainted byte reached an SSTORE
+///     slot and was read back unmodified (`INJECTION_CONFIRMED_PROVENANCE`, set at SLOAD in
+///     the `0x54/0x5c` arm). Until now this flag was computed but never consumed; this is
+///     its first (and only) reader.
+///   • **a sink-cleared tainted CALL** — a tainted call passed the chain verdict
+///     (`INJECTION_CONFIRMED_EXPLOIT_PATH`).
+///
+/// FAIL-OPEN for reachability: when the taint analysis did not run this execution
+/// (non-concolic builds, or `INJECTION_ANALYSIS_RAN == false`), returns `true` so promotion
+/// is byte-identical to pre-weld behavior. Only when the analysis RAN and found NO
+/// provenance does this return `false` → the caller suppresses the source-less candidate
+/// (this is what kills `burn(0)`/`mint(0)` phantoms: material state change, no attacker
+/// delivery path). The materiality half of the gate is the a-posteriori inflow floor, so
+/// the weld is `materiality(inflow>floor) AND injection_causal_link_confirmed()`.
+pub fn injection_causal_link_confirmed() -> bool {
+    unsafe {
+        if !INJECTION_ANALYSIS_RAN {
+            return true;
+        }
+        INJECTION_CONFIRMED_PROVENANCE || INJECTION_CONFIRMED_EXPLOIT_PATH
+    }
+}
+
+/// Feature 021 — whether the taint analysis actually ran this execution. Lets the promotion
+/// producer record whether a `causally_linked` verdict is a real observation or the
+/// fail-open default (so the stamped provenance tag is honest about its own confidence).
+pub fn injection_analysis_ran() -> bool {
+    unsafe { INJECTION_ANALYSIS_RAN }
+}
+
 /// Per-execution reset of all injection detection static flags.
 pub fn injection_reset_static() {
     unsafe {
@@ -1859,5 +1892,75 @@ mod dim_propagation_tests {
         assert_eq!(generic_delta(25600), 400, "/64 of 25600");
         assert!(price_delta(25600) < generic_delta(25600), "Accumulator probe must be coarser than Generic");
         assert_eq!(price_delta(0), 1, "floor = 1");
+    }
+
+    // Feature 021 (Taint↔Promotion Weld) — the taint half of the a-posteriori AND-gate.
+    // These pin the three branches of `injection_causal_link_confirmed()`. They mutate the
+    // injection `static mut`s, so they serialize on the module test lock (shared with any
+    // on_step-based test that could set INJECTION flags).
+    #[test]
+    fn causal_link_fail_open_when_analysis_absent() {
+        let _g = price_cmp_guard();
+        unsafe {
+            // Analysis did not run this execution → fail-OPEN: promotion must be unchanged
+            // even with no provenance and no exploit path.
+            INJECTION_ANALYSIS_RAN = false;
+            INJECTION_CONFIRMED_PROVENANCE = false;
+            INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        }
+        assert!(
+            injection_causal_link_confirmed(),
+            "analysis absent must fail-open (true) so non-concolic/step reach is preserved"
+        );
+        assert!(!injection_analysis_ran(), "analysis_ran must report the honest false");
+    }
+
+    #[test]
+    fn causal_link_fail_closed_source_less_phantom() {
+        let _g = price_cmp_guard();
+        unsafe {
+            // Analysis RAN, material state changed, but NO attacker-delivery path:
+            // the burn(0)/mint(0) phantom family. Must suppress (false).
+            INJECTION_ANALYSIS_RAN = true;
+            INJECTION_CONFIRMED_PROVENANCE = false;
+            INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        }
+        assert!(
+            !injection_causal_link_confirmed(),
+            "analysis ran + no provenance must fail-CLOSED (false) → source-less candidate suppressed"
+        );
+    }
+
+    #[test]
+    fn causal_link_confirmed_by_value_provenance() {
+        let _g = price_cmp_guard();
+        unsafe {
+            // The value-confirmed storage provenance path alone confirms causality — this is
+            // the first live reader of INJECTION_CONFIRMED_PROVENANCE (previously dead).
+            INJECTION_ANALYSIS_RAN = true;
+            INJECTION_CONFIRMED_PROVENANCE = true;
+            INJECTION_CONFIRMED_EXPLOIT_PATH = false;
+        }
+        assert!(
+            injection_causal_link_confirmed(),
+            "value-confirmed provenance alone must confirm the causal link"
+        );
+        // Reset so we don't leak a set flag into a parallel test after the lock drops.
+        unsafe { INJECTION_CONFIRMED_PROVENANCE = false; INJECTION_ANALYSIS_RAN = false; }
+    }
+
+    #[test]
+    fn causal_link_confirmed_by_exploit_path() {
+        let _g = price_cmp_guard();
+        unsafe {
+            INJECTION_ANALYSIS_RAN = true;
+            INJECTION_CONFIRMED_PROVENANCE = false;
+            INJECTION_CONFIRMED_EXPLOIT_PATH = true;
+        }
+        assert!(
+            injection_causal_link_confirmed(),
+            "a sink-cleared tainted call must confirm the causal link"
+        );
+        unsafe { INJECTION_CONFIRMED_EXPLOIT_PATH = false; INJECTION_ANALYSIS_RAN = false; }
     }
 }

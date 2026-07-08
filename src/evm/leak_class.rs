@@ -78,8 +78,8 @@ impl LeakClass {
         match self {
             LeakClass::ControlFlow => Some(MiddlewareType::Reentrancy),
             LeakClass::Value => Some(MiddlewareType::FeeOnTransferDetector),
-            LeakClass::Permission => Some(MiddlewareType::PermissionLeak),
-            LeakClass::Message => None, // Phase B → Some(MiddlewareType::MessageLeak)
+            LeakClass::Permission => Some(MiddlewareType::FunctionAuth),
+            LeakClass::Message => None, // Phase B → Some(MiddlewareType::ArbitraryCall) (oracle-rooted, not `MessageLeak`)
             LeakClass::Invariant => None,
             LeakClass::Ownership => None,
         }
@@ -183,7 +183,7 @@ mod tests {
         // The 019 Phase A gate is the Permission primitive's inline hook — the coupling 020 formalizes.
         assert_eq!(
             LeakClass::Permission.middleware(),
-            Some(MiddlewareType::PermissionLeak)
+            Some(MiddlewareType::FunctionAuth)
         );
     }
 }

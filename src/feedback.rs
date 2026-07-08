@@ -38,6 +38,12 @@ use crate::{
     evm::middlewares::cmp_linearity::TaintDim,
 };
 
+#[cfg(feature = "concolic_secant_dispatch")]
+use crate::evm::types::{EVMQueueExecutor, EVMFuzzState};
+#[cfg(feature = "concolic_secant_dispatch")]
+use crate::evm::input::EVMInput;
+
+
 /// OracleFeedback is a wrapper around a set of oracles and producers.
 /// It executes the producers and then oracles after each successful execution.
 /// If any of the oracle returns true, then it returns true and report a
@@ -289,13 +295,28 @@ where
                 .oracle(&mut oracle_ctx, original_stage)
             {
                 // Phase 0: only report bugs with a causal taint chain.
-                // The injection analysis ran before this feedback (in
-                // Sha3WrappedFeedback) and set INJECTION_CONFIRMED_EXPLOIT_PATH.
-                // When the analysis did not run (step / non-concolic inputs),
-                // injection_exploit_path_detected() returns true (safe default).
+                // Run JIT re-execution if the analysis hasn't run yet.
                 #[cfg(feature = "concolic_secant_dispatch")]
-                if !crate::evm::middlewares::cmp_linearity::injection_exploit_path_detected() {
-                    continue;
+                {
+                    if !crate::evm::middlewares::cmp_linearity::injection_analysis_ran() {
+                        let mut executor_borrow = self.executor.borrow_mut();
+                        if let Some(evm_executor) = executor_borrow.as_any().downcast_mut::<EVMQueueExecutor>() {
+                            debug_assert_eq!(std::any::TypeId::of::<S>(), std::any::TypeId::of::<EVMFuzzState>(), "Generic state S must be EVMFuzzState for JIT cast");
+                            let evm_input: &EVMInput = unsafe { &*(oracle_ctx.input as *const I as *const EVMInput) };
+                            let evm_state: &mut EVMFuzzState = unsafe { &mut *(oracle_ctx.fuzz_state as *mut S as *mut EVMFuzzState) };
+                            let lin = std::rc::Rc::new(std::cell::RefCell::new(
+                                crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
+                            ));
+                            evm_executor.reexecute_with_middleware(evm_input, evm_state, lin);
+                            crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
+                            unsafe {
+                                crate::evm::middlewares::cmp_linearity::INJECTION_ANALYSIS_RAN = true;
+                            }
+                        }
+                    }
+                    if !crate::evm::middlewares::cmp_linearity::injection_exploit_path_detected() {
+                        continue;
+                    }
                 }
 
                 let metadata = oracle_ctx

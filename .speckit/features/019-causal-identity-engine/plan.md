@@ -5,6 +5,8 @@
 **Last updated:** 2026-07-04
 **Held:** LOCAL
 
+> **Rename note (2026-07-07):** the middleware authored here as `permission_leak.rs` / `PermissionLeakTracer` / `MiddlewareType::PermissionLeak` was renamed to **`function_auth.rs` / `FunctionAuthTracer` / `MiddlewareType::FunctionAuth`** — identity is oracle-rooted (it hardens `OracleType::Function`), per the naming law formalized in Feature 020. The `permission_leak_metadata` state field and `-d permission_leak` CLI string are unchanged (detection-domain, not identity). Original names below preserved as authored.
+
 ---
 
 ## Implementation Evidence (Phase A, 2026-07-04)

@@ -9,7 +9,7 @@ pub mod flashloan_oracle;
 pub mod middleware;
 pub mod oracle_staleness;
 pub mod oracle_tracker;
-pub mod permission_leak;
+pub mod function_auth;
 pub mod reentrancy;
 pub mod sha3_bypass;
 pub mod value_capture;

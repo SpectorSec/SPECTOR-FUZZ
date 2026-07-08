@@ -31,7 +31,11 @@ pub enum MiddlewareType {
     CmpLinearity,
     CallPrinter,
     Reentrancy,
-    PermissionLeak,
+    // Identity = the ORACLE it hardens (OracleType::Function), NOT the LeakClass primitive.
+    // A primitive is a category (can house many oracles — e.g. Value = 3), so it can't be a
+    // unique identity; see leak_class.rs. (Was `PermissionLeak`.) A future Message-primitive
+    // MW hardening OracleType::ArbitraryCall must be named `ArbitraryCall`, not `MessageLeak`.
+    FunctionAuth,
     IntegerOverflow,
     Cheatcode,
     ValueCapture,

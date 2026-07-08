@@ -1,0 +1,89 @@
+digraph FusedCausalityLever {
+  rankdir=TB;
+  bgcolor="#0d1117";
+  fontname="Helvetica";
+  fontcolor="#e6edf3";
+  labelloc="t";
+  fontsize=22;
+  label="SPECTOR-FUZZ — Causality Layer welded to the Reflexive Lever  (Feature 021 · AS-BUILT)\ntaint = the spine · the ledger = the amplitude · the weld = PromotionCandidate\nSOLID GREEN = built & wired    ·    DASHED ORANGE = remaining coarse-by-design";
+  node [fontname="Helvetica", fontcolor="#e6edf3", color="#30363d", penwidth=1.6];
+  edge [color="#8b949e", fontname="Helvetica", fontcolor="#c9d1d9", fontsize=11, penwidth=1.6];
+
+  /* ═══════════════ TOP BAND — MAGNITUDE (Feature 015 ledger loop) ═══════════════ */
+  subgraph cluster_magnitude {
+    label="MAGNITUDE  ·  the reflexive-lever ledger loop (015)  ·  'how much money'";
+    fontsize=15; fontcolor="#f85149"; color="#f85149"; style="rounded"; penwidth=1.4;
+
+    promote [shape=box, style="filled,rounded", fillcolor="#1f6feb", color="#388bfd", fontcolor="#ffffff",
+      label="PROMOTE\nhoist lever into the frame\napriori / a-posteriori"];
+    locate  [shape=box, style="filled,rounded", fillcolor="#161b22", color="#d29922", fontcolor="#e6edf3",
+      label="LOCATE\nΔledger/Δarg → arg_idx"];
+    amplify [shape=box, style="filled,rounded", fillcolor="#161b22", color="#db6d28", fontcolor="#e6edf3",
+      label="AMPLIFY\nsigned secant → profit peak"];
+
+    mut [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="MUTATOR\npin lever · arg = x\nmutator.rs:656 maybe_pin_aposteriori_lever"];
+    exe [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="EXECUTOR\nrun frame atomically\n→ ordered erc20 log"];
+    fb  [shape=box, style="filled,rounded", fillcolor="#161b22", color="#f85149", fontcolor="#e6edf3",
+      label="FEEDBACK\nsum attacker NET inflow\nfeedbacks.rs:396"];
+    obj [shape=box, style="filled,rounded", fillcolor="#2d0f0f", color="#f85149", fontcolor="#ffa198",
+      label="LEDGER_OBJECTIVE\nthe gradient ($)"];
+
+    promote -> locate [color="#d29922"];
+    locate  -> amplify [color="#db6d28"];
+    amplify -> mut [label=" each probe = 1 iter ", color="#f85149", fontcolor="#ffa198"];
+    mut -> exe [color="#f85149"]; exe -> fb [color="#f85149"]; fb -> obj [color="#f85149"];
+    obj -> mut [label=" choose next x ", color="#f85149", fontcolor="#ffa198", constraint=false];
+  }
+
+  /* ═══════════════ THE WELD — the promotion gate ═══════════════ */
+  gate [shape=record, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#7ee787", penwidth=2.6,
+    label="{ ★ THE WELD · record_aposteriori_candidate ★  ✅ BUILT (021) | { <mat> materiality_Δ &gt; 0\n(best_inflow &gt; floor) | <taint> injection_causal_link_confirmed()\n(did WE move it?) } | analysis_ran &amp;&amp; !linked  →  SUPPRESS\nelse  →  emit PromotionCandidate }"];
+
+  cand [shape=record, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#e6edf3", penwidth=2.0,
+    label="{ PromotionCandidate  (campaign_planner.rs:100 / feedbacks.rs:396) | { <kind> .kind: LeakClass ✅ 020-A | <prov> .taint_provenance: TaintProvenanceTag ✅ 021 } | best_inflow · (contract, selector) }"];
+
+  /* candidate is what PROMOTE consumes — closes magnitude↔causality */
+  cand -> promote [label="  the lever to hoist  ", color="#3fb950", fontcolor="#3fb950", penwidth=2.0];
+  gate -> cand [label="  materiality AND causal-link  ", color="#3fb950", fontcolor="#7ee787", penwidth=2.2];
+
+  /* ═══════════════ BOTTOM BAND — CAUSALITY (013/014 taint) ═══════════════ */
+  subgraph cluster_causality {
+    label="CAUSALITY  ·  the taint bus (013 + 014)  ·  'who caused it'";
+    fontsize=15; fontcolor="#7aa2f7"; color="#3b4261"; style="rounded"; penwidth=1.4;
+
+    source [shape=box, style="filled,rounded", fillcolor="#0f2233", color="#73daca", fontcolor="#a5f3e0",
+      label="SOURCE  (attacker input x)\nINJECTION_TAINTED_CALLDATA / _CALL_TARGET\ncmp_linearity.rs:94-95  ✅ per-exec bits"];
+    bus [shape=box, style="filled,rounded", fillcolor="#1a1030", color="#bb9af7", fontcolor="#d2a8ff",
+      label="BUS / MEMORY\nhost.tainted_storage : (addr,slot) → TaintProvenance\nhost.rs:446  ✅  {tainted, stored_value, DIM, ts_seen}\npersists SSTORE→SLOAD  ·  carries economic dimension"];
+    prov [shape=box, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#7ee787",
+      label="INJECTION_CONFIRMED_PROVENANCE\ncmp_linearity.rs:110 (set at SLOAD :955)\n✅ NOW CONSUMED by injection_causal_link_confirmed()"];
+    linkfn [shape=box, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#7ee787",
+      label="injection_causal_link_confirmed()\ncmp_linearity.rs ✅ 021\nprovenance ∥ exploit_path · FAIL-OPEN if analysis absent"];
+    sink [shape=box, style="filled,rounded", fillcolor="#0f2233", color="#7aa2f7", fontcolor="#a5c8ff",
+      label="SINK verdict — injection_chain_verdict()\ncmp_linearity.rs:139 · succeeded && selector≠0\n(coarse BY DESIGN — see note; gates ORACLE recall, untouched)"];
+    curgate [shape=box, style="filled,rounded,dashed", fillcolor="#2d2410", color="#f0883e", fontcolor="#f0883e",
+      label="injection_exploit_path_detected()\nstill gates ORACLE FEEDBACK (fail-open)\n— left AS-IS: sharpening it risks whole-oracle recall"];
+
+    source -> bus [label="  propagate  ", color="#73daca", fontcolor="#73daca"];
+    bus -> prov [label="  value-verify (SLOAD reads back tainted)  ", color="#3fb950", fontcolor="#7ee787"];
+    prov -> linkfn [label="  consumed  ", color="#3fb950", fontcolor="#7ee787", penwidth=2.0];
+    source -> sink [label="  record TAINTED_CALLS  ", color="#7aa2f7"];
+    sink -> linkfn [label="  exploit_path (2nd signal)  ", color="#7aa2f7", fontcolor="#a5c8ff"];
+    sink -> curgate [style=dashed, color="#f0883e"];
+  }
+
+  /* ═══════════════ MATERIALITY (019, already killing burn(0)) ═══════════════ */
+  materiality [shape=box, style="filled,rounded", fillcolor="#12261e", color="#3fb950", fontcolor="#3fb950", penwidth=2.0,
+    label="019 materiality gate — contract_material()\n✅ BUILT · already kills burn(0)/mint(0)\n(SSTORE pre≠post or value-CALL this tx)"];
+
+  /* ── the weld inputs (all built) ── */
+  materiality -> gate:mat [label="  ✅ built (019)  ", color="#3fb950", fontcolor="#7ee787", penwidth=2.0];
+  linkfn -> gate:taint [label="  ✅ built (021): the taint half  ", color="#3fb950", fontcolor="#7ee787", penwidth=2.2];
+  linkfn -> cand:prov [label="  ✅ stamps taint_provenance (dim from read_located_dim)  ", color="#3fb950", fontcolor="#7ee787"];
+
+  /* ═══════════════ WHAT SHIPPED vs WHAT REMAINS (legend) ═══════════════ */
+  legend [shape=note, style="filled", fillcolor="#12261e", color="#3fb950", fontcolor="#e6edf3", fontsize=12,
+    label="FEATURE 021 — SHIPPED (177 lib tests green)\l  ✅ 2. INJECTION_CONFIRMED_PROVENANCE now consumed (was dead) — first & only reader\l  ✅ 3. gate relocated onto the a-posteriori producer, FAIL-CLOSED:\l        analysis_ran && !causally_linked  →  suppress source-less candidate\l  ✅    PromotionCandidate.taint_provenance: TaintProvenanceTag {linked, ran, dim}\l\lLEFT COARSE BY DESIGN (dashed orange):\l  ✳ 1. injection_chain_verdict stays 'succeeded && selector≠0'. The promotion\l        financial-sink is ALREADY the materiality conjunct (best_inflow > floor),\l        so sharpening chain_verdict would only risk ORACLE-layer recall. Deferred\l        to a run with fork validation.\l\lWHY IT HOLDS:  materiality asks 'did state move?'  ·  taint asks 'did WE?'\lTwo independent locks → source-less burn(0)/mint(0) can never promote.\lFAIL-OPEN when taint analysis didn't run → non-concolic reach is byte-identical.\lDIM on the tag → the archetype hook (Price / Balance / Accumulator delivery).\l"];
+}

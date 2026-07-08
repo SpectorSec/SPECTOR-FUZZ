@@ -1,0 +1,88 @@
+digraph TopologyClassifier {
+  rankdir=LR;
+  bgcolor="#0d1117";
+  fontname="Helvetica";
+  fontcolor="#e6edf3";
+  labelloc="t";
+  fontsize=20;
+  label="SPECTOR-FUZZ — Topology Protocol Classifier  ·  classify_selector(&[u8;4], fn_name) → Option<ProtocolFamily>\ntopology.rs:266  ·  NAME-FIRST canonical fingerprinting  ·  precedence cascade (returns on FIRST match → order = specificity)";
+  node [fontname="Helvetica", fontcolor="#e6edf3", color="#30363d", penwidth=1.4];
+  edge [color="#8b949e", fontname="Helvetica", fontcolor="#c9d1d9", fontsize=10, penwidth=1.3];
+
+  /* ── INPUT ── */
+  input [shape=record, style="filled,rounded", fillcolor="#1f2933", color="#58a6ff", fontcolor="#a5c8ff", penwidth=2.0,
+    label="{ ABIConfig  (one ABI entry) | { .function : [u8;4]  (selector) | .function_name : String } | ← from artifacts.address_to_abi\n(corpus_initializer.rs:620) }"];
+
+  norm [shape=box, style="filled,rounded", fillcolor="#161b22", color="#8b949e", fontcolor="#e6edf3",
+    label="n = fn_name.to_lowercase()\n(the canonical key)"];
+  input -> norm [label="  per ABI entry  "];
+
+  /* ── THE PRECEDENCE CASCADE (top = highest specificity) ── */
+  subgraph cluster_cascade {
+    label="PRECEDENCE CASCADE  ·  first match wins  ·  specificity ↓";
+    fontsize=13; fontcolor="#d29922"; color="#3b4261"; style="rounded"; penwidth=1.4;
+
+    node [shape=box, style="filled,rounded", fillcolor="#161b22", color="#484f58", fontcolor="#c9d1d9", fontsize=10];
+
+    r_link  [label="0 · SELECTOR-BYTE arm\nis_oracle_interface(&selector)\n(the ONLY 4-byte test)", color="#73daca", fontcolor="#a5f3e0"];
+    r_4626a [label="1 · ERC-4626 name set\nconvertToAssets/Shares · totalAssets · asset\npreviewDeposit/Mint/Withdraw/Redeem\nmaxDeposit/Mint/Withdraw/Redeem · redeem"];
+    r_4626b [label="2 · ERC-4626 SIG-DISAMBIG\nn=='deposit' && fn_name.contains('address')\n(2-param vault deposit vs 1-param stake)", color="#bb9af7", fontcolor="#d2a8ff"];
+    r_721   [label="3 · ERC-721\nownerOf · tokenURI · getApproved"];
+    r_1155  [label="4 · ERC-1155\nsafeBatchTransferFrom · balanceOfBatch"];
+    r_20    [label="5 · ERC-20  (BASE CASE — after the above)\ntransfer · transferFrom · approve\nallowance · totalSupply · balanceOf", color="#f0883e", fontcolor="#f0883e"];
+    r_v2    [label="6 · Uniswap V2 AMM\ngetReserves · token0 · token1 · swap\naddLiquidity · removeLiquidity"];
+    r_v3    [label="7 · Uniswap V3 AMM\nexactInputSingle · exactInput\nexactOutputSingle · exactOutput · slot0"];
+    r_lend  [label="8 · Lending\nborrow · repay · liquidate · liquidationCall"];
+    r_flash [label="9 · FlashLoan (entry + callback)\nflashLoan · executeOperation\nuniswapV2Call · pancakeCall"];
+    r_cb    [label="10 · Callback receiver\nonERC721Received · onERC1155Received\nonERC1155BatchReceived · tokensReceived"];
+    r_gov   [label="11 · Governance\npropose · castVote · queue"];
+    r_stake [label="12 · Staking / rewards\nstake · unstake · getReward\nnotifyRewardAmount · earned"];
+    r_712   [label="13 · EIP-712\nDOMAIN_SEPARATOR · domainSeparator"];
+    r_reb   [label="14 · Rebasing\nrebase · sync"];
+    r_priv  [label="15 · NAME arm (delegated)\nis_privileged_fn(fn_name)", color="#73daca", fontcolor="#a5f3e0"];
+
+    r_link -> r_4626a -> r_4626b -> r_721 -> r_1155 -> r_20 -> r_v2 -> r_v3 ->
+      r_lend -> r_flash -> r_cb -> r_gov -> r_stake -> r_712 -> r_reb -> r_priv
+      [label="no match ↓", color="#484f58", fontcolor="#6e7681", style=dashed, constraint=true];
+  }
+  norm -> r_link [label="  test in order  ", color="#8b949e"];
+
+  /* ── OUTPUT: the 15 canonical ProtocolFamily variants ── */
+  subgraph cluster_families {
+    label="ProtocolFamily  (15 canonical variants · topology.rs:22)";
+    fontsize=13; fontcolor="#3fb950"; color="#238636"; style="rounded"; penwidth=1.4;
+    node [shape=box, style="filled,rounded", fillcolor="#12261e", color="#2ea043", fontcolor="#7ee787", fontsize=10];
+    f_link[label="Chainlink"]; f_4626[label="ERC4626"]; f_721[label="ERC721"];
+    f_1155[label="ERC1155"]; f_20[label="ERC20"]; f_v2[label="UniswapV2"];
+    f_v3[label="UniswapV3"]; f_lend[label="Lending"]; f_flash[label="FlashLoan"];
+    f_cb[label="Callback"]; f_gov[label="Governance"]; f_stake[label="Staking"];
+    f_712[label="EIP712"]; f_reb[label="Rebasing"]; f_priv[label="Privileged"];
+  }
+  edge [color="#2ea043", fontcolor="#7ee787", constraint=false];
+  r_link->f_link[label="match→"]; r_4626a->f_4626; r_4626b->f_4626; r_721->f_721;
+  r_1155->f_1155; r_20->f_20; r_v2->f_v2; r_v3->f_v3; r_lend->f_lend;
+  r_flash->f_flash; r_cb->f_cb; r_gov->f_gov; r_stake->f_stake; r_712->f_712;
+  r_reb->f_reb; r_priv->f_priv;
+
+  /* fallthrough → None */
+  none [shape=box, style="filled,rounded,dashed", fillcolor="#2d0f0f", color="#f85149", fontcolor="#ffa198",
+    label="None\n(unclassified — ignored\nby topology)"];
+  r_priv -> none [label="no match", color="#f85149", fontcolor="#ffa198", style=dashed];
+
+  /* ── DOWNSTREAM: families → analyze → exploit classes ── */
+  agg [shape=box, style="filled,rounded", fillcolor="#1a1030", color="#bb9af7", fontcolor="#d2a8ff", penwidth=1.8,
+    label="families: HashSet<ProtocolFamily>\n(union across ALL target contracts)\ncorpus_initializer.rs:626"];
+  analyze [shape=record, style="filled,rounded", fillcolor="#1a1030", color="#bb9af7", fontcolor="#d2a8ff", penwidth=2.0,
+    label="{ TopologyReport::analyze(families)  ·  topology.rs:159 | CO-OCCURRENCE scoring (2-family pairs high, single-family low) | e.g. ERC4626+Chainlink→PriceGatedVault 95 · AMM+Chainlink→OraclePriceManip 85\nAMM+(4626|Lending|Staking)→ReflexiveSkew 88 · Privileged→PermissionEscalation 85 | → ranked Vec<(ExploitClass, confidence)> } "];
+  hints [shape=box, style="filled,rounded", fillcolor="#0f2233", color="#58a6ff", fontcolor="#a5c8ff",
+    label="TopologyHints::from_report_and_abi\n(conf ≥ 70 → real selectors per class)\n→ scheduler gamma-ray boost + mutator bias"];
+
+  edge [constraint=true];
+  f_link -> agg [color="#6e7681", style=dotted, label="  (all matched families)  ", fontcolor="#6e7681"];
+  agg -> analyze [color="#bb9af7", penwidth=1.8];
+  analyze -> hints [label="  ExploitClass.target_families() → selectors  ", color="#58a6ff", fontcolor="#a5c8ff"];
+
+  /* ── legend ── */
+  legend [shape=note, style="filled", fillcolor="#12261e", color="#3fb950", fontcolor="#e6edf3", fontsize=11,
+    label="HOW IT CLASSIFIES (topology.rs:266 classify_selector):\l  • NAME-FIRST: n = fn_name.to_lowercase(); match against canonical name SETS.\l  • SELECTOR bytes used for ONE arm only — Chainlink via is_oracle_interface(&selector).\l  • ONE param-signature disambiguation — deposit(+address) ⇒ ERC-4626 vault, else Staking.\l  • PRECEDENCE MATTERS: specific standards (4626/721/1155) tested BEFORE ERC-20 base case,\l    because transfer/approve/balanceOf are shared → ERC-20 is the deliberate fallthrough.\l  • Returns Option — first hit wins; no hit ⇒ None ⇒ contract invisible to topology.\l  • Runs PRE-FLIGHT on the loaded ABIs — zero transactions sent (corpus_initializer.rs:611-649).\l"];
+}

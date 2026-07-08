@@ -412,6 +412,12 @@ pub struct TopologyHints {
     /// for intelligence + oracle gap-filling but the mutator runs unbiased.
     #[serde(default)]
     pub bias: f64,
+    /// §7d content re-point / §7e #2 fix — per-CONTRACT family attribution, keeping the address
+    /// key that the flat `sets`/`family_selectors` discard. Lets the planner pick the RIGHT
+    /// capital-source contract for the Borrow slot instead of a blind first-token. Additive:
+    /// existing flat consumers (mutator bias, scheduler boost) are untouched.
+    #[serde(default)]
+    pub contract_families: HashMap<EVMAddress, Vec<ProtocolFamily>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,13 +445,19 @@ impl TopologyHints {
         // Build family → selectors from already-loaded ABIs using the same
         // classify_selector logic that produced the topology report.
         let mut family_selectors: HashMap<ProtocolFamily, Vec<[u8; 4]>> = HashMap::new();
-        for abis in address_to_abi.values() {
+        // §7d/§7e #2: keep the per-CONTRACT attribution the flat map discards (address key).
+        let mut contract_families: HashMap<EVMAddress, Vec<ProtocolFamily>> = HashMap::new();
+        for (addr, abis) in address_to_abi {
             for abi in abis {
                 if let Some(family) = classify_selector(&abi.function, &abi.function_name) {
                     family_selectors
-                        .entry(family)
+                        .entry(family.clone())
                         .or_default()
                         .push(abi.function);
+                    let cf = contract_families.entry(*addr).or_default();
+                    if !cf.contains(&family) {
+                        cf.push(family);
+                    }
                 }
             }
         }
@@ -468,7 +480,7 @@ impl TopologyHints {
             })
             .collect();
 
-        TopologyHints { sets, bias }
+        TopologyHints { sets, bias, contract_families }
     }
 
     /// Returns the highest confidence hint set that contains `selector`,

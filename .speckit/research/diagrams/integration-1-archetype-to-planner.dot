@@ -1,0 +1,83 @@
+// =============================================================================
+// INTEGRATION SUB-DIAGRAM 1 of 3  —  arche_cat -> planner  (the SHAPE-prior wire)
+// Blows up the single dashed-red edge on SYSTEM_DESIGN.dot v5 into its build sites.
+// Grounded in population-procedure.md §7d. Line contract matches SYSTEM_DESIGN:
+//   solid black = BUILT · dashed red = TO-BUILD · dotted = feedback · green = held-local
+// =============================================================================
+digraph integration_archetype_planner {
+    rankdir=LR; compound=true; fontname="Helvetica"; fontsize=15; labelloc="t";
+    label="INTEGRATION 1/3 — archetype_catalog → plan_campaign_sampled  (SHAPE prior)\nmake the dashed-red SYSTEM_DESIGN edge SOLID · sites = campaign_planner.rs";
+    node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---------------- INPUTS (all BUILT) ----------------
+    subgraph cluster_in {
+        label="INPUTS (BUILT this session + existing)"; style=filled; color="#E1F5FE";
+        classify [label="classify_selector (topology.rs:266)\nABI → ProtocolFamily → target PRODUCT"];
+        arche    [label="archetype_catalog.json\nper-product weighted skeletons\n(product,vuln,phase_sig) w=P(arch|product)"];
+        fam_sel  [label="TopologyHints::from_report_and_abi\n(topology.rs:434)\nProtocolFamily → real selectors [u8;4]"];
+        diverge  [label="divergence_diagnostic.json\nvuln → oracle prior (which module)"];
+    }
+
+    // ---------------- TODAY: the thin wiring (the problem) ----------------
+    subgraph cluster_today {
+        label="TODAY — thin/blind wiring in plan_campaign_sampled (campaign_planner.rs:284)";
+        style=filled; color="#FBE9E7";
+        t_borrow [label="build_borrow_step (298)\n← cache.borrowable_tokens.first()\nBLIND — no authority typing"];
+        t_prime  [label="pick_prime_and_exploit (304)\n← prefer_same_contract : bool (370-381)\nONE topology bit, no context slot"];
+        t_link   [label="linkages: Vec::new() (352)\nEMPTY — no inter-phase carry"];
+        t_bias   [label="family_selectors → MUTATOR BIAS\nWRONG DESTINATION (bias knob,\nnever touches a step)", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---------------- TO-BUILD: the integration (dashed red) ----------------
+    subgraph cluster_build {
+        label="TO-BUILD — the re-point (population-procedure.md §7d)  [dashed red = unbuilt]";
+        style=filled; color="#FFF3E0";
+        sample   [label="① sample_archetype(product)\nby weight → phase_sig skeleton\n(NEW fn; reads archetype_catalog)",
+                  style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        f_borrow [label="② Borrow.authority_mechanism ←\nfamily_selectors[FlashLoan|approve|deposit]\nat site 298 (replace .first())",
+                  style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        f_prime  [label="③ Prime.context ← co-occurring family\nat site 304 (replace the bool)",
+                  style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        f_link   [label="④ populate linkages\nSeed→Mask→Checkpoint→Sink\nat site 352 (no longer empty)",
+                  style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        f_orac   [label="⑤ attach oracle for (product,vuln)\nfrom divergence prior\n(SURFACE→permission_leak, etc.)",
+                  style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---------------- CONSUMER (BUILT) ----------------
+    subgraph cluster_out {
+        label="CONSUMER (BUILT — unchanged)"; style=filled; color="#E0F7FA";
+        campaign [label="CampaignSequence (input.rs:50)\nsteps · linkages · promoted · warps"];
+        mutator  [label="mutator — Layer-1 fill\nSCOPED to phase window\n(oscillation = var, not skeleton)"];
+        ledger   [label="executor → feedback ledger secant\n(feedbacks.rs:396) — OBJECTIVE"];
+    }
+
+    // ---- input → build ----
+    classify -> sample  [label="target product"];
+    arche    -> sample  [label="weighted skeletons"];
+    sample   -> f_borrow [label="phase_sig picks slots to fill", style="dashed", color="#D32F2F"];
+    sample   -> f_prime  [style="dashed", color="#D32F2F"];
+    sample   -> f_link   [style="dashed", color="#D32F2F"];
+    fam_sel  -> f_borrow [label="RE-POINT (was → bias)", style="dashed", color="#D32F2F", penwidth=2];
+    fam_sel  -> t_bias   [label="today (wrong dest)", style="dotted", color="#999999"];
+    diverge  -> f_orac   [label="oracle routing", style="dashed", color="#D32F2F"];
+
+    // ---- build REPLACES today ----
+    f_borrow -> t_borrow [label="replaces", style="dashed", color="#D32F2F", dir=none];
+    f_prime  -> t_prime  [label="replaces", style="dashed", color="#D32F2F", dir=none];
+    f_link   -> t_link   [label="replaces", style="dashed", color="#D32F2F", dir=none];
+
+    // ---- filled steps → consumer ----
+    f_borrow -> campaign [label="typed Borrow"];
+    f_prime  -> campaign [label="typed Prime"];
+    f_link   -> campaign [label="taint thread"];
+    f_orac   -> ledger   [label="verdict source"];
+    campaign -> mutator  [label="phase window"];
+    mutator  -> ledger   [label="run atomically"];
+    ledger   -> mutator  [label="secant: next mutation", style="dotted"];
+
+    // ---- the build checklist (note) ----
+    checklist [shape=note, style=filled, fillcolor="#FFFDE7", fontsize=10,
+      label="BUILD UNIT (this edge = 5 changes, one file + one new fn):\l ① sample_archetype(product) — new, reads archetype_catalog.json\l ② site 298 — fill Borrow.authority_mechanism from family_selectors\l ③ site 304 — fill Prime.context (retire prefer_same_contract bool)\l ④ site 352 — populate linkages (Seed→Mask→Checkpoint→Sink)\l ⑤ divergence prior → oracle activation for (product,vuln)\l INVARIANT: mutator stays Layer-1 (fills var inside the skeleton).\l Closed-loop check: fuzzer reaches the lever ⇒ fill was correct.\l"];
+}

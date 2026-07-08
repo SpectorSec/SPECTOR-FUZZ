@@ -49,7 +49,7 @@ use crate::{
             middleware::Middleware,
             oracle_staleness::OracleStaleness,
             oracle_tracker::OracleTracker,
-            permission_leak::PermissionLeakTracer,
+            function_auth::FunctionAuthTracer,
             reentrancy::ReentrancyTracer,
             sha3_bypass::{Sha3Bypass, Sha3TaintAnalysis},
             value_capture::ValueCaptureMiddleware,
@@ -230,7 +230,7 @@ pub fn evm_fuzzer(
         // cmp_linearity runs on a separate reexecution pass (feedbacks.rs:138); this
         // reads the accumulated taint bus best-effort, gating on the same-pass delta.
         debug!("causal-identity permission-leak detector enabled");
-        fuzz_host.add_middlewares(Rc::new(RefCell::new(PermissionLeakTracer::new())));
+        fuzz_host.add_middlewares(Rc::new(RefCell::new(FunctionAuthTracer::new())));
     }
 
     // Feature 014 Phase 1: oracle-gated value movement detection.

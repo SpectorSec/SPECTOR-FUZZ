@@ -1,0 +1,62 @@
+// =============================================================================
+// INTEGRATION SUB-DIAGRAM 2 of 3  —  diverge -> auto_orac  (the ORACLE-prior wire)
+// Blows up the dashed-red SYSTEM_DESIGN edge: divergence_diagnostic → oracle activation.
+// Sites = fuzzers/evm_fuzzer.rs:524-596 (oracles.push) + corpus_initializer.rs.
+// Line contract: solid=BUILT · dashed red=TO-BUILD · dotted=feedback · green=held-local
+// =============================================================================
+digraph integration_divergence_oracle {
+    rankdir=LR; compound=true; fontname="Helvetica"; fontsize=15; labelloc="t";
+    label="INTEGRATION 2/3 — divergence_diagnostic → oracle activation  (ORACLE prior)\nmake oracle activation TARGET-AWARE (today it is GLOBAL) · sites = evm_fuzzer.rs:524-596";
+    node [shape=box, style=rounded, fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---------------- INPUTS (BUILT) ----------------
+    subgraph cluster_in {
+        label="INPUTS (BUILT)"; style=filled; color="#E1F5FE";
+        classify [label="classify_selector (topology.rs:266)\nABI → ProtocolFamily → target PRODUCT"];
+        diverge  [label="divergence_diagnostic.json\n(product,vuln) → oracle-need\nSURFACE→permission_leak · blind-reent→reentrancy MW\nfloor→structural · congruent→ledger only"];
+        suite    [label="Oracle suite (20) + Middlewares (~14)\nreentrancy · fee · freshness · arb_call ·\npermission_leak MW · v2_pair · erc4626 …"];
+    }
+
+    // ---------------- TODAY: GLOBAL activation (the problem) ----------------
+    subgraph cluster_today {
+        label="TODAY — GLOBAL activation, no per-target routing (evm_fuzzer.rs:524-596)";
+        style=filled; color="#FBE9E7";
+        t_all   [label="oracles.push(...) × N\nALL oracles run on EVERY target\n(echidna, invariant, nft, fee, approval,\ncrosschain, rebasing …)", color="#D32F2F", fontcolor="#D32F2F"];
+        t_flag  [label="a few CLI-flag-gated GLOBALLY\n--temporal-skimming, --reflexive-lever\n(not target-derived)"];
+        t_noroute [label="NO (product,vuln) → oracle map\nthe divergence prior feeds NOTHING", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---------------- TO-BUILD (dashed red) ----------------
+    subgraph cluster_build {
+        label="TO-BUILD — oracle_router (make activation target-aware)  [dashed red]";
+        style=filled; color="#FFF3E0";
+        router  [label="① oracle_router(product, vuln)\nreads divergence prior → ACTIVE SUBSET\n(NEW fn; keyed by topology product)",
+                 style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        gate    [label="② gate the oracles.push calls\nby router decision (site 524-596)\nnot unconditional",
+                 style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        surf    [label="③ SURFACE products (AMM/Insurance/Bridge)\n→ ACTIVATE permission_leak MW\n(the 119-exploit dominator)",
+                 style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+    }
+
+    // ---------------- CONSUMER (BUILT) ----------------
+    subgraph cluster_out {
+        label="CONSUMER (BUILT)"; style=filled; color="#E0F7FA";
+        active  [label="ACTIVE oracle set (per target)\ncheaper: run what the vuln-class needs"];
+        verdict [label="oracle verdict → ledger / bug_idx\n(feedbacks.rs)"];
+    }
+
+    classify -> router [label="target product"];
+    diverge  -> router [label="oracle-need per (product,vuln)"];
+    suite    -> gate   [label="the modules to gate"];
+    router   -> gate   [style="dashed", color="#D32F2F", label="active subset"];
+    router   -> surf   [style="dashed", color="#D32F2F"];
+    gate     -> t_all  [label="replaces GLOBAL push", style="dashed", color="#D32F2F", dir=none];
+    diverge  -> t_noroute [label="today: unconsumed", style="dotted", color="#999999"];
+    gate     -> active [label="per-target"];
+    surf     -> active [label="+permission_leak"];
+    active   -> verdict;
+
+    checklist [shape=note, style=filled, fillcolor="#FFFDE7", fontsize=10,
+      label="BUILD UNIT (this edge = 3 changes):\l ① oracle_router(product,vuln) — new, reads divergence_diagnostic\l ② gate oracles.push at evm_fuzzer.rs:524-596 by router\l ③ SURFACE-dominant products → activate permission_leak MW\l WHY: today every oracle runs on every target (waste + noise);\l divergence prior says which oracle each vuln-class actually needs.\l Anti-correlation: sharp-shape products need few oracles;\l flat-shape (Insurance/Bridge) lean hardest on permission_leak.\l"];
+}

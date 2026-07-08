@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evm::abi::{ABIAddressToInstanceMap, BoxedABI};
 use crate::evm::input::{CampaignSequence, ConciseEVMInput, EVMInputTy};
 use crate::evm::leak_class::LeakClass;
+use crate::evm::middlewares::cmp_linearity::TaintDim;
 use crate::evm::topology::{ExploitClass, TopologyReport};
 use crate::evm::types::{EVMAddress, EVMU256};
 
@@ -107,10 +108,41 @@ pub struct PromotionCandidate {
     /// serialized-corpus round-trip byte-compatible.
     #[serde(default)]
     pub kind: LeakClass,
+    /// Feature 021 (Taint↔Promotion Weld) — PROOF the candidate was attacker-delivered rather than
+    /// a source-less state change. The a-posteriori producer stamps the taint verdict for the
+    /// promoted step's execution. A candidate only exists when the weld's taint half passed (or the
+    /// analysis did not run — fail-open), so this is the causal receipt that survives into the
+    /// corpus for the mutator/telemetry to read. `#[serde(default)]` keeps pre-021 corpora
+    /// byte-compatible (deserialize as the all-false / `Generic` default).
+    #[serde(default)]
+    pub taint_provenance: TaintProvenanceTag,
+    /// Feature 023 — the campaign step (phase) this candidate fired at. Value path: the
+    /// `best_inflow_step` idx. Structural path: `FunctionAuthData.material_at_step[contract]`.
+    /// The shared `(product, vuln, phase)` coordinate the kind-aware mutator pins on.
+    /// `#[serde(default)]` (None) keeps pre-023 corpora byte-compatible.
+    #[serde(default)]
+    pub phase: Option<usize>,
     pub set: bool,
 }
 
 impl_serdeany!(PromotionCandidate);
+
+/// Feature 021 — the causal-provenance receipt welded onto a `PromotionCandidate`. Deliberately
+/// minimal and serializable so it round-trips in the corpus and is assertable in unit tests
+/// without a live taint reexecution. Semantics:
+/// - `causally_linked`: attacker input was tied to this candidate's execution (value-confirmed
+///   storage provenance, or a sink-cleared tainted call) — see
+///   `cmp_linearity::injection_causal_link_confirmed`.
+/// - `analysis_ran`: whether the taint reexecution actually ran; when `false`, `causally_linked`
+///   is the fail-open default (`true`) and carries no evidentiary weight.
+/// - `dim`: the located economic dimension of the taint (Price / Balance / Accumulator / Generic),
+///   the latent hook for the delivery-archetype taxonomy.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaintProvenanceTag {
+    pub causally_linked: bool,
+    pub analysis_ran: bool,
+    pub dim: TaintDim,
+}
 
 impl CampaignTargetCache {
     /// Build the cache from the ABI registry by scanning for known selector patterns.
@@ -183,7 +215,7 @@ pub fn plan_campaign(
     let mut rand = StdRand::with_seed(0xC0FFEE);
     // Deterministic/test entry keeps reflexive promotion OFF; the live fuzzer path
     // (mutator) passes `self.reflexive_lever`.
-    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, false, &mut rand)
+    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, false, None, None, &mut rand)
 }
 
 /// Feature 015 selectors of reflexive-skew liquidity primitives.
@@ -243,6 +275,24 @@ fn maybe_promote_lever(cache: &CampaignTargetCache) -> Option<ConciseEVMInput> {
     None
 }
 
+/// Feature 024 (post-hoc → planner socket) — build a step for a structural pin
+/// `(contract, selector)` by finding its ABI in the harvested cache (prime/exploit/reflexive
+/// pools). Mirrors `maybe_promote_lever`. `None` if the selector wasn't harvested for that
+/// contract (then the structural move can't be seeded — the sampler must find it, as today).
+fn build_structural_step(
+    cache: &CampaignTargetCache,
+    contract: EVMAddress,
+    selector: [u8; 4],
+) -> Option<ConciseEVMInput> {
+    cache
+        .prime_targets
+        .iter()
+        .chain(cache.exploit_targets.iter())
+        .chain(cache.reflexive_targets.iter())
+        .find(|(a, s, _)| *a == contract && *s == selector)
+        .map(|(a, _, abi)| build_abi_step(*a, Some(abi.clone())))
+}
+
 /// Structural-sampling campaign planner. The planner's ONLY job is to propose an
 /// atomic frame (borrow → sampled prime → sampled exploit) by drawing uniformly from
 /// the harvested contract vocabulary, `get_next_call`-style. It deliberately does NOT
@@ -261,6 +311,13 @@ pub fn plan_campaign_sampled<R: Rand>(
     temporal_skimming: bool,
     reflexive_lever: bool,
     dimension_warp: bool,
+    // Feature 024 — post-hoc → planner socket: the structural (permission-leak) candidate's
+    // (contract, selector) to RE-SEED into the sampled campaign so the exploit is reliably
+    // reached each iteration. None on the value/a-priori paths ⇒ byte-identical behavior.
+    structural_pin: Option<(EVMAddress, [u8; 4])>,
+    // §7d content re-point: a topology-classified capital-source contract for the Borrow slot
+    // (from per-contract families), preferred over the blind first borrowable. None ⇒ old behavior.
+    borrow_authority: Option<EVMAddress>,
     rand: &mut R,
 ) -> Option<CampaignSequence> {
     let mut steps: Vec<ConciseEVMInput> = Vec::new();
@@ -268,8 +325,11 @@ pub fn plan_campaign_sampled<R: Rand>(
     let mut promoted: Vec<usize> = Vec::new();
 
     // Step 0 (optional): Borrow step — acquire capital via flashloan
-    if let Some(token_addr) = cache.borrowable_tokens.first() {
-        steps.push(build_borrow_step(*token_addr));
+    // §7d content re-point: prefer a topology-classified capital-source token (Borrow authority)
+    // over the blind first borrowable; falls back to `.first()` when topology has no opinion.
+    let borrow_tok = borrow_authority.or_else(|| cache.borrowable_tokens.first().copied());
+    if let Some(token_addr) = borrow_tok {
+        steps.push(build_borrow_step(token_addr));
     }
 
     // Populate prime + exploit steps (with concrete function ABIs), respecting hints
@@ -295,6 +355,24 @@ pub fn plan_campaign_sampled<R: Rand>(
     // the ledger-moving belly call at runtime. One lever/frame: only arm when `promoted`
     // is still empty. Off the reflexive path this stays `false` ⇒ no executor overhead.
     let aposteriori = reflexive_lever && promoted.is_empty();
+
+    // Feature 024 — post-hoc → planner socket. Re-seed the structural (permission-leak) Prime so
+    // the campaign RELIABLY reaches it, instead of only when the sampler coincidentally includes
+    // it. "Held" by re-planning: the persistent structural candidate re-seeds every iteration,
+    // mirroring how `promoted` is re-derived. Placed before the exploit (which stays last, so the
+    // warp still targets it). Skipped if already present, or if the selector isn't in the cache.
+    // NOT added to `promoted` ⇒ the kind-aware mutator never amplifies it (Feature 023 Phase 3a).
+    if let Some((sc, ssel)) = structural_pin {
+        let present = steps.iter().any(|st| {
+            st.contract == sc && st.data.as_ref().map(|d| d.function).unwrap_or_default() == ssel
+        });
+        if !present {
+            if let Some(step) = build_structural_step(cache, sc, ssel) {
+                steps.push(step);
+            }
+        }
+    }
+
     if let Some((addr, abi)) = exploit_step {
         steps.push(build_abi_step(addr, abi));
     }
@@ -761,7 +839,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "exactly one lever promoted");
         let lever_idx = campaign.promoted[0];
@@ -796,7 +874,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "the lending lever is promoted");
         let sel = campaign.steps[campaign.promoted[0]]
@@ -806,6 +884,81 @@ mod tests {
             .function;
         assert_eq!(sel, borrow_sel, "promoted step is the borrow rate-warper");
         assert!(!campaign.aposteriori, "a-priori fired ⇒ a-posteriori disarmed");
+    }
+
+    /// Feature 024 — post-hoc → planner socket: a structural pin `(contract, selector)` whose ABI
+    /// was harvested is re-seeded into the sampled campaign; an un-harvested selector yields no
+    /// step (the sampler must find it, as today). Proves the socket the capstone named.
+    #[test]
+    fn structural_pin_seeds_step_into_plan() {
+        let mut map = HashMap::new();
+        let a = EVMAddress::from([0x01; 20]);
+        let b = EVMAddress::from([0x02; 20]);
+        map.insert(a, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(b, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        // The helper: harvested (contract, selector) → a step; un-harvested → None.
+        let pin = (a, PRIME_SELECTORS[0]);
+        assert!(
+            build_structural_step(&cache, pin.0, pin.1).is_some(),
+            "harvested (contract, selector) yields a structural step"
+        );
+        assert!(
+            build_structural_step(&cache, a, [0xde, 0xad, 0xbe, 0xef]).is_none(),
+            "un-harvested selector yields no step"
+        );
+
+        // The plan with the pin contains a step for it (byte-identical off the None path).
+        let mut rand = StdRand::with_seed(0x5EED);
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, Some(pin), None, &mut rand)
+            .expect("viable prime+exploit → campaign");
+        assert!(
+            campaign.steps.iter().any(|st| st.contract == pin.0
+                && st.data.as_ref().map(|d| d.function).unwrap_or_default() == pin.1),
+            "structural_pin's (contract, selector) is present in the planned campaign"
+        );
+    }
+
+    /// §7d content re-point: `borrow_authority` (a topology-classified capital-source token)
+    /// overrides the blind `borrowable_tokens.first()`; `None` is byte-identical to old behavior.
+    #[test]
+    fn borrow_authority_overrides_first_borrowable() {
+        let mut map = HashMap::new();
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let t_first = EVMAddress::from([0xaa; 20]);
+        let t_auth = EVMAddress::from([0xbb; 20]);
+        let cache = CampaignTargetCache::new(&abi_map, vec![t_first, t_auth]);
+
+        let mut rand = StdRand::with_seed(0xB0);
+        let with_auth =
+            plan_campaign_sampled(&cache, None, false, false, false, None, Some(t_auth), &mut rand)
+                .expect("viable campaign");
+        let borrow = with_auth
+            .steps
+            .iter()
+            .find(|s| matches!(s.input_type, crate::evm::input::EVMInputTy::Borrow));
+        assert_eq!(
+            borrow.map(|s| s.contract),
+            Some(t_auth),
+            "borrow_authority overrides borrowable_tokens.first()"
+        );
+
+        let no_auth =
+            plan_campaign_sampled(&cache, None, false, false, false, None, None, &mut rand)
+                .expect("viable campaign");
+        let borrow0 = no_auth
+            .steps
+            .iter()
+            .find(|s| matches!(s.input_type, crate::evm::input::EVMInputTy::Borrow));
+        assert_eq!(
+            borrow0.map(|s| s.contract),
+            Some(t_first),
+            "None keeps the blind first-borrowable (byte-identical)"
+        );
     }
 
     /// Off-path proof: with `reflexive_lever=false` the same fixture yields NO promotion,
@@ -820,7 +973,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no promotion when reflexive_lever is off");
         assert_eq!(campaign.steps.len(), 2, "plain prime→exploit frame, lever untouched");
@@ -843,7 +996,7 @@ mod tests {
         assert!(cache.reflexive_targets.is_empty(), "fixture has no reflexive archetype");
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no a-priori lever to promote");
         assert!(campaign.aposteriori, "reflexive path with no archetype must arm a-posteriori");
@@ -861,7 +1014,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "a-priori lever promoted");
         assert!(!campaign.aposteriori, "a-priori match ⇒ a-posteriori disarmed");
@@ -877,9 +1030,59 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, false, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(!campaign.aposteriori, "flag off ⇒ never armed");
+    }
+
+    // Feature 021 — the welded taint receipt defaults to "no evidence" and round-trips.
+    #[test]
+    fn taint_provenance_tag_default_is_empty() {
+        let tag = TaintProvenanceTag::default();
+        assert!(!tag.causally_linked);
+        assert!(!tag.analysis_ran);
+        assert_eq!(tag.dim, TaintDim::Generic);
+    }
+
+    // Feature 021 — `#[serde(default)]` on `taint_provenance` keeps a pre-021 corpus (JSON with
+    // no `taint_provenance` key) deserializing cleanly to the empty tag: no corpus-break.
+    #[test]
+    fn promotion_candidate_deserializes_pre021_corpus() {
+        // A pre-021 serialized candidate: has `kind` (020) but NO `taint_provenance` (021).
+        let pre021 = r#"{
+            "contract": "0x0000000000000000000000000000000000000001",
+            "selector": [1,2,3,4],
+            "best_inflow": 42,
+            "kind": "Value",
+            "set": true
+        }"#;
+        let cand: PromotionCandidate =
+            serde_json::from_str(pre021).expect("pre-021 corpus must deserialize via serde(default)");
+        assert_eq!(cand.taint_provenance, TaintProvenanceTag::default());
+        assert!(cand.set);
+        assert_eq!(cand.best_inflow, 42);
+    }
+
+    // Feature 021 — a stamped candidate round-trips its taint receipt through the corpus.
+    #[test]
+    fn promotion_candidate_roundtrips_taint_provenance() {
+        let cand = PromotionCandidate {
+            contract: EVMAddress::from([0x01; 20]),
+            selector: [0xa9, 0x05, 0x9c, 0xbb],
+            best_inflow: 1_000_000_000_000_000_000,
+            kind: LeakClass::Value,
+            taint_provenance: TaintProvenanceTag {
+                causally_linked: true,
+                analysis_ran: true,
+                dim: TaintDim::Price,
+            },
+            phase: Some(3),
+            set: true,
+        };
+        let json = serde_json::to_string(&cand).expect("serialize");
+        let back: PromotionCandidate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.taint_provenance, cand.taint_provenance);
+        assert_eq!(back.taint_provenance.dim, TaintDim::Price);
     }
 }
 

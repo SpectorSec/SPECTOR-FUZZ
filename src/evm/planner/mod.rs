@@ -3,6 +3,6 @@ pub mod campaign_executor;
 
 pub use campaign_planner::{
     plan_campaign, plan_campaign_sampled, CampaignInflowBoundaries, CampaignTargetCache,
-    PromotionCandidate,
+    PromotionCandidate, TaintProvenanceTag,
 };
 pub use campaign_executor::execute_campaign;
