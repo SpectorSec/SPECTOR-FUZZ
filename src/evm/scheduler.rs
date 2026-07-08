@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     host::{BRANCH_STATUS, BRANCH_STATUS_IDX},
+    planner::PromotionCandidate,
     topology::TopologyHints,
     types::EVMAddress,
 };
@@ -118,14 +119,32 @@ pub struct PowerABITestcaseMetadata {
     /// Prevents the fuzzer from getting trapped in a local optimum on
     /// topology-predicted paths that don't actually yield oracle fires.
     pub topology_hits: u32,
+    /// Feature 026 Phase A — how many times this testcase received the
+    /// Promote→Scheduler economic boost. Sibling of `topology_hits` so the two
+    /// pressures decay independently (a topology-shaped step and a promoted lever
+    /// are different signals). `#[serde(default)]` = corpus back-compat.
+    #[serde(default)]
+    pub promote_hits: u32,
 }
 
 impl PowerABITestcaseMetadata {
     /// Create new [`struct@SchedulerTestcaseMetadata`]
     #[must_use]
     pub fn new(lines: usize) -> Self {
-        Self { lines, topology_hits: 0 }
+        Self { lines, topology_hits: 0, promote_hits: 0 }
     }
+}
+
+/// Feature 026 Phase A — the Promote→Scheduler energy multiplier at a given decay tick.
+/// Pure, unit-testable (cf. the 025 `secant_promotable` precedent). `PROMOTE_BOOST` is the
+/// full early boost applied to an input exercising the promoted (contract, selector); it
+/// decays exponentially with each hit (mirror of the topology gamma-ray boost) so a promoted
+/// lever gets front-loaded pressure without permanently trapping the search:
+///   hits=0 → 2.0x   ·   hits→∞ → 1.0x (neutral).
+fn promote_boost(hits: u32) -> f64 {
+    const PROMOTE_BOOST: f64 = 2.0;
+    let decay = 0.95_f64.powi(hits as i32);
+    1.0 + (PROMOTE_BOOST - 1.0) * decay
 }
 
 impl_serdeany!(PowerABITestcaseMetadata);
@@ -434,6 +453,34 @@ where
             }
         }
 
+        // Feature 026 Phase A — Promote → Scheduler energy. The reflexive (015) and
+        // parameter-bound (025) levers promote a (contract, selector) via PromotionCandidate,
+        // but the scheduler never learned of it: a promoted step was drilled only when this
+        // scorer happened to serve a matching input — the measured "3x front-loaded cost".
+        // Here we boost power for inputs that exercise the promoted (contract, selector), with
+        // the same exponential decay as the topology boost (a sibling promote_hits counter) so
+        // a promoted lever gets early pressure without permanently trapping the search.
+        // With no candidate set (!cand.set), this is inert → power byte-identical to pre-026.
+        if let Some(cand) = state.metadata_map().get::<PromotionCandidate>() {
+            if cand.set {
+                if let Some(input) = entry.input() {
+                    if let Some(abi) = input.get_data_abi() {
+                        if abi.function == cand.selector && input.get_contract() == cand.contract {
+                            let hits = match entry.metadata::<PowerABITestcaseMetadata>() {
+                                Ok(meta) => meta.promote_hits,
+                                Err(_) => 0,
+                            };
+                            power *= promote_boost(hits);
+
+                            if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
+                                meta.promote_hits = meta.promote_hits.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if power >= MAX_POWER {
             power = MAX_POWER;
         }
@@ -448,3 +495,22 @@ where
 /// The standard powerscheduling stage
 pub type PowerABIMutationalStage<E, EM, I, M, Z> =
     PowerMutationalStageWithId<E, CorpusPowerABITestcaseScore<<E as UsesState>::State>, EM, I, M, Z>;
+
+#[cfg(test)]
+mod tests {
+    use super::promote_boost;
+
+    #[test]
+    fn promote_boost_decays_from_full_to_neutral() {
+        // hits=0 → full 2.0x early pressure.
+        assert!((promote_boost(0) - 2.0).abs() < 1e-9, "full boost at hits=0");
+        // strictly decreasing as the lever is repeatedly scheduled.
+        assert!(promote_boost(1) < promote_boost(0));
+        assert!(promote_boost(10) < promote_boost(1));
+        // approaches — but never drops below — neutral (1.0): a promoted lever loses its
+        // front-loaded advantage but is never penalised.
+        assert!(promote_boost(100) > 1.0, "still above neutral at moderate hits");
+        assert!(promote_boost(100) < 1.01, "approaching neutral");
+        assert!(promote_boost(100_000) >= 1.0, "never below neutral — 1.0 is the floor");
+    }
+}
