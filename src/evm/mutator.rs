@@ -244,6 +244,27 @@ fn secant_step_signed(x1: u128, g1: i128, g2: i128, delta: u128) -> Option<u128>
     Some(x1.saturating_add(step))
 }
 
+/// Feature 025 (Parameter-Bound skew) — pure promotability decision for the ledger secant,
+/// extracted so it is unit-testable in isolation (cf. [`secant_step`]).
+///
+/// The secant tunes a MAGNITUDE on a promoted campaign step. Which candidates carry one:
+/// - `Value`      → always (magnitude = the transferred amount; `n_args` is irrelevant).
+/// - `Permission` → only with ≥1 arg slot (magnitude = the setter argument — setFee /
+///   setRewardRate / …). A no-arg privileged reach has nothing to tune and is left to the
+///   024 Prime-lock path.
+/// - anything else → not a lever here.
+///
+/// Arg *type* is deliberately not gated: LOCATE rotates args by measured ledger sensitivity,
+/// so a non-numeric arg self-deprioritizes without a hard-coded type check.
+fn secant_promotable(kind: crate::evm::leak_class::LeakClass, n_args: usize) -> bool {
+    use crate::evm::leak_class::LeakClass;
+    match kind {
+        LeakClass::Value => true,
+        LeakClass::Permission => n_args >= 1,
+        _ => false,
+    }
+}
+
 /// Feature 009 §5.3 stall→requeue fallback.
 ///
 /// When the secant definitively gives up on a comparison (flat gradient,
@@ -663,21 +684,14 @@ where
             return false;
         }
         // The candidate recorded by a prior execution's feedback (cross-iteration channel).
-        let (contract, selector) = {
+        let (contract, selector, kind) = {
             let Some(cand) = state.metadata_map().get::<PromotionCandidate>() else {
                 return false;
             };
             if !cand.set {
                 return false;
             }
-            // Feature 023 Phase 3: the reflexive lever amplifies VALUE candidates only. A
-            // structural (Permission) candidate marks a Prime step to LOCK, not a magnitude to
-            // grow; the lock mechanism is a later phase, so here we simply do not amplify it. This
-            // keeps the value path byte-identical (all pre-023 candidates were Value).
-            if cand.kind != crate::evm::leak_class::LeakClass::Value {
-                return false;
-            }
-            (cand.contract, cand.selector)
+            (cand.contract, cand.selector, cand.kind)
         };
         // Pin the matching step in the current campaign, if any and not already pinned.
         let Some(campaign) = input.get_campaign_mut() else { return false };
@@ -689,6 +703,22 @@ where
             step.contract == contract && sel == selector
         });
         if let Some(idx) = hit {
+            // Feature 025 (Parameter-Bound skew): the secant amplifies a MAGNITUDE. A VALUE
+            // candidate's magnitude is its transferred amount; a structural (Permission)
+            // candidate's magnitude — when it exists — is a *setter argument* (setFee /
+            // setRewardRate / updatePoolParams / …). `secant_promotable` is the pure decision:
+            // Value always; Permission only with ≥1 arg slot (no-arg reach has nothing to tune
+            // → left to 024's Prime-lock); any other kind is not a lever here. Arg *type* is not
+            // gated — LOCATE (below) rotates args by measured ledger sensitivity, so an address/
+            // bool arg self-deprioritizes. (Pre-025 was Value-only; the value path is unchanged.)
+            let n_args = campaign.steps[idx]
+                .data
+                .as_ref()
+                .map(|a| a.get_bytes_vec().len() / 32)
+                .unwrap_or(0);
+            if !secant_promotable(kind, n_args) {
+                return false;
+            }
             campaign.promoted = vec![idx];
             return true;
         }
@@ -1962,6 +1992,23 @@ mod tests {
         let fp2 = crate::evm::host::cmp_owner_fp(a, 101);
         assert_ne!(fp1, 0, "fingerprint must never be the 0 sentinel");
         assert_ne!(fp1, fp2, "distinct PCs must produce distinct fingerprints");
+    }
+
+    #[test]
+    fn secant_promotable_parameter_bound_skew() {
+        use super::secant_promotable;
+        use crate::evm::leak_class::LeakClass;
+        // Value is a magnitude regardless of arg count (pre-025 behaviour, unchanged).
+        assert!(secant_promotable(LeakClass::Value, 0), "Value always promotes");
+        assert!(secant_promotable(LeakClass::Value, 3), "Value always promotes");
+        // 025: a Permission (structural) candidate is a lever ONLY when it carries a setter arg.
+        assert!(!secant_promotable(LeakClass::Permission, 0), "no-arg reach → 024 Prime-lock, not secant");
+        assert!(secant_promotable(LeakClass::Permission, 1), "setter with one arg → tunable magnitude");
+        assert!(secant_promotable(LeakClass::Permission, 4), "setter with several args → tunable");
+        // No other kind is a secant lever.
+        assert!(!secant_promotable(LeakClass::Ownership, 2), "Ownership is not a magnitude lever");
+        assert!(!secant_promotable(LeakClass::Invariant, 2), "Invariant is not a magnitude lever");
+        assert!(!secant_promotable(LeakClass::Message, 2), "Message is not a magnitude lever");
     }
 
 }
