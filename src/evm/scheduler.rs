@@ -26,6 +26,7 @@ use crate::{
         blaz::builder::{ArtifactInfoMetadata, BuildJobResult},
         corpus_initializer::EVMInitializationArtifacts,
         input::EVMInput,
+        middlewares::cmp_linearity::TaintDim,
     },
     input::VMInputT,
     power_sched::{PowerMutationalStageWithId, TestcaseScoreWithId},
@@ -125,13 +126,21 @@ pub struct PowerABITestcaseMetadata {
     /// are different signals). `#[serde(default)]` = corpus back-compat.
     #[serde(default)]
     pub promote_hits: u32,
+    /// Feature 026 Phase B — the economic dimension this testcase's execution exhibited,
+    /// snapshotted from the (per-execution) flow-flags at mint time (on_add). Enables the
+    /// `dim_flow→scheduler` energy steer without reading `static mut` flags at score time.
+    #[serde(default)]
+    pub located_dim: TaintDim,
+    /// Feature 026 Phase B — decay counter for the dimension boost (sibling of the other two).
+    #[serde(default)]
+    pub dim_hits: u32,
 }
 
 impl PowerABITestcaseMetadata {
     /// Create new [`struct@SchedulerTestcaseMetadata`]
     #[must_use]
     pub fn new(lines: usize) -> Self {
-        Self { lines, topology_hits: 0, promote_hits: 0 }
+        Self { lines, topology_hits: 0, promote_hits: 0, located_dim: TaintDim::Generic, dim_hits: 0 }
     }
 }
 
@@ -145,6 +154,40 @@ fn promote_boost(hits: u32) -> f64 {
     const PROMOTE_BOOST: f64 = 2.0;
     let decay = 0.95_f64.powi(hits as i32);
     1.0 + (PROMOTE_BOOST - 1.0) * decay
+}
+
+/// Feature 026 Phase B — classify the just-executed input's economic dimension from the
+/// (per-execution) flow-flags, called at testcase-mint time (on_add). Most-specific wins:
+/// PRICE > ACCUMULATOR > Generic. The flags are `static mut` set during execution and not yet
+/// cleared at on_add (no intervening execution), so this is a best-effort per-testcase snapshot.
+/// Fail-safe: Generic ⇒ no boost ⇒ byte-identical to pre-026-B.
+fn classify_flow_dim() -> TaintDim {
+    use crate::evm::middlewares::cmp_linearity::{ACCUMULATOR_INFLATION_FLOW, PRICE_MANIPULATION_FLOW};
+    unsafe {
+        if PRICE_MANIPULATION_FLOW {
+            TaintDim::Price
+        } else if ACCUMULATOR_INFLATION_FLOW {
+            TaintDim::Accumulator
+        } else {
+            TaintDim::Generic
+        }
+    }
+}
+
+/// Feature 026 Phase B — the `dim_flow→scheduler` energy multiplier: PRICE→high, ACCUMULATOR→med,
+/// everything else neutral (dot line 241 weights). Decays `0.95^hits` like the promote/topology
+/// boosts (sibling `dim_hits`) so an economic dimension gets front-loaded budget without trapping.
+/// Floors at 1.0 (never penalises). Pure, unit-testable.
+fn dim_boost(dim: TaintDim, hits: u32) -> f64 {
+    let base = match dim {
+        TaintDim::Price => 1.75,
+        TaintDim::Accumulator => 1.4,
+        // Generic / Timestamp / Balance carry no scheduler dim-steer (Timestamp is a PRIME-phase
+        // warp lever, not a mutation-energy dimension; Balance is coarse and already coverage-led).
+        _ => return 1.0,
+    };
+    let decay = 0.95_f64.powi(hits as i32);
+    1.0 + (base - 1.0) * decay
 }
 
 impl_serdeany!(PowerABITestcaseMetadata);
@@ -236,6 +279,9 @@ where
     S: State + HasCorpus<Input = EVMInput> + HasTestcase + HasMetadata,
 {
     fn on_add(&mut self, state: &mut Self::State, idx: CorpusId) -> Result<(), Error> {
+        // Feature 026 Phase B — snapshot the economic dimension NOW: the flow-flags reflect the
+        // just-executed interesting input and no execution intervenes before on_add.
+        let flow_dim = classify_flow_dim();
         // adding power scheduling information based on code size
         {
             let mut testcase = state.testcase_mut(idx).unwrap();
@@ -248,12 +294,17 @@ where
             let artifact = match meta.get(&input.contract) {
                 Some(artifact) => artifact,
                 None => {
-                    testcase.add_metadata(PowerABITestcaseMetadata::new(1));
+                    let mut m = PowerABITestcaseMetadata::new(1);
+                    m.located_dim = flow_dim;
+                    testcase.add_metadata(m);
                     return Ok(());
                 } // some contracts are not in ArtifactInfo, like borrow
             };
             if !input.is_step() {
                 self.add_abi_metadata(&mut testcase, artifact)?;
+                if let Ok(m) = testcase.metadata_mut::<PowerABITestcaseMetadata>() {
+                    m.located_dim = flow_dim;
+                }
             }
         }
 
@@ -481,6 +532,22 @@ where
             }
         }
 
+        // Feature 026 Phase B — dim_flow → scheduler energy. Boost inputs whose execution
+        // exhibited a high-value economic dimension (PRICE_MANIP→high, ACCUM→med), read from the
+        // per-testcase `located_dim` stamped at mint (not the static-mut flags, which reflect the
+        // wrong execution at score time). Decays like the others. Generic ⇒ inert ⇒ byte-identical.
+        let (dim, dim_hits) = match entry.metadata::<PowerABITestcaseMetadata>() {
+            Ok(meta) => (meta.located_dim, meta.dim_hits),
+            Err(_) => (TaintDim::Generic, 0),
+        };
+        let boost = dim_boost(dim, dim_hits);
+        if boost > 1.0 {
+            power *= boost;
+            if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
+                meta.dim_hits = meta.dim_hits.saturating_add(1);
+            }
+        }
+
         if power >= MAX_POWER {
             power = MAX_POWER;
         }
@@ -498,7 +565,23 @@ pub type PowerABIMutationalStage<E, EM, I, M, Z> =
 
 #[cfg(test)]
 mod tests {
-    use super::promote_boost;
+    use super::{dim_boost, promote_boost, TaintDim};
+
+    #[test]
+    fn dim_boost_tiers_and_decay() {
+        // PRICE > ACCUMULATOR > neutral at hits=0.
+        assert!(dim_boost(TaintDim::Price, 0) > dim_boost(TaintDim::Accumulator, 0));
+        assert!((dim_boost(TaintDim::Price, 0) - 1.75).abs() < 1e-9);
+        assert!((dim_boost(TaintDim::Accumulator, 0) - 1.4).abs() < 1e-9);
+        // Non-steered dimensions are exactly neutral (byte-identical path).
+        assert_eq!(dim_boost(TaintDim::Generic, 0), 1.0);
+        assert_eq!(dim_boost(TaintDim::Timestamp, 0), 1.0);
+        assert_eq!(dim_boost(TaintDim::Balance, 0), 1.0);
+        // Decays toward — but never below — neutral.
+        assert!(dim_boost(TaintDim::Price, 10) < dim_boost(TaintDim::Price, 0));
+        assert!(dim_boost(TaintDim::Price, 100) > 1.0);
+        assert!(dim_boost(TaintDim::Price, 100) < 1.01);
+    }
 
     #[test]
     fn promote_boost_decays_from_full_to_neutral() {
