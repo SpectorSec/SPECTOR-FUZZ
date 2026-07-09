@@ -11,12 +11,12 @@
 //               ERC4626 + NFT are ORPHANS (bound to no class), Invariant covers 3 oracles).
 //
 // Changes from v4:
-//   1. NEW Phase 0 — Corpus Priors cluster. The old cluster_lineage was marked
-//      "narrative intent — not code." It is NOW CODE: exploit_analytics.duckdb
-//      (315 clean exploits) -> archetype_catalog.json (SHAPE prior, per-product
-//      weighted swappable skeletons) + divergence_diagnostic.json (ORACLE prior,
-//      resolution-floor coverage map). Two-tier prior: shape (local/sparse) ANTI-
-//      correlated with oracle (global/dense). Wires INTO planner + auto_orac.
+//   1. Phase 0 — Corpus. exploit_analytics.duckdb (315 clean exploits) is the OFFLINE
+//      mining source for the reflexive-lever catalogue. NOTE (2026-07-09): the
+//      archetype_catalog.json (SHAPE prior) + divergence_diagnostic.json (ORACLE prior)
+//      runtime sockets into the planner were REMOVED — pivoted away (skew-coverage-
+//      program): the archetype is not a runtime provider; general dimension-skew
+//      capability replaces per-corpus memorization.
 //   2. 019 Causal Identity Engine: FunctionAuth MW built (Phase A) -> hardens
 //      FunctionOracle (kills burn(0) phantom). ArbitraryCall MW proposed (Phase B,
 //      gated on the SAME cross-contract-provenance edge as mutator.rs:757).
@@ -24,15 +24,17 @@
 //      real LeakClass SSOT enum; SnapshotDeltaOracle (idx 20, Ownership) built.
 //   4. Inventory corrected: oracle suite 13-drawn -> 20 real; middlewares 5 -> ~14.
 //
-// DEPENDENCY-GAP NOTE (why a design catches what per-file review misses): the
-// archetype/divergence artifacts EXIST but feed NOTHING — the planner still reads
-// only thin topology co-occurrence rank (line: topology -> planner). The missing
-// EDGE is the whole gap. Drawn as dashed-red PROPOSED-READY: data built, load unbuilt.
+// SKEW-PIVOT NOTE (2026-07-09): the archetype/divergence runtime sockets were removed,
+// not built. The planner is fed by live topology + the reflexive-lever catalogue (mined
+// offline from the corpus); vulnerabilities are found by GENERAL dimension-skew capability
+// (025 param-bound, 026 scheduler energy, 027 geometric secant, 028 cross-contract
+// provenance), not by loading a per-corpus prior. Remaining red = genuine unbuilt work.
 //
 // LINE STYLE CONTRACT:
 //   solid black  = BUILT (in code; (L) = held local/unpushed)
-//   dashed red   = PROPOSED / NOT WIRED
-//   dotted       = feedback / confirmation loop (BUILT)
+//   dashed red   = PROPOSED / NOT WIRED (genuine unbuilt work)
+//   dashed amber = DEFERRED (decided, gated on validation — e.g. threat-model ④)
+//   dotted       = feedback / confirmation / offline loop (BUILT)
 //   thick        = critical path (015<->016 bridge)
 // =============================================================================
 digraph SPECTOR_FUZZ_CANONICAL_V4 {
@@ -59,11 +61,13 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
         L_built  [label="BUILT (in code)", shape=box, style=rounded];
         L_local  [label="BUILT — held LOCAL (unpushed)", shape=box, style=rounded, color="#00695C", fontcolor="#00695C"];
         L_prop   [label="PROPOSED (not wired)", shape=box, style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
+        L_defer  [label="DEFERRED (decided; gated on validation)", shape=box, style="rounded,dashed", color="#F57F17", fontcolor="#F57F17"];
         L_crit   [label="CRITICAL PATH", shape=box, style=rounded, penwidth=3];
         L_over   [label="Conceptual overlay (doc lens)", shape=note, style=filled, fillcolor="#F5F5F5"];
         L_built -> L_local [style=invis];
         L_local -> L_prop [style=invis];
-        L_prop -> L_crit [style=invis];
+        L_prop -> L_defer [style=invis];
+        L_defer -> L_crit [style=invis];
     }
 
     // =========================================================================
@@ -81,13 +85,12 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     // PHASE 0 — CORPUS PRIORS  (data layer — NOW CODE, was "narrative intent")
     // =========================================================================
     subgraph cluster_phase0 {
-        label="Phase 0 — Corpus Priors  (data layer — BUILT: duckdb + catalog + diagnostic)";
+        label="Phase 0 — Corpus  (OFFLINE mining source — duckdb)";
         style=filled; color="#E1F5FE";
-        corpus_db [label="exploit_analytics.duckdb  (BUILT)\n315 clean exploits · 12 PRODUCT tables\nproduct × vuln(labels.category) × phase_frame\n+ attack_flows.jsonl narratives (312)"];
-        arche_cat [label="archetype_catalog.json  (BUILT)\nper-product WEIGHTED swappable skeletons\n(product, vuln, phase_sig) · w=P(arch|product)\n= SHAPE prior (local, sparse; sharp=Lending)"];
-        diverge   [label="divergence_diagnostic.json  (BUILT)\nresolution-floor coverage map\nCONGRUENT 119 / SURFACE 119 / FLOOR 40 / BLIND 22\n= ORACLE prior (global, dense; vuln→res-class)"];
-        corpus_db -> arche_cat [label="cluster (product,vuln,phase_sig)"];
-        corpus_db -> diverge   [label="vuln res-class × phase_sig 'L' visible?"];
+        corpus_db [label="exploit_analytics.duckdb  (BUILT)\n315 clean exploits · 12 PRODUCT tables\n+ attack_flows.jsonl narratives (312)\nOFFLINE mining source (no runtime edge into the engine)"];
+        // archetype_catalog.json + divergence_diagnostic.json REMOVED 2026-07-09:
+        // the runtime-prior sockets were pivoted away (skew-coverage-program). The corpus
+        // survives only as the offline source of the reflexive-lever catalogue.
     }
     patterns -> corpus_db [label="mined · cleaned · traced · phase-framed"];
 
@@ -192,11 +195,14 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     topology -> planner [label="co-occurrence rank"];
     anti_topo -> mw_guard [label="hint: missing guard"];
 
-    // ---- Phase 0 priors -> engine (THE dependency gap: artifacts built, load unbuilt) ----
-    arche_cat -> planner   [style="dashed", color="#D32F2F", fontcolor="#D32F2F", penwidth=2,
-                            label="PROPOSED-READY: sample archetype by weight\n= SHAPE prior seeds plan_campaign_sampled\n(artifacts BUILT; planner load unbuilt)\nREPLACES thin topology co-occurrence rank"];
-    diverge   -> auto_orac [style="dashed", color="#D32F2F", fontcolor="#D32F2F",
-                            label="PROPOSED: vuln→oracle routing\n= ORACLE prior activates the right module\n(SURFACE→permission_leak; blind reentrancy→reentrancy MW)"];
+    // ---- Phase 0 priors -> engine: REMOVED 2026-07-09 ----
+    //   The archetype->planner (SHAPE prior) and divergence->auto_orac (ORACLE prior)
+    //   sockets were the "load the corpus prior into the engine" edges. Pivoted away
+    //   (skew-coverage-program): the archetype is NOT a runtime provider — general skew
+    //   capability replaces per-corpus memorization. The corpus survives ONLY as the
+    //   offline mining source for the reflexive-lever catalogue:
+    corpus_db -> promote [style=dotted, color="#666666", fontcolor="#666666",
+                          label="OFFLINE: data-mined REFLEXIVE_LEVER_SELECTORS\n(015 catalogue · campaign_planner.rs:239)"];
 
     // =========================================================================
     // 015 — PROMOTE -> LOCATE -> AMPLIFY
@@ -233,12 +239,12 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     // =========================================================================
     dim_flow -> temporal [style=bold, color="#1B5E20", fontcolor="#1B5E20",
                           label="017 Wire B: TIMESTAMP_DIM_LOCATED + --dimension-warp\nflag published in feedbacks, planner warp gate\n(campaign_planner.rs:307-310)\nts_seen survival: 017 Wire A (cmp_linearity.rs:291 / :314)"];
-    ghost    -> prov_src [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="PROPOSED: caller identity -> provenance\nCALLER = clean(0) today\n(out-of-scope: correct within calldata threat model)"];
+    ghost    -> prov_src [style=dashed, color="#F57F17", fontcolor="#F57F17",
+                          label="DEFERRED (2026-07-09, threat-model ④): caller identity -> provenance\nCALLER = clean(0); calldata-only threat model KEPT.\nRevisit after live validation shows missed confused-deputy cases."];
     prov_map -> locate   [color="#00695C", fontcolor="#00695C",
                           label="028 BUILT: cross-contract provenance CONSUMPTION\narg_reaches_storage ORs per_slot across ALL contracts\n(was same-contract only) — callee/proxy-target levers now kept"];
-    dim_flow -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="PROPOSED: flow-flag -> scheduler ENERGY\nflags DO feed located_dim->probe; do NOT boost\nscheduler vote weight. PRICE_MANIP->high, ACCUM->med"];
+    dim_flow -> scheduler [color="#00695C", fontcolor="#00695C",
+                          label="026-B BUILT: dim_flow -> scheduler ENERGY\nper-testcase located_dim stamped in on_add + dim_boost\n(PRICE 1.75x / ACCUM 1.4x, decaying via dim_hits)"];
 
     // =========================================================================
     // LIQUIDATION — EXTRACTABILITY CONFIRMATION
@@ -316,6 +322,6 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     //       consume: mutator.rs:667 reads it EVERY iter, pins matching campaign step
     //       gap:     PowerABIScheduler (evm/scheduler.rs:305) never boosts energy for
     //                inputs containing the promoted (contract,selector)
-    promote -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F", penwidth=2,
-                          label="DROPPED EDGE — reflexive-loop RETURN arrow (triangulated)\nintent: lever is a convergence loop  ·  code: PowerABIScheduler:305 ignores candidate\nsymptom: 3x front-loaded cost — drills only when scheduler coincidentally serves a match\nloop currently closes via MUTATOR (mutator.rs:667), NOT scheduler energy"];
+    promote -> scheduler [color="#00695C", fontcolor="#00695C", penwidth=2,
+                          label="026-A BUILT: reflexive-loop RETURN arrow (was the triangulated dropped edge)\npromote_boost in CorpusPowerABITestcaseScore::compute — candidate (contract,selector)\nmatch -> 2.0x decaying energy (promote_hits). Loop now closes via SCHEDULER energy,\nnot just the mutator (mutator.rs:667)."];
 }
