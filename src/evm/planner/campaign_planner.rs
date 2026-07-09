@@ -215,7 +215,7 @@ pub fn plan_campaign(
     let mut rand = StdRand::with_seed(0xC0FFEE);
     // Deterministic/test entry keeps reflexive promotion OFF; the live fuzzer path
     // (mutator) passes `self.effective_reflexive`.
-    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, false, None, None, None, &mut rand)
+    plan_campaign_sampled(cache, topology_report, temporal_skimming, false, false, None, None, None, None, &mut rand)
 }
 
 /// Feature 015 selectors of reflexive-skew liquidity primitives.
@@ -311,10 +311,14 @@ pub fn plan_campaign_sampled<R: Rand>(
     temporal_skimming: bool,
     effective_reflexive: bool,
     dimension_warp: bool,
-    // Feature 024 — post-hoc → planner socket: the structural (permission-leak) candidate's
-    // (contract, selector) to RE-SEED into the sampled campaign so the exploit is reliably
-    // reached each iteration. None on the value/a-priori paths ⇒ byte-identical behavior.
+    // Feature 024 — post-hoc → planner socket: the structural (permission-leak / ownership)
+    // candidate's (contract, selector) to RE-SEED into the sampled campaign so the exploit is
+    // reliably reached each iteration. None on the value/a-priori paths ⇒ byte-identical behavior.
     structural_pin: Option<(EVMAddress, [u8; 4])>,
+    // Feature 031 — runtime-discovered Value lever: the PromotionCandidate's (contract, selector)
+    // when kind==Value. Injected as the Lever step (before exploit, marked `promoted`) with higher
+    // priority than the static REFLEXIVE_LEVER_SELECTORS list. None ⇒ byte-identical behavior.
+    value_lever_pin: Option<(EVMAddress, [u8; 4])>,
     // §7d content re-point: a topology-classified capital-source contract for the Borrow slot
     // (from per-contract families), preferred over the blind first borrowable. None ⇒ old behavior.
     borrow_authority: Option<EVMAddress>,
@@ -341,13 +345,27 @@ pub fn plan_campaign_sampled<R: Rand>(
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
     }
-    // Feature 015 — a-priori Promote: hoist the reflexive-skew liquidity lever
-    // (`add_liquidity`/`remove_liquidity_imbalance`) into the frame BETWEEN prime and
-    // exploit, so the ledger-secant can pin and amount-tune it. Without this the lever
-    // only ever appears in the runtime belly (`get_next_call`) where no tuner can reach
-    // it. Trigger keys on selector presence in the harvested vocabulary (works for both
-    // preset and onchain paths); the `ReflexiveSkew` topology class only prioritizes.
-    if effective_reflexive {
+    // Feature 031 — dynamic Value lever (unconditional, not gated on effective_reflexive).
+    // Runtime ground truth: the oracle found exactly which selector is the lever on THIS
+    // target. Covers all Value-kind lever types (reflexive-price, donation/sync, ERC4626
+    // share-price, novel protocols) — not just the 14 known selectors below.
+    let dynamic_fired = if let Some((vc, vsel)) = value_lever_pin {
+        if let Some(lever) = build_structural_step(cache, vc, vsel) {
+            promoted.push(steps.len());
+            steps.push(lever);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    // Feature 015 — cold-start fallback: static reflexive-price list (Curve/Compound/Aave).
+    // Fires ONLY when no runtime candidate exists yet AND --reflexive-lever was passed.
+    // For known Curve-family targets this gives an immediate head start before runtime
+    // discovery produces a candidate. For novel protocols returns None → runs flat until
+    // the dynamic path fills in. NOT a general lever system — bootstrap for one pattern.
+    if !dynamic_fired && effective_reflexive {
         if let Some(lever) = maybe_promote_lever(cache) {
             promoted.push(steps.len());
             steps.push(lever);
@@ -852,7 +870,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "exactly one lever promoted");
         let lever_idx = campaign.promoted[0];
@@ -887,7 +905,7 @@ mod tests {
         );
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "the lending lever is promoted");
         let sel = campaign.steps[campaign.promoted[0]]
@@ -925,13 +943,77 @@ mod tests {
 
         // The plan with the pin contains a step for it (byte-identical off the None path).
         let mut rand = StdRand::with_seed(0x5EED);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, false, Some(pin), None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, Some(pin), None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(
             campaign.steps.iter().any(|st| st.contract == pin.0
                 && st.data.as_ref().map(|d| d.function).unwrap_or_default() == pin.1),
             "structural_pin's (contract, selector) is present in the planned campaign"
         );
+    }
+
+    /// Feature 031 — dynamic Value lever: a runtime-discovered (contract, selector) passed as
+    /// `value_lever_pin` is injected as the Lever step and marked `promoted`, WITHOUT requiring
+    /// `--reflexive-lever` (effective_reflexive=false). Uses SEL_ADD_LIQUIDITY on a distinct
+    /// lever address — the key property tested is flag-independence, not selector novelty.
+    /// (Selectors not in any cache pool are skipped silently per spec; that is correct behaviour.)
+    #[test]
+    fn value_lever_pin_seeds_lever_step() {
+        let mut map = HashMap::new();
+        let prime_addr = EVMAddress::from([0x01; 20]);
+        let exploit_addr = EVMAddress::from([0x02; 20]);
+        let lever_addr = EVMAddress::from([0x0e; 20]); // distinct address from prime/exploit
+        map.insert(prime_addr, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(exploit_addr, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        // SEL_ADD_LIQUIDITY on lever_addr → lands in reflexive_targets, findable by
+        // build_structural_step. The lever_addr is distinct so the pin is unambiguous.
+        map.insert(lever_addr, vec![make_abi(SEL_ADD_LIQUIDITY)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xBEEF);
+        // effective_reflexive=false: static fallback is OFF. Dynamic pin must fire alone.
+        let campaign = plan_campaign_sampled(
+            &cache, None, false, false, false,
+            None, Some((lever_addr, SEL_ADD_LIQUIDITY)), None, None,
+            &mut rand,
+        ).expect("viable prime+exploit+lever → campaign");
+
+        assert_eq!(campaign.promoted.len(), 1, "exactly one lever promoted");
+        let lever_idx = campaign.promoted[0];
+        let lever_sel = campaign.steps[lever_idx]
+            .data.as_ref().expect("promoted lever has ABI").function;
+        assert_eq!(lever_sel, SEL_ADD_LIQUIDITY, "dynamic pin is the promoted lever step");
+        assert_eq!(campaign.steps[lever_idx].contract, lever_addr, "correct contract pinned");
+        // Lever must precede the exploit (always the last step).
+        assert!(lever_idx < campaign.steps.len() - 1, "lever precedes exploit");
+    }
+
+    /// Feature 031 — static list fallback: with no value_lever_pin but effective_reflexive=true
+    /// and a known reflexive selector in the cache, the cold-start fallback still fires.
+    /// Proves the fallback is byte-identical to pre-031 behaviour on the reflexive path.
+    #[test]
+    fn value_lever_pin_none_falls_back_to_static_list() {
+        let mut map = HashMap::new();
+        let pool_addr = EVMAddress::from([0x0c; 20]);
+        map.insert(EVMAddress::from([0x01; 20]), vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(EVMAddress::from([0x02; 20]), vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        map.insert(pool_addr, vec![make_abi(SEL_ADD_LIQUIDITY)]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        // No value_lever_pin → dynamic_fired=false → fallback fires on effective_reflexive path.
+        let campaign = plan_campaign_sampled(
+            &cache, None, false, true, false,
+            None, None, None, None,
+            &mut rand,
+        ).expect("viable campaign");
+
+        assert_eq!(campaign.promoted.len(), 1, "static fallback promotes add_liquidity");
+        let lever_sel = campaign.steps[campaign.promoted[0]]
+            .data.as_ref().expect("ABI").function;
+        assert_eq!(lever_sel, SEL_ADD_LIQUIDITY, "fallback yields the known Curve lever");
     }
 
     /// §7d content re-point: `borrow_authority` (a topology-classified capital-source token)
@@ -948,7 +1030,7 @@ mod tests {
 
         let mut rand = StdRand::with_seed(0xB0);
         let with_auth =
-            plan_campaign_sampled(&cache, None, false, false, false, None, Some(t_auth), None, &mut rand)
+            plan_campaign_sampled(&cache, None, false, false, false, None, None, Some(t_auth), None, &mut rand)
                 .expect("viable campaign");
         let borrow = with_auth
             .steps
@@ -961,7 +1043,7 @@ mod tests {
         );
 
         let no_auth =
-            plan_campaign_sampled(&cache, None, false, false, false, None, None, None, &mut rand)
+            plan_campaign_sampled(&cache, None, false, false, false, None, None, None, None, &mut rand)
                 .expect("viable campaign");
         let borrow0 = no_auth
             .steps
@@ -986,7 +1068,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no promotion when effective_reflexive is off");
         assert_eq!(campaign.steps.len(), 2, "plain prime→exploit frame, lever untouched");
@@ -1009,7 +1091,7 @@ mod tests {
         assert!(cache.reflexive_targets.is_empty(), "fixture has no reflexive archetype");
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(campaign.promoted.is_empty(), "no a-priori lever to promote");
         assert!(campaign.aposteriori, "reflexive path with no archetype must arm a-posteriori");
@@ -1027,7 +1109,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, true, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert_eq!(campaign.promoted.len(), 1, "a-priori lever promoted");
         assert!(!campaign.aposteriori, "a-priori match ⇒ a-posteriori disarmed");
@@ -1043,7 +1125,7 @@ mod tests {
         let cache = CampaignTargetCache::new(&abi_map, Vec::new());
 
         let mut rand = StdRand::with_seed(0xC0FFEE);
-        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, None, &mut rand)
+        let campaign = plan_campaign_sampled(&cache, None, false, false, false, None, None, None, None, &mut rand)
             .expect("viable prime+exploit → campaign");
         assert!(!campaign.aposteriori, "flag off ⇒ never armed");
     }

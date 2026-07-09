@@ -1172,14 +1172,28 @@ where
                     // The removed anchor read observed_values (ABI-return words), which
                     // misread approve's bool `true` as profit and skewed chains toward
                     // approve→approve. Economic truth now lives solely at the ledger.
-                    // Feature 024 — post-hoc → planner socket: if a STRUCTURAL (permission-leak)
-                    // candidate is set, pass its (contract, selector) so the planner re-seeds that
-                    // Prime step every iteration (the "hold"). kind==Value candidates are handled by
-                    // the reflexive lever, not here, so this stays None on the value path.
+                    // Feature 024 / 031 — kind-aware planner routing.
+                    // Permission + Ownership → Prime slot (structural prerequisite).
+                    // Value → Lever slot (magnitude-tunable amplifier, dynamic pin).
+                    // ControlFlow + Invariant have no producer yet (oracle-side gap, not here).
                     let structural_pin = state
                         .metadata_map()
                         .get::<PromotionCandidate>()
-                        .filter(|c| c.set && c.kind == crate::evm::leak_class::LeakClass::Permission)
+                        .filter(|c| {
+                            c.set && matches!(
+                                c.kind,
+                                crate::evm::leak_class::LeakClass::Permission
+                                    | crate::evm::leak_class::LeakClass::Ownership
+                            )
+                        })
+                        .map(|c| (c.contract, c.selector));
+                    // Feature 031 — dynamic Value lever: runtime-discovered (contract, selector)
+                    // injected as Lever step by the planner. Supersedes the static 14-selector
+                    // list for any target the oracle actually found a lever on.
+                    let value_lever_pin = state
+                        .metadata_map()
+                        .get::<PromotionCandidate>()
+                        .filter(|c| c.set && c.kind == crate::evm::leak_class::LeakClass::Value)
                         .map(|c| (c.contract, c.selector));
                     // §7d content re-point: pick a topology-classified capital-source token for the
                     // Borrow slot — a borrowable whose contract exposes FlashLoan/Lending/ERC4626
@@ -1213,7 +1227,7 @@ where
                         .get::<crate::feedback::DivergenceSecantState>()
                         .filter(|d| d.pin_gate)
                         .map(|d| d.x1);
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, borrow_authority, divergence_value, &mut plan_rand) {
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, value_lever_pin, borrow_authority, divergence_value, &mut plan_rand) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This
