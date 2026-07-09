@@ -215,6 +215,39 @@ fn secant_step(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     Some(x1.saturating_add(step))
 }
 
+/// Feature 027 (Geometric / Inversion skew) — the secant in LOG space, the non-linear
+/// complement to [`secant_step`]. Many DeFi levers move the comparison distance MULTIPLICATIVELY,
+/// not linearly: AMM reserves (spot price ∝ 1/x), Uniswap-V3 ticks (price = 1.0001^tick), and
+/// any power-law `d ∝ x^k` surface. On those the linear secant mis-steps or stalls (`d1 <= d2`
+/// gives up), because its constant-slope model doesn't hold. In log space a power-law becomes
+/// affine, so one two-point secant on `(ln x, d)` recovers the step:
+///   `L1 = ln x1`, `L2 = ln(x1+δ)`;  root `L* = L1 − d1·(L2−L1)/(d2−d1)`;  `x* = exp(L*)`.
+///
+/// Unlike the linear form this handles BOTH directions (a distance that grows with x ⇒ `x* < x1`),
+/// which is exactly the "increasing the amount made it worse — invert" case the linear secant
+/// abandons. Returns `None` on a degenerate probe (`x1 == 0`, flat gradient `d1 == d2`, or a
+/// non-finite / out-of-domain result). Uses f64 intermediates — this is a NEXT-guess heuristic and
+/// the secant re-probes, so exact integer precision is unnecessary; the result is clamped back into
+/// the u128 arg domain.
+#[cfg(feature = "cmp")]
+fn secant_step_geometric(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
+    if x1 == 0 || delta == 0 || d1 == d2 {
+        return None;
+    }
+    let l1 = (x1 as f64).ln();
+    let l2 = ((x1 as f64) + (delta as f64)).ln();
+    if !(l2 > l1) {
+        return None; // ln not strictly increasing (x1 huge / δ negligible in f64)
+    }
+    // Root of the log-space affine model: L* = L1 − d1·(L2 − L1)/(d2 − d1).
+    let lstar = (l1 as f64) - (d1 as f64) * (l2 - l1) / (d2 as f64 - d1 as f64);
+    let xstar = lstar.exp();
+    if !xstar.is_finite() || xstar < 1.0 || xstar >= u128::MAX as f64 {
+        return None;
+    }
+    Some(xstar as u128)
+}
+
 /// Feature 015 — secant on the ledger's DERIVATIVE (finds an interior profit peak).
 ///
 /// The value/calldata secants ([`secant_step`]) drive one monotone comparison distance
@@ -497,11 +530,18 @@ where
                 let d2 = unsafe { cmp_read_at(secant.pin_idx, secant.pin_pc) }.unwrap_or(secant.d1);
                 secant.phase = crate::feedback::SecantPhase::Idle;
                 secant.cooldown = COOLDOWN;
-                match secant_step(secant.x1, secant.d1, d2, PROBE_DELTA) {
+                let linear = secant_step(secant.x1, secant.d1, d2, PROBE_DELTA);
+                if linear.is_none() {
+                    // 009 §5.3: linear secant can't flip this gate — hand back to concolic
+                    // (safety net; over-requeue is safe) even if the 027 geometric fallback
+                    // then produces a guess. Never starve concolic of a gate it might solve.
+                    #[cfg(feature = "concolic_secant_dispatch")]
+                    requeue_for_concolic(state);
+                }
+                // 027 Geometric skew: on a linear stall, try the log-space secant for
+                // multiplicative / inverted objectives (AMM 1/x, V3 base^tick).
+                match linear.or_else(|| secant_step_geometric(secant.x1, secant.d1, d2, PROBE_DELTA)) {
                     None => {
-                        // 009 §5.3: secant can't flip this gate — hand back to concolic.
-                        #[cfg(feature = "concolic_secant_dispatch")]
-                        requeue_for_concolic(state);
                         state.metadata_map_mut().insert(secant);
                         false
                     }
@@ -602,14 +642,18 @@ where
                 secant.phase = crate::feedback::SecantPhase::Idle;
                 secant.cooldown = COOLDOWN;
                 secant.cursor = secant.cursor.wrapping_add(1); // rotate to next arg
-                match secant_step(secant.x1, secant.d1, d2, PROBE_DELTA) {
+                let linear = secant_step(secant.x1, secant.d1, d2, PROBE_DELTA);
+                if linear.is_none() {
+                    // This argument may not be the lever for the pinned comparison.
+                    // 009 §5.3 (conservative): requeue for concolic. Over-requeue here
+                    // (another arg may be the lever) is safe — never a regression. Kept as
+                    // the safety net even when the 027 geometric fallback guesses below.
+                    #[cfg(feature = "concolic_secant_dispatch")]
+                    requeue_for_concolic(state);
+                }
+                // 027 Geometric skew: log-space fallback for multiplicative/inverted objectives.
+                match linear.or_else(|| secant_step_geometric(secant.x1, secant.d1, d2, PROBE_DELTA)) {
                     None => {
-                        // This argument is not the lever for the pinned comparison.
-                        // 009 §5.3 (conservative): requeue for concolic. Over-requeue
-                        // here (another arg may be the lever) is safe — never a
-                        // regression; full-rotation gating is a future refinement.
-                        #[cfg(feature = "concolic_secant_dispatch")]
-                        requeue_for_concolic(state);
                         state.metadata_map_mut().insert(secant);
                         false
                     }
@@ -1937,6 +1981,28 @@ mod tests {
         assert_eq!(super::secant_step(10, 1000, 1000, 100), None);
         // d2 > d1 (distance grew) → saturating dd == 0 → also abort.
         assert_eq!(super::secant_step(10, 900, 1000, 100), None);
+    }
+
+    #[cfg(feature = "cmp")]
+    #[test]
+    fn test_secant_step_geometric_recovers_multiplicative_lever() {
+        // The linear secant ABANDONS the "distance grew with x" case (d2 > d1 ⇒ None) — but on a
+        // multiplicative/inverted surface that just means the lever should move the OTHER way.
+        // 027 log-space secant extracts a meaningful step there instead of only requeueing concolic.
+        let x1 = 1_000_000u128;
+        assert_eq!(super::secant_step(x1, 900, 1000, 100), None, "linear gives up when distance grows");
+        let g = super::secant_step_geometric(x1, 900, 1000, 100).expect("geometric recovers a step");
+        assert!(g < x1, "distance grew with x ⇒ geometric inverts direction (decrease x)");
+        assert!(g >= 1, "clamped into the arg domain");
+
+        // Same direction as linear when distance shrinks with x (d1 > d2): step UP toward the flip.
+        let up = super::secant_step_geometric(x1, 1000, 900, 100).expect("geometric solves shrink case");
+        assert!(up > x1, "distance shrank with x ⇒ push x up");
+
+        // Degenerate probes → None (mirror the linear guards).
+        assert_eq!(super::secant_step_geometric(0, 900, 1000, 100), None, "x1==0 undefined for ln");
+        assert_eq!(super::secant_step_geometric(x1, 500, 500, 100), None, "flat gradient");
+        assert_eq!(super::secant_step_geometric(x1, 900, 1000, 0), None, "zero probe delta");
     }
 
     #[cfg(feature = "cmp")]
