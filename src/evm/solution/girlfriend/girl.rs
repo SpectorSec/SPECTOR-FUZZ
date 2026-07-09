@@ -42,6 +42,9 @@ pub struct Girlfriend {
     /// Fork chain alias + block for `vm.createSelectFork(chain, block)`.
     pub chain: String,
     pub block: String,
+    /// GAP 1 — temporal warp wire: (step_index, blocks_to_advance) from CampaignWarpStates.
+    /// Injected as vm.warp()/vm.roll() lines before the step at each index.
+    pub warps: Vec<(usize, u64)>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -74,7 +77,13 @@ impl Girlfriend {
             selector_override: HashMap::new(),
             chain: String::new(),
             block: String::new(),
+            warps: Vec::new(),
         }
+    }
+
+    pub fn with_warps(mut self, warps: Vec<(usize, u64)>) -> Self {
+        self.warps = warps;
+        self
     }
 
     pub fn with_selector_override(mut self, map: HashMap<String, String>) -> Self {
@@ -145,8 +154,20 @@ impl Girlfriend {
         let mut recv = contract_map.remove(&receiver).unwrap();
         let first_state = parsed_root_calls.first().and_then(|pc| pc.vm_state.clone()).unwrap_or_default();
         let last_state = parsed_root_calls.last().and_then(|pc| pc.vm_state.clone()).unwrap_or_default();
-        recv.setup_test1_vm_state(first_state, last_state);
+        recv.setup_test1_vm_state(first_state, last_state, sender);
+
+        // GAP 1 — temporal warp wire: build a lookup from step index → blocks to advance.
+        let base_block: u64 = self.block.parse().unwrap_or(0);
+        let warp_at: HashMap<usize, u64> = self.warps.iter().cloned().collect();
+
         for (i, prc) in parsed_root_calls.iter().enumerate() {
+            // Inject vm.warp/vm.roll before steps that have a campaign warp scheduled.
+            // block_timestamp estimated as warped_block * 12 (Ethereum ~12s/block post-merge).
+            if let Some(&blocks) = warp_at.get(&i) {
+                let warped_block = base_block + blocks;
+                recv.test1_calls.push(format!("vm.warp({});", warped_block * 12));
+                recv.test1_calls.push(format!("vm.roll({});", warped_block));
+            }
             recv.push_test1_call(prc.clone(), i == parsed_root_calls.len() - 1);
         }
         recv.tidy_named_addresses();

@@ -262,10 +262,11 @@ impl Contract {
         self.functions.insert(call.fn_signature, func);
     }
 
-    pub fn setup_test1_vm_state(&mut self, first_state: VmState, last_state: VmState) {
+    pub fn setup_test1_vm_state(&mut self, first_state: VmState, last_state: VmState, sender: &str) {
         self.test1_calls.extend(vec![
             format!("vm.createSelectFork(\"{}\", {}); // tx.blockNumber - 1", last_state.forked_rpc, last_state.block_number),
             format!("// vm.createSelectFork(\"{}\", bytes32({}));", first_state.forked_rpc, first_state.tx_hash),
+            format!("vm.deal({sender}, 100 ether); // match INITIAL_BALANCE set during fuzzing"),
             String::new(),
         ]);
     }

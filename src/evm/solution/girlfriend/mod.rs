@@ -21,9 +21,11 @@ pub fn gen_from_call_tree(
     output_dir: &str,
     chain: String,
     block: String,
+    warps: Vec<(usize, u64)>,
 ) -> Result<(String, String), anyhow::Error> {
     let mut gf = girl::Girlfriend::new(output_dir.to_string())
         .with_selector_override(selector_override)
-        .with_fork(chain, block);
+        .with_fork(chain, block)
+        .with_warps(warps);
     gf.gen_from_calls(calls, sender)
 }

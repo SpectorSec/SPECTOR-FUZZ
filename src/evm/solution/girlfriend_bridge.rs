@@ -52,7 +52,14 @@ pub fn generate_girlfriend_poc(state: &impl HasMetadata, work_dir: &str) {
     let output_dir = format!("{}/vulnerabilities", work_dir);
     // Active fork chain + block so the PoC emits a valid vm.createSelectFork(chain, block).
     let (chain, block) = crate::evm::solution::cli_chain_and_block();
-    match gen_from_call_tree(calls, &sender, selector_override, &output_dir, chain, block) {
+    // GAP 1 — temporal warp wire: feed campaign warps into the PoC so vm.warp/vm.roll
+    // are emitted at the correct step boundaries for temporal-skimming exploits.
+    let warps = state
+        .metadata_map()
+        .get::<crate::evm::oracles::CampaignWarpStates>()
+        .map(|w| w.warps.clone())
+        .unwrap_or_default();
+    match gen_from_call_tree(calls, &sender, selector_override, &output_dir, chain, block, warps) {
         Ok(_) => tracing::debug!("[girlfriend] PoC written under {}/ (sender {})", output_dir, sender),
         Err(e) => tracing::warn!("Girlfriend PoC generation failed: {e}"),
     }
