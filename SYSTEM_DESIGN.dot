@@ -119,7 +119,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
             style=filled; color="#FFF3E0";
             prov_src  [label="Provenance SOURCE\nCALLDATALOAD (0x35) only\nbit = 1 << arg_idx\nCALLER/ORIGIN/VALUE = clean(0)"];
             prov_tb   [label="TB.provenance: u64\nOR'd through opcodes"];
-            prov_map  [label="ArgStorageProvenance\nhost.arg_slot_provenance\n(same-contract only)"];
+            prov_map  [label="ArgStorageProvenance\nhost.arg_slot_provenance\n(per-(addr,slot); consumer cross-contract via 028)"];
             prov_src -> prov_tb [label="bits set"];
             prov_tb -> prov_map [label="SSTORE records"];
         }
@@ -235,8 +235,8 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
                           label="017 Wire B: TIMESTAMP_DIM_LOCATED + --dimension-warp\nflag published in feedbacks, planner warp gate\n(campaign_planner.rs:307-310)\nts_seen survival: 017 Wire A (cmp_linearity.rs:291 / :314)"];
     ghost    -> prov_src [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
                           label="PROPOSED: caller identity -> provenance\nCALLER = clean(0) today\n(out-of-scope: correct within calldata threat model)"];
-    prov_map -> locate   [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                          label="PROPOSED: cross-contract provenance\nsame-contract only today (mutator.rs:757)"];
+    prov_map -> locate   [color="#00695C", fontcolor="#00695C",
+                          label="028 BUILT: cross-contract provenance CONSUMPTION\narg_reaches_storage ORs per_slot across ALL contracts\n(was same-contract only) — callee/proxy-target levers now kept"];
     dim_flow -> scheduler [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
                           label="PROPOSED: flow-flag -> scheduler ENERGY\nflags DO feed located_dim->probe; do NOT boost\nscheduler vote weight. PRICE_MANIP->high, ACCUM->med"];
 

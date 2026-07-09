@@ -248,6 +248,22 @@ fn secant_step_geometric(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u1
     Some(xstar as u128)
 }
 
+/// Feature 028 — does calldata word `arg` reach ANY storage slot, across ALL contracts?
+/// Pure decision behind the LOCATE provenance skip (extracted for unit testing). Cross-contract
+/// by design: an arg whose only storage effect lands in a CALLEE / proxy target still counts —
+/// the pre-028 `*addr == step.contract` filter wrongly returned false for it (dropping the
+/// confused-deputy / proxy lever). Taint + per-slot storage already span CALL/DELEGATECALL
+/// (017 Phase 2), so ORing across every contract's slots is both correct and over-inclusion-safe
+/// (an extra LOCATE probe self-corrects via sensitivity; over-exclusion loses a lever). The
+/// `arg < 64` guard reflects the u64 provenance width (64 tracked args).
+fn arg_reaches_storage(per_slot: &std::collections::HashMap<(EVMAddress, EVMU256), u64>, arg: usize) -> bool {
+    if arg >= 64 {
+        return false;
+    }
+    let bits = per_slot.values().fold(0u64, |acc, b| acc | b);
+    bits & (1u64 << arg) != 0
+}
+
 /// Feature 015 — secant on the ledger's DERIVATIVE (finds an interior profit peak).
 ///
 /// The value/calldata secants ([`secant_step`]) drive one monotone comparison distance
@@ -831,14 +847,10 @@ where
                 if !s.located {
                     let skip = match input.get_campaign() {
                         Some(campaign) => {
-                            let pin = match campaign.promoted.first() {
-                                Some(p) => *p,
-                                None => return false,
-                            };
-                            let step = match campaign.steps.get(pin) {
-                                Some(s) => s,
-                                None => return false,
-                            };
+                            // Feature 028: LOCATE runs only on a promoted step.
+                            if campaign.promoted.first().is_none() {
+                                return false;
+                            }
                             let prov_map = if let Some(cur) = *state.corpus().current() {
                                 if let Ok(tc) = state.corpus().get(cur) {
                                     tc.borrow().metadata_map().get::<crate::evm::feedbacks::ArgStorageProvenance>().cloned()
@@ -849,13 +861,9 @@ where
                                 None
                             };
                             match prov_map {
-                                Some(meta) => {
-                                    let bits = meta.per_slot.iter()
-                                        .filter(|((addr, _), _)| *addr == step.contract)
-                                        .map(|(_, b)| b)
-                                        .fold(0u64, |acc, b| acc | b);
-                                    bits & (1u64 << arg) == 0
-                                }
+                                // Feature 028 — cross-contract provenance CONSUMPTION: skip the arg
+                                // only if it reaches NO storage in ANY contract (see helper).
+                                Some(meta) => !arg_reaches_storage(&meta.per_slot, arg),
                                 None => false,
                             }
                         }
@@ -2003,6 +2011,28 @@ mod tests {
         assert_eq!(super::secant_step_geometric(0, 900, 1000, 100), None, "x1==0 undefined for ln");
         assert_eq!(super::secant_step_geometric(x1, 500, 500, 100), None, "flat gradient");
         assert_eq!(super::secant_step_geometric(x1, 900, 1000, 0), None, "zero probe delta");
+    }
+
+    #[test]
+    fn arg_reaches_storage_is_cross_contract() {
+        use super::{arg_reaches_storage, EVMAddress, EVMU256};
+        use std::collections::HashMap;
+        let proxy_target = EVMAddress::from([0xBBu8; 20]);
+        let own = EVMAddress::from([0xAAu8; 20]);
+        // arg 2's provenance bit is recorded ONLY in a DIFFERENT contract's slot (a callee / proxy
+        // target). 028: this must count as reaching storage — the pre-028 same-contract filter
+        // would have skipped arg 2 and dropped the cross-contract lever.
+        let mut per_slot: HashMap<(EVMAddress, EVMU256), u64> = HashMap::new();
+        per_slot.insert((proxy_target, EVMU256::from(7u64)), 1u64 << 2);
+        assert!(arg_reaches_storage(&per_slot, 2), "callee-only storage effect counts (cross-contract)");
+        // an arg touching no storage anywhere is still skippable.
+        assert!(!arg_reaches_storage(&per_slot, 5), "no storage effect ⇒ skippable");
+        // own-contract storage still counts (common case unchanged).
+        per_slot.insert((own, EVMU256::from(1u64)), 1u64 << 0);
+        assert!(arg_reaches_storage(&per_slot, 0));
+        // out-of-range arg (u64 provenance width) → false, no shift overflow.
+        assert!(!arg_reaches_storage(&per_slot, 64));
+        assert!(!arg_reaches_storage(&per_slot, 200));
     }
 
     #[cfg(feature = "cmp")]
