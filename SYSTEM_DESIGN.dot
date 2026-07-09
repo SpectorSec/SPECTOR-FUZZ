@@ -136,7 +136,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
             mw_guard [label="EmptyStateGuard\nSLOAD+JUMPI before transfer"];
             mw_dos   [label="DoSDetector\nSLOAD key before REVERT\n(reads tainted_storage)"];
             mw_perm  [label="FunctionAuth MW  (019 Phase A · BUILT)\nfunction_auth.rs · FunctionAuthTracer · type FunctionAuth\ninline frame-auth context -> o_func · kills burn(0) phantom\n(identity oracle-rooted; permission_leak_metadata field keeps domain name)", color="#1B5E20", fontcolor="#1B5E20"];
-            mw_arb   [label="ArbitraryCall MW  (019 Phase B · PROPOSED)\narbitrary_call.rs (not built) · hardens o_arb\ncross-contract arg provenance -> o_arb\n(oracle-rooted identity; Message-Leak PRIMITIVE = p_msg)",
+            mw_arb   [label="ArbitraryCall MW  (019 Phase B · PROPOSED — UNBLOCKED by 028)\narbitrary_call.rs (not built) · hardens o_arb (arb_call.rs)\ncross-contract arg provenance now CONSUMABLE (028 arg_reaches_storage)\n→ MW itself is the only remaining build (oracle-rooted; Message-Leak = p_msg)",
                       style="rounded,dashed", color="#D32F2F", fontcolor="#D32F2F"];
             mw_misc  [label="FeeOnTransferDetector · ValueCapture\nSha3Bypass · CallPrinter"];
         }
@@ -253,10 +253,33 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     o_erc20 -> liquid [label="detected tokens -> route discovery"];
     o_nft   -> liquid [label="detected NFT -> liquidation"];
 
-    // CORRECTED: no oracle/liquidation -> secant feedback exists (oracles/*.rs has zero
-    // located_dim/amplify refs). Shared medium is the ledger objective, not a direct edge.
-    liquid -> amplify [style=dashed, color="#D32F2F", fontcolor="#D32F2F",
-                       label="PROPOSED: profit confirmed -> boost AMPLIFY confidence\n(code: no path; secant reads ledger obj only, not oracle verdicts)"];
+    // ① SUPERSEDED 2026-07-09 (was "profit-confirmed -> boost AMPLIFY confidence", red PROPOSED):
+    // the riff concluded oracle materiality is NOT a verdict->amplify confidence boost — it's a
+    // missing OBJECTIVE. Built as Feature 029 (divergence optimization), drawn below. Kept as a
+    // dotted marker of the resolution, not a proposed edge.
+    liquid -> amplify [style=dotted, color="#00695C", fontcolor="#00695C",
+                       label="SUPERSEDED by 029: materiality → divergence OBJECTIVE\n(not a verdict→amplify confidence boost)"];
+
+    // =========================================================================
+    // 029 — DIVERGENCE OPTIMIZATION  (Phase-1 optimization mode — BUILT 2026-07-09, 9643867)
+    //   The missing Phase 1: maximize oracle DIVERGENCE MAGNITUDE (the invariant break) so
+    //   small-tolerance / rounding-drift bugs become reachable BEFORE extraction. Objective =
+    //   read_divergence(), NOT CMP_MAP (value secant) or profit (ledger secant). Alex/Recon's
+    //   "optimization mode": maximize the break, THEN extract.
+    // =========================================================================
+    subgraph cluster_029 {
+        label="029 — Divergence Optimization  (Phase 1: maximize the break, THEN extract)";
+        style=filled; color="#E0F2F1";
+        div_pub  [label="publish_divergence / read_divergence\n(feedbacks.rs — thread-local, mirrors LEDGER_OBJECTIVE)", color="#00695C", fontcolor="#00695C"];
+        div_sec  [label="apply_divergence_secant  (MAGNITUDE axis)\nmutator.rs — peak-find via secant_step_signed\nsets pin_gate on the +→− peak", color="#00695C", fontcolor="#00695C"];
+        div_fb   [label="DivergenceFeedback  (SEQUENCE axis)\nfeedbacks.rs — climbs the ceiling, votes;\nhonors pin_gate (stops voting on peak)", color="#00695C", fontcolor="#00695C"];
+        div_pub -> div_sec [label="objective"];
+        div_pub -> div_fb  [label="objective"];
+    }
+    o_4626 -> div_pub [color="#00695C", fontcolor="#00695C",
+                       label="029 beachhead: publish max(price_delta, share_delta)\nBEFORE the boolean gate (erc4626.rs:147)"];
+    div_sec -> amplify [style=bold, penwidth=2, color="#00695C", fontcolor="#00695C",
+                        label="P1→P3 HANDOFF: pin_gate ⇒ divergence inert +\nDivergenceFeedback stops voting ⇒ extraction (ledger secant + TokenBalance) takes over"];
 
     // =========================================================================
     // SIX PRIMITIVE-LEAK TAXONOMY  (LeakClass SSOT — leak_class.rs; edges = oracles())
@@ -266,7 +289,7 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     // =========================================================================
     // 019 inline middlewares harden the post-hoc oracles with during-exec info
     mw_perm -> o_func [color="#1B5E20", fontcolor="#1B5E20", label="019A BUILT: inline frame-auth\n→ materiality guard (no burn(0))"];
-    mw_arb  -> o_arb  [style="dashed", color="#D32F2F", fontcolor="#D32F2F", label="019B PROPOSED: cross-contract\nprovenance (same gate as mutator.rs:757)"];
+    mw_arb  -> o_arb  [style="dashed", color="#D32F2F", fontcolor="#D32F2F", label="019B PROPOSED — UNBLOCKED by 028:\ncross-contract provenance now consumable\n(arg_reaches_storage); arbitrary_call.rs MW itself unbuilt"];
 
     subgraph cluster_prim {
         label="Six Primitive-Leak Taxonomy  (020: LeakClass SSOT enum — a real binding, not conceptual)";
