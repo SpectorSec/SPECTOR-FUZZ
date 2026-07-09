@@ -954,6 +954,112 @@ where
             }
         }
     }
+
+    /// Feature 029 — Phase 1 divergence optimization secant.
+    ///
+    /// Reads the post-execution oracle divergence magnitude (`read_divergence()`) and
+    /// tunes `txn_value` toward the divergence maximum (compound ceiling). Uses the same
+    /// signed-slope bracket and `secant_step_signed` as the ledger secant, but targets
+    /// oracle divergence instead of profit. No campaign/promoted machinery — tunes the
+    /// top-level `txn_value` directly.
+    ///
+    /// Inert after `pin_gate` is set (P1→P3 handoff: divergence peaked, extraction takes over).
+    /// Inert when divergence is 0 (no oracle published) — trivial gate keeps it off-path.
+    fn apply_divergence_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
+    where
+        I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
+        S: HasMetadata + HasCorpus,
+    {
+        let divergence = crate::evm::feedbacks::read_divergence();
+
+        let mut s = state
+            .metadata_map()
+            .get::<crate::feedback::DivergenceSecantState>()
+            .cloned()
+            .unwrap_or_default();
+
+        // Gate: P1→P3 handoff complete — secant is inert.
+        if s.pin_gate {
+            return false;
+        }
+
+        const PROBE_DELTA: u128 = 1_000_000_000_000_000; // 0.001 ETH in wei
+        const COOLDOWN: u32 = 8;
+
+        let read_value = |input: &I| -> u128 {
+            input.get_txn_value().map(crate::evm::host::evmu256_to_u128_sat).unwrap_or(0)
+        };
+
+        match s.phase {
+            crate::feedback::SecantPhase::Idle => {
+                if s.cooldown > 0 {
+                    s.cooldown -= 1;
+                    state.metadata_map_mut().insert(s);
+                    return false;
+                }
+                // Need a non-zero divergence to optimize.
+                if divergence == 0 {
+                    return false;
+                }
+                let x1 = read_value(input);
+                s.x1 = x1;
+                input.set_txn_value(EVMU256::from(x1));
+                s.phase = crate::feedback::SecantPhase::Probe1;
+                state.metadata_map_mut().insert(s);
+                true
+            }
+            crate::feedback::SecantPhase::Probe1 => {
+                // `divergence` is the magnitude from the x1 execution.
+                s.d1 = divergence;
+                let x2 = s.x1.saturating_add(PROBE_DELTA);
+                input.set_txn_value(EVMU256::from(x2));
+                s.phase = crate::feedback::SecantPhase::Probe2;
+                state.metadata_map_mut().insert(s);
+                true
+            }
+            crate::feedback::SecantPhase::Probe2 => {
+                // `divergence` is the magnitude from the x1+δ execution.
+                let d2 = divergence;
+                let local_slope: i128 = (d2 as i128).saturating_sub(s.d1 as i128);
+                s.phase = crate::feedback::SecantPhase::Idle;
+                s.cooldown = COOLDOWN;
+
+                let mut bracketed = false;
+                let next_x = match s.prev_slope {
+                    // +→− bracket: the peak lies between prev_x1 and current x1.
+                    Some(g_prev) if g_prev > 0 && local_slope < 0 && s.x1 > s.prev_x1 => {
+                        bracketed = true;
+                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1)
+                            .unwrap_or(s.x1)
+                    }
+                    _ => {
+                        let march = (s.x1 / 2).max(PROBE_DELTA / 1000);
+                        if local_slope > 0 {
+                            s.x1.saturating_add(march) // keep climbing
+                        } else if local_slope < 0 {
+                            s.x1.saturating_sub(march) // back off
+                        } else {
+                            s.x1 // flat — hold
+                        }
+                    }
+                };
+
+                s.prev_x1 = s.x1;
+                s.prev_slope = Some(local_slope);
+
+                // P1→P3 handoff: on a bracketed peak (+→− crossing), pin the gate.
+                // This locks the maximized divergence path and hands extraction
+                // to TokenBalanceFeedback. Future probe cycles are inert.
+                if bracketed {
+                    s.pin_gate = true;
+                }
+
+                input.set_txn_value(EVMU256::from(next_x));
+                state.metadata_map_mut().insert(s);
+                true
+            }
+        }
+    }
 }
 
 /// Feature 015 — read a promoted campaign step's arg word as u128 (lower 16 bytes).
@@ -1099,7 +1205,15 @@ where
                                 })
                                 .copied()
                         });
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, borrow_authority, &mut plan_rand) {
+                    // Feature 029 Phase 2 — divergence pin: when the secant has converged
+                    // (pin_gate), publish the divergence-maximized x so the planner pre-loads
+                    // the first non-borrow step's txn_value. None ⇒ no pin (normal path).
+                    let divergence_value = state
+                        .metadata_map()
+                        .get::<crate::feedback::DivergenceSecantState>()
+                        .filter(|d| d.pin_gate)
+                        .map(|d| d.x1);
+                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, borrow_authority, divergence_value, &mut plan_rand) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This
@@ -1179,6 +1293,19 @@ where
         if self.reflexive_lever && state.rand_mut().below(100) < 40 {
             if self.apply_ledger_secant(input, state) {
                 mutated = true;
+            }
+        }
+
+        // Feature 029: Phase 1 divergence optimization secant. Tunes txn_value toward
+        // the oracle magnitude maximum, gated on divergence > 0 (published by oracle).
+        // Self-gates via DivergenceSecantState.pin_gate (P1→P3 handoff); inert once
+        // the divergence peak is pinned and extraction takes over.
+        if state.rand_mut().below(100) < 30 {
+            let ap = input.get_access_pattern().borrow().clone();
+            if ap.call_value {
+                if self.apply_divergence_secant(input, state) {
+                    mutated = true;
+                }
             }
         }
 

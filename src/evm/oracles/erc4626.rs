@@ -144,9 +144,19 @@ impl
             let shares_pre  = read(&pre_results,  2 * i + 1);
             let shares_post = read(&post_results, 2 * i + 1);
 
+            // Feature 029 — publish divergence magnitude for the optimizer.
+            // Both drain (price drop) and inflation (share drop) are meaningful deltas.
+            // Published BEFORE the boolean gate so small deviations (Alex's 1-second
+            // truncation) still feed the optimizer even when the predicate doesn't fire.
+            let drain_mag = if price_pre > price_post { price_pre - price_post } else { EVMU256::ZERO };
+            let inflate_mag = if shares_pre > shares_post { shares_pre - shares_post } else { EVMU256::ZERO };
+            let mag = drain_mag.max(inflate_mag);
+            crate::evm::feedbacks::publish_divergence(crate::evm::feedbacks::evmu256_to_u128_sat_fb(mag));
+
             let drained   = share_price_drained(price_pre, price_post);
             let inflated  = became_zero_share(shares_pre, shares_post);
             if !drained && !inflated {
+                // Even when no oracle fires, the divergence was published above for the optimizer.
                 continue;
             }
 

@@ -48,6 +48,11 @@ thread_local! {
     /// objective (publish + read happen on the same thread within one iteration) — no
     /// lock, no `unsafe`. Stays `0` when the feature is off (never written).
     static LEDGER_OBJECTIVE: Cell<u128> = const { Cell::new(0) };
+    /// Feature 029 — Phase 1 divergence magnitude (optimization mode). Oracles
+    /// publish the break magnitude here (e.g. price_post - price_pre for ERC4626);
+    /// `apply_divergence_secant` reads it to maximize the divergence before extraction.
+    /// Stays `0` when no oracle publishes (byte-identical to pre-029).
+    static DIVERGENCE_OBJECTIVE: Cell<u128> = const { Cell::new(0) };
     /// Feature 016 Phase 3 — last detected dimension flow type from the taint
     /// analysis reexecution. Set after CmpLinearityTaint runs, read by the mutator's
     /// `apply_ledger_secant` to bias probe delta and mutation energy.
@@ -63,6 +68,18 @@ pub fn publish_ledger_objective(value: u128) {
 /// Read the last published raw-inflow objective (Feature 015). `0` before any publish.
 pub fn read_ledger_objective() -> u128 {
     LEDGER_OBJECTIVE.with(|c| c.get())
+}
+
+/// Feature 029 — publish this execution's oracle divergence magnitude.
+/// Called from oracles that compute a break magnitude (e.g. erc4626.rs).
+/// Off-path (no Feature 029 oracle active) this global is never written.
+pub fn publish_divergence(value: u128) {
+    DIVERGENCE_OBJECTIVE.with(|c| c.set(value));
+}
+
+/// Read the last published divergence magnitude (Feature 029). `0` before any publish.
+pub fn read_divergence() -> u128 {
+    DIVERGENCE_OBJECTIVE.with(|c| c.get())
 }
 
 /// Feature 016 Phase 3 — publish the detected dimension flow type from the taint
@@ -231,7 +248,8 @@ where
                 }
             }
         }
-        self.inner_feedback.as_mut().append_metadata(state, observers, testcase)
+        let result = self.inner_feedback.as_mut().append_metadata(state, observers, testcase);
+        result
     }
 }
 
@@ -470,8 +488,50 @@ impl<SC> TokenBalanceFeedback<SC> {
                 set: true,
             });
         }
+
+        // Feature 029 Phase 2 — compound sequence canary (liquid → amplify edge).
+        // When BOTH divergence (Phase 1 success) AND profit (Phase 3 success) are
+        // present in the same execution, mark it as a compound sequence. This closes
+        // the dashed-red `liquid -> amplify` edge from the V5 diagram: the oracle
+        // magnitude signal feeds back into the system as discoverable metadata.
+        //
+        // Benjamin's talk proved this matters — when coverage collapsed into
+        // `runActions`, compound sequences were invisible. The canary makes them
+        // visible to the scheduler (026 energy) and to coverage reporting.
+        let divergence = read_divergence();
+        if divergence > 0 && inflow > 0 {
+            let existing = state
+                .metadata_map()
+                .get::<CompoundSequenceCanary>()
+                .copied()
+                .unwrap_or_default();
+            let updated = CompoundSequenceCanary {
+                inflow: inflow.max(existing.inflow),
+                divergence: divergence.max(existing.divergence),
+                set: true,
+            };
+            if updated != existing {
+                state.add_metadata(updated);
+            }
+        }
     }
 }
+
+/// Feature 029 Phase 2 — compound sequence canary metadata.
+///
+/// Records that an execution achieved BOTH oracle divergence (Phase 1 success)
+/// and attacker inflow (Phase 3 success) — a compound sequence. The scheduler
+/// (026 energy) can boost inputs carrying this metadata, and coverage reports
+/// can verify compound sequences are being discovered.
+///
+/// Additive: no consumer yet (dead write); future 026 boost reads this.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompoundSequenceCanary {
+    pub inflow: u128,
+    pub divergence: u128,
+    pub set: bool,
+}
+impl_serdeany!(CompoundSequenceCanary);
 
 /// Feature 015 Phase 2 — dust floor for a-posteriori promotion: an attributed per-step
 /// attacker inflow must clear this to be a candidate (rejects rounding/refund noise). 1e15 raw
@@ -528,7 +588,7 @@ fn best_inflow_step(
 /// cannot price (`None`) are skipped.
 /// Feature 015 — saturating EVMU256 → u128 (the ledger objective is u128, matching the
 /// secant's arg-amount domain). Values above 2^128 clamp to `u128::MAX`.
-fn evmu256_to_u128_sat_fb(v: EVMU256) -> u128 {
+pub(crate) fn evmu256_to_u128_sat_fb(v: EVMU256) -> u128 {
     let limbs = v.as_limbs(); // [u64; 4], little-endian
     if limbs[2] != 0 || limbs[3] != 0 {
         u128::MAX
@@ -747,6 +807,97 @@ fn net_realized(gross: EVMU512, earned: EVMU512, owed: EVMU512) -> EVMU512 {
     gross.saturating_add(earned).saturating_sub(owed)
 }
 
+/// Feature 029 — DivergenceFeedback (the scheduler gradient for Phase 1).
+///
+/// Mirrors `TokenBalanceFeedback` but tracks oracle divergence magnitude per `bug_idx`
+/// (not per-token extraction). When divergence hits a new ceiling, the state is marked
+/// interesting and the infant-state scheduler votes, causing the fuzzer to explore
+/// sequences that maximize oracle break magnitude — the "inner loop" that discovers the
+/// compound ceiling before extraction begins.
+///
+/// Naturally uncontested during Phase 1 because `TokenBalanceFeedback` sees zero
+/// attacker inflow (deposits/donations have no `erc20_transfers` to the attacker set),
+/// so it never votes. Once `DivergenceSecantState.pin_gate` is set (divergence peaked),
+/// this feedback stops voting and Phase 3 extraction takes over.
+pub struct DivergenceFeedback<SC> {
+    best_divergence: HashMap<u64, u128>,
+    scheduler: SC,
+}
+
+impl<SC> DivergenceFeedback<SC> {
+    pub fn new(scheduler: SC) -> Self {
+        Self {
+            best_divergence: HashMap::new(),
+            scheduler,
+        }
+    }
+}
+
+impl<SC> Debug for DivergenceFeedback<SC> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DivergenceFeedback")
+            .field("bugs_tracked", &self.best_divergence.len())
+            .finish()
+    }
+}
+
+impl<SC> Named for DivergenceFeedback<SC> {
+    fn name(&self) -> &str {
+        "DivergenceFeedback"
+    }
+}
+
+impl<SC> Feedback<EVMFuzzState> for DivergenceFeedback<SC>
+where
+    SC: Scheduler<State = InfantStateState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>>
+        + HasVote<InfantStateState<EVMAddress, EVMAddress, EVMState, ConciseEVMInput>>,
+{
+    fn init_state(&mut self, _state: &mut EVMFuzzState) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_interesting<EMI, OT>(
+        &mut self,
+        state: &mut EVMFuzzState,
+        _manager: &mut EMI,
+        input: &EVMInput,
+        _observers: &OT,
+        _exit_kind: &ExitKind,
+    ) -> Result<bool, Error>
+    where
+        EMI: EventFirer<State = EVMFuzzState>,
+        OT: ObserversTuple<EVMFuzzState>,
+    {
+        let divergence = crate::evm::feedbacks::read_divergence();
+        if divergence == 0 {
+            return Ok(false);
+        }
+
+        // Phase gate: if DivergenceSecantState says the peak is pinned, stop voting.
+        if let Some(secant_state) = state.metadata_map().get::<crate::feedback::DivergenceSecantState>() {
+            if secant_state.pin_gate {
+                return Ok(false);
+            }
+        }
+
+        // Use bug_idx 0 as the aggregate divergence key (the beachhead: one divergence per execution).
+        // Future: key per-oracle bug_idx once multiple divergences publish concurrently.
+        let key = 0u64;
+        let best = self.best_divergence.entry(key).or_insert(0);
+        if divergence > *best {
+            *best = divergence;
+            self.scheduler.vote(
+                state.get_infant_state_state(),
+                input.get_state_idx(),
+                INFANT_STATE_INITIAL_VOTES * 3,
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod impact_011_tests {
     use super::*;
@@ -935,5 +1086,71 @@ mod impact_011_tests {
         let transfers = vec![xfer(addr(1), 100 * E18)];
         let bad = vec![0usize, 1]; // len 2, needs 3
         assert_eq!(best_inflow_step(&steps, &transfers, &bad, &attackers, 0), None);
+    }
+
+    // ── Phase-1 silence proof: deposit pattern produces zero attacker inflow ──
+
+    /// A deposit-or-donate transfer pattern (to the vault/contract, not the attacker)
+    /// produces zero attacker inflow. This is why TokenBalanceFeedback is naturally
+    /// silent during Phase-1 divergence setup — the scheduler is uncontested.
+    ///
+    /// Two deposit scenarios:
+    ///   1. Transfer to vault (to != attacker) — skipped by the attacker filter.
+    ///   2. Transfer to attacker but value is 0 (rounding to zero shares) — skipped
+    ///      by the `value > 0` guard in the inflow aggregation (feedbacks.rs:631).
+    /// Both produce empty inflow_by_token → `is_interesting` returns Ok(false) → no vote.
+    #[test]
+    fn deposit_transfer_to_contract_yields_no_inflow() {
+        let attacker = addr(1);
+        let vault = addr(0xCC);
+        let underlying = addr(0xAA);
+        let share = addr(0xBB);
+        let attackers: HashSet<EVMAddress> = [attacker].into_iter().collect();
+
+        // Scenario 1: underlying token goes to vault, not attacker.
+        let mut inflow_by_token: HashMap<EVMAddress, EVMU256> = HashMap::new();
+        let transfers_to_vault = vec![
+            (underlying, attacker, vault, EVMU256::from(100_000u64)),
+        ];
+        for (token, _from, to, value) in &transfers_to_vault {
+            if attackers.contains(to) && *value > EVMU256::ZERO {
+                *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;
+            }
+        }
+        assert!(
+            inflow_by_token.is_empty(),
+            "transfer to vault (not attacker) must produce no inflow"
+        );
+
+        // Scenario 2: share minted to attacker but value is zero (inflation rounding).
+        inflow_by_token.clear();
+        let transfers_zero_shares = vec![
+            (share, vault, attacker, EVMU256::ZERO),
+        ];
+        for (token, _from, to, value) in &transfers_zero_shares {
+            if attackers.contains(to) && *value > EVMU256::ZERO {
+                *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;
+            }
+        }
+        assert!(
+            inflow_by_token.is_empty(),
+            "zero-value mint to attacker must produce no inflow"
+        );
+
+        // Scenario 3: combined deposit — underlying to vault, zero shares to attacker.
+        inflow_by_token.clear();
+        let combined = vec![
+            (underlying, attacker, vault, EVMU256::from(100_000u64)),
+            (share, vault, attacker, EVMU256::ZERO),
+        ];
+        for (token, _from, to, value) in &combined {
+            if attackers.contains(to) && *value > EVMU256::ZERO {
+                *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;
+            }
+        }
+        assert!(
+            inflow_by_token.is_empty(),
+            "combined deposit (to vault + zero shares) must produce no inflow"
+        );
     }
 }

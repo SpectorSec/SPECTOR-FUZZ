@@ -813,3 +813,35 @@ pub struct LedgerSecantState {
 }
 
 impl_serdeany!(LedgerSecantState);
+
+/// Feature 029 — secant state for Phase 1 divergence optimization.
+///
+/// Unlike the value/calldata secants (which target in-execution CMP_MAP distance)
+/// and the ledger secant (which targets post-execution profit), this one targets
+/// the POST-execution oracle divergence magnitude (`DIVERGENCE_OBJECTIVE`).
+///
+/// The objective is to MAXIMIZE divergence (not minimize distance or peak-find
+/// profit), so the amplify logic marches while divergence rises and brackets the
+/// peak when it falls — same `secant_step_signed` bracket as the ledger secant.
+///
+/// Probing `txn_value` (not a campaign step arg) so no LOCATE/promoted machinery
+/// is needed for the beachhead. The pin_gate tracks the P1→P3 boundary.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct DivergenceSecantState {
+    pub phase: SecantPhase,
+    /// Baseline txn_value for this probe episode (wei).
+    pub x1: u128,
+    /// Divergence magnitude measured at x1 (from DIVERGENCE_OBJECTIVE).
+    pub d1: u128,
+    /// Previous episode's x1 (for the +→− bracket when prev_slope > 0 > local_slope).
+    pub prev_x1: u128,
+    /// Previous local slope (d2 − d1 from prior episode). Option so the first amplify
+    /// measurement seeds it.
+    pub prev_slope: Option<i128>,
+    pub cooldown: u32,
+    /// Phase gate: true once the divergence peak has been pinned and we hand
+    /// to TokenBalanceFeedback (P1→P3). When true, the secant is inert.
+    pub pin_gate: bool,
+}
+
+impl_serdeany!(DivergenceSecantState);
