@@ -3,6 +3,10 @@ pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
 
+// ── Reproduce this PoC ──────────────────────────────────────────────
+//   forge test --match-test test -vvv
+{{#if is_onchain}}//   (fork is set in the receiver constructor via vm.createSelectFork){{/if}}
+// ────────────────────────────────────────────────────────────────────
 // https://explorer.phalcon.xyz/tx/{{chain_name}}/{{last_txhash}}
 // {{{sender_scan_url}}}
 
@@ -67,7 +71,7 @@ contract {{name}} {{#if is_receiver}}is Test {{/if}}{
 {{else}}
     function test() public {
 {{/if}}
-        // vm.startPrank({{../sender}}, {{../sender}});
+        vm.startPrank({{../sender}}, {{../sender}});
     {{#if test1_calls}}
 
     {{#each test1_calls}}
@@ -78,7 +82,7 @@ contract {{name}} {{#if is_receiver}}is Test {{/if}}{
 
 {{#if test2_calls}}
     function test2() public {
-        // vm.startPrank({{../sender}}, {{../sender}});
+        vm.startPrank({{../sender}}, {{../sender}});
 
     {{#each test2_calls}}
         {{{this}}}
