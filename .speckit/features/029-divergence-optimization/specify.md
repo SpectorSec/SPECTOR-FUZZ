@@ -29,18 +29,25 @@ Phase 1 is the **enabling prerequisite**, not a parallel lane: it transforms fla
   - Tier 1 — `snapshot_delta` (slot delta already in result — publishable) and `temporal_skim` (divergence>threshold — already computed).
   - **Tier 2 — generic Echidna-boolean invariants** (`sum == total`, Alex's exact case): the property must be *rewritten* to return a signed magnitude. Follow-on, not beachhead.
 
-## Consumption — `apply_divergence_secant` (path b, guided/skew)
-- Clone of `apply_ledger_secant`: target = `read_divergence()` instead of `read_ledger_objective()`; reuses `secant_step_signed` (peak-find) + `secant_step_geometric` (027) — the divergence landscape of truncation/rounding is **cliff-shaped** (floor discontinuities), which is exactly what the log-space secant was built for.
-- **Rejected: path (c) `DivergenceFeedback` (scheduler vote).** A second feedback voting on `ORACLE_MAG` alongside `TokenBalanceFeedback`'s `best_inflow` vote makes the two gradients **compete in one scheduler → oscillation**. The mutator two-stage secant has only ONE voter (TokenBalance) → no oscillation. This is the (b) vs (c) skew-vs-havoc call, decided for (b) on the handoff argument below.
+## Trigger — `OPTIMIZE_THRESHOLD` (when to enter Phase 1)
+An oracle fire carries a magnitude (once emitted). At the feedback fire site (feedback.rs ~296, before bug registration):
+- **magnitude ≥ `OPTIMIZE_THRESHOLD`** → the bug is already material; register directly (today's behaviour, byte-identical).
+- **magnitude < `OPTIMIZE_THRESHOLD`** → a *small* divergence ("off-by-one, who cares") → **route into Phase 1** to find the compound ceiling before reporting. This is Alex's escalation criterion verbatim (small rounding → optimization mode → real severity). The threshold is what distinguishes "already a finding" from "escalate first."
+
+## Consumption — TWO gradients, phase-gated (corrects the earlier "(b) only, reject (c)")
+Phase 1 needs BOTH — they optimize different axes:
+- **(b) `apply_divergence_secant` — MAGNITUDE (one arg).** Clone of `apply_ledger_secant`: target = `read_divergence()`; reuses `secant_step_signed` (peak) + `secant_step_geometric` (027 — truncation/rounding divergence is **cliff-shaped**, the log-space secant's terrain). Tunes the amount knob (deposit size / vote %) toward the divergence peak.
+- **(c) `DivergenceFeedback<SC>` — SEQUENCE (multi-step).** Mirror of `TokenBalanceFeedback` keyed on `bug_idx` (`best_divergence: HashMap<bug_idx, EVMU256>`); climbs which *sequence* raises the break (deposit→wait→deploy→vote; ERC4626 deposit→donate). **The secant cannot discover a sequence — only a corpus/scheduler gradient can.** So (c) is not redundant with (b); it's the sequence half.
+- **Why this does NOT oscillate (corrects my over-rejection):** `TokenBalanceFeedback` is *naturally silent during Phase 1* — divergence setup deposits/donates, so attacker `best_inflow` is flat or negative → it doesn't vote. `DivergenceFeedback` has the floor in Phase 1 without competition. An explicit lock is needed only at the Phase-1→3 boundary (below): once the setup is pinned, `DivergenceFeedback` stops voting and `TokenBalanceFeedback` takes over. Mutually exclusive by phase, not by removing (c).
 
 ## THE HANDOFF (the sharpened part — resolves the oscillation gap)
 A **one-bit objective-mode switch inside the mutator**, with the "lock the path" done by machinery already shipped this session:
 
-1. **Feed:** during Phase 1 the divergence secant probes the setup input. Emit a `PromotionCandidate` for the setup step so **026-A promote→scheduler energy** retains it (else under-fed — the same reason 026-A exists). Profit is flat here → `TokenBalanceFeedback` is silent → nothing competes.
-2. **Gate:** on divergence peak (`secant_step_signed` slope flattens / converges), **pin the setup step as a Prime** → **024 post-hoc→planner socket re-seeds it every plan** (the "hold") → flip the secant's read target `read_divergence()` → `read_ledger_objective()`.
-3. **Extract:** Phase 3 (existing extraction secant + `TokenBalanceFeedback`) climbs profit on the locked prefix.
+1. **Feed (Phase 1):** `DivergenceFeedback` (c) climbs the *sequence* gradient while `apply_divergence_secant` (b) tunes the *magnitude*. `TokenBalanceFeedback` is naturally silent (profit flat/negative during setup) → the divergence gradient owns the scheduler uncontested. Emit a `PromotionCandidate` for the setup step so **026-A promote→scheduler energy** also retains it.
+2. **Gate (1→3 boundary):** on divergence peak (`secant_step_signed` slope flattens / `best_divergence` plateaus), **pin the setup step as a Prime** → **024 post-hoc→planner socket re-seeds it every plan** (the "hold") → **`DivergenceFeedback` stops voting** and the secant's read target flips `read_divergence()` → `read_ledger_objective()`. This lock is the ONE explicit anti-oscillation mechanism.
+3. **Extract (Phase 3):** existing extraction secant + `TokenBalanceFeedback` climb profit on the locked prefix.
 
-Sequential, single-voter, single switchable objective — no competing scheduler gradient. Composes 024 (pin/re-seed) + 026-A (retain energy) + 027 (cliff landscape) + the ledger-secant template. Feature 029's handoff is buildable *because* those exist.
+**One active voter per phase** (DivergenceFeedback in P1 / TokenBalance in P3), made mutually exclusive by the pin-lock — not by dropping (c). Composes 024 (pin/re-seed) + 026-A (retain energy) + 027 (cliff landscape) + the ledger-secant template. Feature 029's handoff is buildable *because* those exist.
 
 ## Success Criteria
 1. `read_divergence()` returns a non-zero magnitude on the erc4626 beachhead where the oracle previously only emitted a boolean bug. ✓ unit-testable at the publish site.
@@ -52,11 +59,12 @@ Sequential, single-voter, single switchable objective — no competing scheduler
 
 ## Out of Scope
 - Tier-2 generic-invariant magnitude (magnitude-valued property rewrite) — follow-on once the beachhead proves the loop.
-- The (c) `DivergenceFeedback` scheduler-vote path — rejected (oscillation).
 - ② `arbitrary_call` MW and Proxy ⑤ — below 029 on the board.
 
 ## Open checkpoints (verify in plan)
-- **29.1** exact mutator integration: is `apply_divergence_secant` a sibling driver in the same mutate pass as `apply_ledger_secant`, gated by the mode bit? Where does the mode bit live (a `DivergenceSecantState` metadata, mirroring `ValueSecantState`)?
+- **29.1** exact mutator integration: is `apply_divergence_secant` (b) a sibling driver in the same mutate pass as `apply_ledger_secant`, gated by the mode bit? Where does the mode bit live (a `DivergenceSecantState` metadata, mirroring `ValueSecantState`)?
 - **29.2** the peak→pin trigger: reuse `maybe_pin_aposteriori_lever` with a new `LeakClass`/kind for the divergence setup, or a dedicated pin? Confirm the 024 socket re-seeds a divergence-kind pin.
-- **29.3** does `TokenBalanceFeedback` need explicit suppression during Phase 1, or is "profit flat ⇒ silent" sufficient in practice? (Success criterion 4.)
-- **29.4** erc4626 publish site: publish the raw `price_post − price_pre`, or a normalized/basis-point magnitude (Alex used bps for relative sizing)? Signed (insolvent vs underpaying direction).
+- **29.3** the phase-lock: is "profit flat ⇒ `TokenBalanceFeedback` silent in P1" empirically sufficient, or does the pin also need to explicitly gate `DivergenceFeedback` off in P3? (The one place oscillation could still bite.)
+- **29.4** erc4626 publish site: raw `price_post − price_pre` vs normalized/bps magnitude (Alex used bps for relative sizing); signed (insolvent vs underpaying direction).
+- **29.5** `DivergenceFeedback` (c) chain order in `evm_fuzzer.rs` — before `TokenBalanceFeedback`; confirm the scheduler-vote pattern (`HasVote`) mirrors `TokenBalanceFeedback` cleanly for a `bug_idx`-keyed high-water.
+- **29.6** `OPTIMIZE_THRESHOLD` value/units — per-oracle (bps) or absolute? And confirm the ≥threshold path is byte-identical to today's direct registration.
