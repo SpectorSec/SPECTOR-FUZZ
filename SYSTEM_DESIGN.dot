@@ -280,14 +280,14 @@ digraph SPECTOR_FUZZ_CANONICAL_V4 {
     }
     o_reent -> p_ctrl [style=dashed, color="#666666", label="reentrant entry"];
     o_erc20 -> p_val  [style=dashed, color="#666666", label="balance delta"];
-    o_4626  -> p_val  [style=dashed, color="#D32F2F", fontcolor="#D32F2F", label="ORPHAN (v5.1): ERC4626 NOT in\nLeakClass.oracles() SSOT — intended Value,\nunbound dropped-edge"];
+    o_4626  -> p_val  [style=dashed, color="#666666", label="ERC4626 share-price manip\n(BOUND: OracleType::ERC4626 → LeakClass::Value SSOT)"];
     o_fee   -> p_val  [style=dashed, color="#666666", label="fee desync"];
     o_rebase -> p_val [style=dashed, color="#666666", label="rebasing desync"];
     o_arb   -> p_msg  [style=dashed, color="#666666", label="unvalidated target"];
     o_func  -> p_perm [style=dashed, color="#666666", label="unauth privileged call"];
     o_inv   -> p_inv  [style=dashed, color="#666666", label="invariant violation"];
     o_appr  -> p_inv  [style=dashed, color="#666666", label="SSOT: Invariant ALSO covers\nStateComparison(7) + Echidna(6)\n(both live in this node)"];
-    o_nft   -> p_own  [style=dashed, color="#D32F2F", fontcolor="#D32F2F", label="ORPHAN (v5.1): NFT NOT in\nLeakClass.oracles() SSOT — intended Ownership,\nunbound dropped-edge"];
+    o_nft   -> p_own  [style=dashed, color="#666666", label="NFT ownership\n(BOUND: OracleType::NFT → LeakClass::Ownership SSOT)"];
     o_own   -> p_own  [color="#666666", label="020-B: EIP-1967 slot delta (BUILT home)"];
     liquid  -> p_val  [style=dotted, color="#666666", label="confirms extractability"];
     liquid  -> p_own  [style=dotted, color="#666666", label="confirms extractability"];

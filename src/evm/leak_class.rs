@@ -62,11 +62,11 @@ impl LeakClass {
         use OracleType::*;
         match self {
             LeakClass::ControlFlow => &[Reentrancy],
-            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing],
+            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing, ERC4626],
             LeakClass::Message => &[ArbitraryCall],
             LeakClass::Permission => &[Function],
             LeakClass::Invariant => &[Invariant, StateComparison, Echidna],
-            LeakClass::Ownership => &[Ownership], // 020-B: SnapshotDelta oracle
+            LeakClass::Ownership => &[Ownership, NFT], // 020-B SnapshotDelta + NFTOwnershipOracle (028-orphan bind)
         }
     }
 
@@ -144,10 +144,18 @@ mod tests {
 
     #[test]
     fn ownership_binds_to_snapshot_delta_oracle() {
-        // 020-B: Ownership's detection home is the SnapshotDelta oracle (OracleType::Ownership),
-        // and — per the Information Availability Law — it stays post-hoc (no inline middleware).
-        assert_eq!(LeakClass::Ownership.oracles(), &[OracleType::Ownership]);
+        // 020-B: Ownership's detection home is the SnapshotDelta oracle (OracleType::Ownership);
+        // the NFTOwnershipOracle joined it (orphan bind) — both are Ownership-primitive detectors.
+        // Per the Information Availability Law it stays post-hoc (no inline middleware).
+        assert_eq!(LeakClass::Ownership.oracles(), &[OracleType::Ownership, OracleType::NFT]);
         assert!(LeakClass::Ownership.middleware().is_none());
+    }
+
+    #[test]
+    fn value_binds_erc4626_orphan() {
+        // ERC4626Oracle (share-price manipulation) is a Value-leak detector — bound into the SSOT
+        // (was an orphan: oracle fired via bug_idx / topology auto-activation but unclaimed).
+        assert!(LeakClass::Value.oracles().contains(&OracleType::ERC4626));
     }
 
     #[test]

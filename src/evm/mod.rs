@@ -541,6 +541,7 @@ pub(crate) enum OracleType {
     Rebasing,
     Function,
     Ownership,
+    ERC4626,
 }
 
 impl OracleType {
@@ -563,6 +564,7 @@ impl OracleType {
             OracleType::Rebasing => "rebasing",
             OracleType::Function => "function",
             OracleType::Ownership => "ownership",
+            OracleType::ERC4626 => "erc4626",
         }
     }
 
@@ -585,6 +587,7 @@ impl OracleType {
             "rebasing" => OracleType::Rebasing,
             "function" => OracleType::Function,
             "ownership" | "ownership_leak" => OracleType::Ownership,
+            "erc4626" => OracleType::ERC4626,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -1311,9 +1314,12 @@ mod test {
         assert_eq!(OracleType::from_strs("permission_leak"), vec![OracleType::Function]);
         assert_eq!(
             OracleType::from_strs("value_leak"),
-            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing]
+            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing, OracleType::ERC4626]
         );
-        assert_eq!(OracleType::from_strs("ownership_leak"), vec![OracleType::Ownership]);
+        assert_eq!(
+            OracleType::from_strs("ownership_leak"),
+            vec![OracleType::Ownership, OracleType::NFT]
+        );
         assert_eq!(OracleType::from_strs("control_flow_leak"), vec![OracleType::Reentrancy]);
 
         // Aggregate keywords are untouched by the class layer and still include Ownership (020-B).
