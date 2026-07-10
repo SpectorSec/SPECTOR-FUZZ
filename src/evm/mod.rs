@@ -604,6 +604,7 @@ impl OracleType {
             if detector == "all" {
                 return vec![
                     OracleType::ERC20,
+                    OracleType::ERC4626,
                     OracleType::Pair,
                     OracleType::Reentrancy,
                     OracleType::ArbitraryCall,
@@ -1324,6 +1325,9 @@ mod test {
 
         // Aggregate keywords are untouched by the class layer and still include Ownership (020-B).
         assert!(OracleType::from_strs("all").contains(&OracleType::Ownership));
+        // ERC4626 was previously absent from the "all" list despite being a registered OracleType
+        // and listed in LeakClass::Value.oracles(). Fixed: -d all now includes it.
+        assert!(OracleType::from_strs("all").contains(&OracleType::ERC4626));
         assert!(!OracleType::from_strs("high_confidence").contains(&OracleType::Ownership));
     }
 }

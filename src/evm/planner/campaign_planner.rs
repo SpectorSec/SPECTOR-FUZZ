@@ -345,6 +345,22 @@ pub fn plan_campaign_sampled<R: Rand>(
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
     }
+    // Feature 024 — structural Prime pin (Permission/Ownership). Must land BEFORE the Lever
+    // so the assembled sequence respects BPLE order: Borrow → Prime → Lever → Exploit.
+    // "Held" by re-planning: the persistent structural candidate re-seeds every iteration,
+    // mirroring how `promoted` is re-derived. Skipped if already present, or if the selector
+    // isn't in the cache. NOT added to `promoted` ⇒ secant never amplifies it.
+    if let Some((sc, ssel)) = structural_pin {
+        let present = steps.iter().any(|st| {
+            st.contract == sc && st.data.as_ref().map(|d| d.function).unwrap_or_default() == ssel
+        });
+        if !present {
+            if let Some(step) = build_structural_step(cache, sc, ssel) {
+                steps.push(step);
+            }
+        }
+    }
+
     // Feature 031 — dynamic Value lever (unconditional, not gated on effective_reflexive).
     // Runtime ground truth: the oracle found exactly which selector is the lever on THIS
     // target. Covers all Value-kind lever types (reflexive-price, donation/sync, ERC4626
@@ -377,23 +393,6 @@ pub fn plan_campaign_sampled<R: Rand>(
     // the ledger-moving belly call at runtime. One lever/frame: only arm when `promoted`
     // is still empty. Off the reflexive path this stays `false` ⇒ no executor overhead.
     let aposteriori = effective_reflexive && promoted.is_empty();
-
-    // Feature 024 — post-hoc → planner socket. Re-seed the structural (permission-leak) Prime so
-    // the campaign RELIABLY reaches it, instead of only when the sampler coincidentally includes
-    // it. "Held" by re-planning: the persistent structural candidate re-seeds every iteration,
-    // mirroring how `promoted` is re-derived. Placed before the exploit (which stays last, so the
-    // warp still targets it). Skipped if already present, or if the selector isn't in the cache.
-    // NOT added to `promoted` ⇒ the kind-aware mutator never amplifies it (Feature 023 Phase 3a).
-    if let Some((sc, ssel)) = structural_pin {
-        let present = steps.iter().any(|st| {
-            st.contract == sc && st.data.as_ref().map(|d| d.function).unwrap_or_default() == ssel
-        });
-        if !present {
-            if let Some(step) = build_structural_step(cache, sc, ssel) {
-                steps.push(step);
-            }
-        }
-    }
 
     // Feature 029 Phase 2 — divergence pin: apply the secant-converged txn_value to the
     // first non-borrow step so Phase 3 starts at the divergence peak instead of re-learning
