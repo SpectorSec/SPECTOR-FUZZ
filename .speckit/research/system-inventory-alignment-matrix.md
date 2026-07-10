@@ -191,8 +191,8 @@ All 7 items from the original remediation order are closed as of HEAD `30efe6f`.
 | 6 | Register 6 orphaned `OracleType` variants into `LeakClass` | `c542a38` | ✅ |
 | 7 | Doc pass (THESIS.md + alignment matrix) | `c542a38` + `30efe6f` | ✅ |
 
-**Remaining open items (out of scope for this remediation; future features):**
-- ControlFlow producer — no feature currently scoped
-- Message producer — gated on 019-B (cross-contract provenance)
-- Objective-magnitude-aware scheduler feedback (`promote_boost` is presence-only; no kind-aware magnitude scaling)
-- `freshness.rs` / `temporal_skim.rs` formal taxonomy enrollment (currently intentional out-of-band)
+**Remaining open items — now specced (2026-07-10 re-inventory pass):**
+- ControlFlow producer — **specced, ready to build**: `.speckit/features/034-controlflow-promotion-producer/specify.md`. `reentrancy.rs`'s `reentrancy_metadata.found` already has exactly the (contract, magnitude) shape the existing producers use; routes to `structural_pin` per 031's own suggestion.
+- Objective-magnitude-aware scheduler feedback — **specced, ready to build**: `.speckit/features/035-objective-magnitude-scheduler/specify.md`. Log-scaled, bounded, zero-at-magnitude-0 multiplier on top of the existing `promote_boost`; strict enhancement, never a regression.
+- `freshness.rs` / `temporal_skim.rs` formal taxonomy enrollment — **specced, low priority**: `.speckit/features/036-out-of-band-oracle-enrollment/specify.md`. Taxonomy-only (OracleType + LeakClass binding), no activation-logic change — mirrors the ERC4626 precedent.
+- Message producer — **still genuinely blocked, not specced.** Verified directly: the commit-message hint that Feature 028 ("cross-contract provenance") unblocked `ArbitraryCall` was checked and is not accurate — 028 is the LOCATE/secant's storage-provenance consumption (a different layer), not the Message-detection gate. The actual prerequisite is **Feature 019 Phase B** (lifting `arg_slot_provenance`'s same-contract filter for the CALL-target word specifically, `019-causal-identity-engine/specify.md:67-69,124,155-158`), which 019's own spec still describes as not built. Do not spec Message closure until 019-B lands.
