@@ -1,10 +1,72 @@
 # Feature 037 — Wire DivergenceFeedback + Give CompoundSequenceCanary a Consumer
 
 ## Status
-Ready to build. Found during a system-inventory pass over Feature 029 (Divergence Optimization),
-which was never checked against the 033/034/035 remediation work because it's a separate objective
-channel. Both gaps are the same "component exists, never wired" pattern the rest of the audit
-already tracks — this is that same audit extended to 029.
+**BLOCKED — needs a design decision, not ready to implement as originally written.** The original
+version of this spec proposed nesting `DivergenceFeedback` directly into `infant_feedback`
+(mirroring how `CmpFeedback`/`TokenBalanceFeedback` are combined there today). That approach is
+**incorrect** — verified by tracing the actual per-iteration call order in `fuzzer.rs`, not assumed.
+See "Gap 1 — corrected" below before any implementation starts.
+
+## Gap 0 — the ordering defect that blocks the naive fix (code-verified, found on review)
+
+`fuzzer.rs::evaluate_input_events` calls, in this exact order, for every executed input:
+
+1. `run_target()` (`fuzzer.rs:408`) — runs the campaign; `state.get_execution_result()` is
+   populated synchronously here.
+2. `self.infant_feedback.is_interesting(...)` (`fuzzer.rs:423-425`) — today: `CmpFeedback` OR
+   `TokenBalanceFeedback` (`EagerOrFeedback`, `evm_fuzzer.rs:496`).
+3. `self.objective.is_interesting(...)` (`fuzzer.rs:427-429`) — bound to `OracleFeedback`
+   (`evm_fuzzer.rs:918-931`). `feedback.rs:219-220`'s own doc comment: *"Called after every
+   execution. It executes the producers and then oracles."* **This is the only place any oracle,
+   including `ERC4626Oracle`, actually runs — and therefore the only place `publish_divergence()`
+   is called for the current execution.**
+4. `self.infant_result_feedback.is_interesting(...)` (`fuzzer.rs:453-455`, `DataflowFeedback`) —
+   only reached if step 2 already returned true; can only add extra votes to an infant state that
+   was already added, never trigger adding one.
+5. `self.feedback.is_interesting(...)` (`fuzzer.rs:469-471`) — `MaxMapFeedback` (coverage), the
+   main-corpus decision.
+
+**Step 2 runs before step 3.** `DivergenceFeedback` needs `read_divergence()`, which only step 3
+(this iteration's oracle pass) can set. `DIVERGENCE_OBJECTIVE` (`feedbacks.rs:58`) is a thread-local
+`Cell` that nothing resets between iterations — so if `DivergenceFeedback` ran at step 2, it would
+read whatever the **previous** iteration's oracle pass published, not the current one. Silent
+one-iteration lag, not a crash — the mechanism would vote the infant-state scheduler on the wrong
+execution's signal indefinitely.
+
+Confirmed this is NOT a problem for `CmpFeedback`/`TokenBalanceFeedback` (today's contents of
+`infant_feedback`): `TokenBalanceFeedback::is_interesting` (`feedbacks.rs:689`) reads
+`state.get_execution_result()` directly — populated at step 1, available well before step 2 needs
+it. `DivergenceFeedback` is architecturally different: its signal is oracle-produced, not
+execution-result-direct, and the existing combinator position assumes the latter.
+
+**Moving it to `infant_result_feedback` (step 4, which DOES run after the oracle pass) doesn't fix
+this either** — whether an infant state is added to the corpus at all is decided at `fuzzer.rs:446`
+(`if is_infant_interesting && !reverted`), gated on step 2's verdict alone. Step 4 can only sponsor
+extra votes for a state some other feedback already added; it can never be the trigger — but
+`DivergenceFeedback`'s own doc comment (`feedbacks.rs:863-864`) says it needs to be exactly that
+trigger (*"the state is marked interesting and the infant-state scheduler votes"*).
+
+### The actual decision needed before implementing
+
+Two real options, both with real cost — this needs product/architecture sign-off, not a unilateral
+pick:
+
+1. **Reorder the shared loop**: swap steps 2 and 3 (`objective` before `infant_feedback`) in
+   `fuzzer.rs`. Blast radius: this is generic, shared machinery used by every fuzzing
+   configuration — `CmpFeedback`/`TokenBalanceFeedback`'s current behavior would need re-verifying
+   under the new order (they don't appear to depend on ordering per the direct-execution-result
+   read above, but "appears not to" is not the same as a full re-audit of every consumer).
+2. **Compute divergence eagerly, decoupled from the Oracle-trait pass**: give `ERC4626Oracle`'s
+   price-comparison logic a path that runs directly off `state.get_execution_result()`/observers
+   right after step 1, independent of the full `OracleFeedback` producer/oracle machinery — so
+   `publish_divergence` fires before step 2 without reordering anything shared. Likely the smaller
+   blast radius, but needs checking whether `ERC4626Oracle`'s price read genuinely only needs data
+   already present in the execution result, or needs the oracle-context setup (`OracleCtx::new`,
+   `campaign_intermediate_states`, `temporal_warps`) that step 3 currently provides.
+
+**Do not proceed with either until one is chosen.** The rest of this spec (below) describes what
+correct behavior looks like once the ordering is fixed — it does not by itself constitute a safe
+implementation plan.
 
 ## Gap 1 — `DivergenceFeedback` is never instantiated (code-verified)
 
@@ -26,7 +88,15 @@ itself produces a `Feedback` impl, it nests — this is the standard LibAFL patt
 more than two feedbacks (already proven by `Sha3WrappedFeedback` wrapping the outer `feedback` at
 `evm_fuzzer.rs:932-937`).
 
-### Fix
+### Fix — INVALID AS WRITTEN, see Gap 0 above
+
+The nesting below is mechanically correct (it does add `DivergenceFeedback` to the combinator) but
+is not a correct fix — per Gap 0, this position in `infant_feedback` runs before the oracle pass
+that would populate `read_divergence()` for the current execution. **Do not implement this without
+first resolving Gap 0's ordering decision.** Kept here only to show the mechanical nesting shape,
+which is still needed once the data-availability problem is fixed (whichever option is chosen —
+reordering the loop or computing divergence eagerly, the endpoint still needs `DivergenceFeedback`
+added to this combinator or its replacement):
 
 ```rust
 let divergence_feedback = crate::evm::feedbacks::DivergenceFeedback::new(infant_scheduler.clone());

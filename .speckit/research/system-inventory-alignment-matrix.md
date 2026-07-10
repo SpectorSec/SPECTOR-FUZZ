@@ -218,9 +218,39 @@ call `publish_divergence` — grepped, zero hits. This is correct, not a gap in 
 spec calls generic (non-ERC4626) divergence publishing "Tier 2" and explicitly scopes it as not yet
 built. The two channels are independent and compose without collision.
 
-**Completion gap, specced:** `.speckit/features/037-wire-divergence-feedback/specify.md` — wire
-`DivergenceFeedback` into the infant-scheduler feedback tuple and give `CompoundSequenceCanary` a
-real consumer, or correct `029/plan.md`'s claim that it already has one.
+**Completion gap — specced, then found BLOCKED on a deeper order-of-operations defect
+(2026-07-10, second pass):** `.speckit/features/037-wire-divergence-feedback/specify.md`. The
+first draft of 037 proposed nesting `DivergenceFeedback` into `infant_feedback`'s existing
+`EagerOrFeedback` combinator. Tracing the actual per-iteration call order in
+`fuzzer.rs::evaluate_input_events` shows this is wrong, not just incomplete:
+
+- `self.infant_feedback.is_interesting(...)` runs at `fuzzer.rs:423-425`.
+- `self.objective.is_interesting(...)` — bound to `OracleFeedback`, confirmed the ONLY place any
+  oracle (including `ERC4626Oracle`, the only current `publish_divergence` caller) actually
+  executes (`feedback.rs:219-220`'s own doc comment) — runs at `fuzzer.rs:427-429`, i.e. AFTER
+  `infant_feedback`.
+- `DIVERGENCE_OBJECTIVE` (`feedbacks.rs:58`) is a thread-local `Cell` never reset between
+  iterations. So `DivergenceFeedback`, if placed in `infant_feedback`, would read the PREVIOUS
+  iteration's published value every time — a silent one-iteration lag, not a crash, not a test
+  failure, just permanently wrong data feeding the infant-scheduler vote.
+- Moving it to `infant_result_feedback` (which does run after the oracle pass) doesn't fix the
+  underlying problem either — whether an infant state is added at all is decided at
+  `fuzzer.rs:446` using ONLY `infant_feedback`'s verdict; a later-running feedback can add extra
+  votes to a state something else already added, but can never be the thing that triggers adding
+  it — which is exactly what `DivergenceFeedback`'s own doc comment says it must do.
+- Confirmed `CmpFeedback`/`TokenBalanceFeedback` (today's `infant_feedback` contents) don't have
+  this problem: `TokenBalanceFeedback::is_interesting` (`feedbacks.rs:689`) reads
+  `state.get_execution_result()` directly, populated synchronously by `run_target()` — no
+  dependency on the later oracle pass. `DivergenceFeedback` is architecturally different (an
+  oracle-produced side-channel, not an execution-result-direct read), and the original spec
+  didn't check that distinction before proposing the same combinator slot.
+
+037 is corrected in place to document this and now requires a design decision (reorder the shared
+per-iteration loop vs. compute divergence eagerly, decoupled from the Oracle-trait pass) before any
+implementation — not ready to hand to local Claude as originally written. This is exactly the class
+of finding this document's method (trace actual data flow, not just reachability) is supposed to
+catch — reachability alone ("is it called") is necessary but not sufficient; timing relative to the
+data it depends on is a separate, equally load-bearing question.
 
 ---
 
