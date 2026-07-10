@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use itertools::Itertools;
-use revm_interpreter::bytecode::Bytecode;
-
 use libafl::prelude::HasMetadata;
+use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{
@@ -12,7 +11,7 @@ use crate::{
         leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::ECHIDNA_BUG_IDX,
-        planner::{PromotionCandidate, TaintProvenanceTag},
+        planner::{PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -82,33 +81,37 @@ impl
             .map(|out| out.iter().map(|x| *x == 0).all(|x| x))
             .collect();
 
-        // Items 3+4 (audit remediation): emit Invariant PromotionCandidate on first violation
-        // so the planner locks the violating call into the campaign. No dedup gate here —
-        // echidna.rs re-evaluates every execution, so the high-water check is the dedup.
+        // Items 3+4 (audit remediation): emit Invariant PromotionCandidate on first
+        // violation so the planner locks the violating call into the campaign.
+        // No dedup gate here — echidna.rs re-evaluates every execution, so the
+        // high-water check is the dedup.
         let any_violated = results.iter().any(|&v| v);
         if any_violated {
-            let already_set = ctx
+            let selector: [u8; 4] = ctx.input.data.as_ref().map(|d| d.function).unwrap_or_default();
+            let candidate = PromotionCandidate {
+                contract: ctx.input.contract,
+                selector,
+                best_inflow: 0,
+                kind: LeakClass::Invariant,
+                taint_provenance: TaintProvenanceTag::default(),
+                phase: None,
+                set: true,
+            };
+            let mut candidates = ctx
                 .fuzz_state
                 .metadata_map()
-                .get::<PromotionCandidate>()
-                .map(|c| c.set)
-                .unwrap_or(false);
-            if !already_set {
-                let selector: [u8; 4] = ctx
-                    .input
-                    .data
-                    .as_ref()
-                    .map(|d| d.function)
-                    .unwrap_or_default();
-                ctx.fuzz_state.metadata_map_mut().insert(PromotionCandidate {
-                    contract: ctx.input.contract,
-                    selector,
-                    best_inflow: 0,
-                    kind: LeakClass::Invariant,
-                    taint_provenance: TaintProvenanceTag::default(),
-                    phase: None,
-                    set: true,
-                });
+                .get::<PromotionCandidates>()
+                .cloned()
+                .or_else(|| {
+                    ctx.fuzz_state
+                        .metadata_map()
+                        .get::<PromotionCandidate>()
+                        .map(PromotionCandidates::from_singleton)
+                })
+                .unwrap_or_default();
+            if candidates.record(candidate.clone()) {
+                ctx.fuzz_state.metadata_map_mut().insert(candidates);
+                ctx.fuzz_state.metadata_map_mut().insert(candidate);
             }
         }
 

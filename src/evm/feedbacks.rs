@@ -13,26 +13,29 @@ use libafl::{
     observers::ObserversTuple,
     prelude::Testcase,
     schedulers::Scheduler,
+    state::HasMetadata,
     Error,
 };
 use libafl_bolts::{impl_serdeany, Named};
-use libafl::state::HasMetadata;
+use revm_primitives::ruint::Uint;
 use serde::{Deserialize, Serialize};
 
 use super::{input::EVMInput, types::EVMFuzzState};
 use crate::{
-    evm::{input::{ConciseEVMInput, EVMInputTy}, middlewares::sha3_bypass::Sha3TaintAnalysis, vm::EVMExecutor},
-    evm::leak_class::LeakClass,
-    evm::planner::{CampaignInflowBoundaries, PromotionCandidate, TaintProvenanceTag},
+    evm::{
+        input::{ConciseEVMInput, EVMInputTy},
+        leak_class::LeakClass,
+        middlewares::sha3_bypass::Sha3TaintAnalysis,
+        planner::{CampaignInflowBoundaries, PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
+        types::{EVMAddress, EVMQueueExecutor, EVMU512},
+        vm::{EVMExecutor, EVMState},
+    },
     generic_vm::vm_state::VMStateT,
     input::VMInputT,
     r#const::INFANT_STATE_INITIAL_VOTES,
     scheduler::HasVote,
     state::{HasExecutionResult, HasInfantStateState, InfantStateState},
-    evm::{types::{EVMAddress, EVMQueueExecutor, EVMU512}, vm::EVMState},
 };
-
-use revm_primitives::ruint::Uint;
 type EVMU256 = Uint<256, 4>;
 
 use std::cell::Cell;
@@ -59,13 +62,14 @@ thread_local! {
     static DIMENSION_FLOW: Cell<TaintDim> = const { Cell::new(TaintDim::Generic) };
 }
 
-/// Publish this execution's raw-inflow objective (Feature 015). Only called when
-/// `reflexive_lever` is on, so off-path this global is never touched.
+/// Publish this execution's raw-inflow objective (Feature 015). Only called
+/// when `reflexive_lever` is on, so off-path this global is never touched.
 pub fn publish_ledger_objective(value: u128) {
     LEDGER_OBJECTIVE.with(|c| c.set(value));
 }
 
-/// Read the last published raw-inflow objective (Feature 015). `0` before any publish.
+/// Read the last published raw-inflow objective (Feature 015). `0` before any
+/// publish.
 pub fn read_ledger_objective() -> u128 {
     LEDGER_OBJECTIVE.with(|c| c.get())
 }
@@ -77,14 +81,15 @@ pub fn publish_divergence(value: u128) {
     DIVERGENCE_OBJECTIVE.with(|c| c.set(value));
 }
 
-/// Read the last published divergence magnitude (Feature 029). `0` before any publish.
+/// Read the last published divergence magnitude (Feature 029). `0` before any
+/// publish.
 pub fn read_divergence() -> u128 {
     DIVERGENCE_OBJECTIVE.with(|c| c.get())
 }
 
-/// Feature 016 Phase 3 — publish the detected dimension flow type from the taint
-/// analysis reexecution. Called from `Sha3WrappedFeedback::is_interesting()` after
-/// CmpLinearityTaint runs.
+/// Feature 016 Phase 3 — publish the detected dimension flow type from the
+/// taint analysis reexecution. Called from
+/// `Sha3WrappedFeedback::is_interesting()` after CmpLinearityTaint runs.
 pub fn publish_located_dim(dim: TaintDim) {
     DIMENSION_FLOW.with(|c| c.set(dim));
 }
@@ -155,11 +160,11 @@ where
                 .is_interesting(state, manager, input, observers, exit_kind)
             {
                 Ok(true) => {
-                        // Feature 009a: clear last input's linearity verdict so the
-                        // concolic-dispatch triage never reads a stale value (step
-                        // inputs get no reexecution → must default to "keep concolic").
-                        #[cfg(feature = "concolic_secant_dispatch")]
-                        crate::evm::middlewares::cmp_linearity::lin_reset_verdict();
+                    // Feature 009a: clear last input's linearity verdict so the
+                    // concolic-dispatch triage never reads a stale value (step
+                    // inputs get no reexecution → must default to "keep concolic").
+                    #[cfg(feature = "concolic_secant_dispatch")]
+                    crate::evm::middlewares::cmp_linearity::lin_reset_verdict();
                     if !input.is_step() {
                         // reexecute with sha3 taint analysis
                         // Use full_reset (not cleanup) so ctxs / prev_opcode /
@@ -214,8 +219,7 @@ where
                     let lin = std::rc::Rc::new(std::cell::RefCell::new(
                         crate::evm::middlewares::cmp_linearity::CmpLinearityTaint::new(),
                     ));
-                    (self.evm_executor.deref().borrow_mut())
-                        .reexecute_with_middleware(input, state, lin);
+                    (self.evm_executor.deref().borrow_mut()).reexecute_with_middleware(input, state, lin);
                     // Feature 013 Phase 2+5: four-link chain verdict.
                     crate::evm::middlewares::cmp_linearity::injection_chain_verdict();
                     unsafe {
@@ -224,8 +228,11 @@ where
                     // Feature 016 Phase 3: publish the detected dimension flow type.
                     {
                         use crate::evm::middlewares::cmp_linearity::{
-                            PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
-                            TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
+                            ACCUMULATOR_INFLATION_FLOW,
+                            PRICE_MANIPULATION_FLOW,
+                            PROXY_TAINT_FLOW,
+                            TIMESTAMP_DIM_LOCATED,
+                            TIMESTAMP_TAINT_WRITTEN,
                         };
                         let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
                             TaintDim::Price
@@ -316,20 +323,23 @@ pub struct TokenBalanceFeedback<SC> {
     best_inflow: HashMap<EVMAddress, EVMU256>,
     scheduler: SC,
     /// Feature 011 (Part A): when true, interestingness is gated on a new
-    /// *realized-ETH* ceiling rather than the raw token-unit ceiling. When false
-    /// the executor ref is `None` and this struct behaves exactly as before.
+    /// *realized-ETH* ceiling rather than the raw token-unit ceiling. When
+    /// false the executor ref is `None` and this struct behaves exactly as
+    /// before.
     eth_gradient: bool,
     /// Liquidation engine, used only when `eth_gradient` is on, to value token
     /// inflows in ETH via `EVMExecutor::value_token_inflow_eth`. Concrete
-    /// `EVMQueueExecutor` (same ref the executor/concolic stage hold) so no extra
-    /// generic param is threaded through the feedback tuple.
+    /// `EVMQueueExecutor` (same ref the executor/concolic stage hold) so no
+    /// extra generic param is threaded through the feedback tuple.
     evm_executor: Option<Rc<RefCell<EVMQueueExecutor>>>,
     /// Feature 011 (Part A): best realized-ETH total (raw `earned`-delta scale)
-    /// seen across executions. A new max is the ETH-denominated interesting event.
+    /// seen across executions. A new max is the ETH-denominated interesting
+    /// event.
     best_eth_total: EVMU512,
-    /// Feature 015: when true, publish this execution's summed raw attacker inflow to
-    /// `LEDGER_OBJECTIVE` so the ledger-secant can amplify the promoted lever. Purely
-    /// additive — the survivor selection (net-ETH ceiling) is unchanged.
+    /// Feature 015: when true, publish this execution's summed raw attacker
+    /// inflow to `LEDGER_OBJECTIVE` so the ledger-secant can amplify the
+    /// promoted lever. Purely additive — the survivor selection (net-ETH
+    /// ceiling) is unchanged.
     reflexive_lever: bool,
 }
 
@@ -352,43 +362,45 @@ impl<SC> TokenBalanceFeedback<SC> {
         }
     }
 
-    /// Feature 015 Phase 2 (a-posteriori Promote): attribute per-step attacker inflow across
-    /// an armed campaign and record the single largest ledger-moving belly call as a
-    /// `PromotionCandidate`. The atomic campaign accumulates one ordered `erc20_transfers` log;
-    /// the executor stamped step-boundary offsets (`CampaignInflowBoundaries`) so step `i`'s
-    /// transfers are the slice `[offsets[i]..offsets[i+1]]`. We keep only the highest-inflow
-    /// step above `APOSTERIORI_MIN_INFLOW` (one lever/frame — bounds over-promotion against the
-    /// 3.5GB ceiling), and only replace the incumbent on a strictly larger delta (high-water).
-    /// The mutator later pins the matching step into `promoted` for Locate+Amplify.
+    /// Feature 015 Phase 2 (a-posteriori Promote): attribute per-step attacker
+    /// inflow across an armed campaign and record the single largest
+    /// ledger-moving belly call as a `PromotionCandidate`. The atomic
+    /// campaign accumulates one ordered `erc20_transfers` log; the executor
+    /// stamped step-boundary offsets (`CampaignInflowBoundaries`) so step `i`'s
+    /// transfers are the slice `[offsets[i]..offsets[i+1]]`. We keep only the
+    /// highest-inflow step above `APOSTERIORI_MIN_INFLOW` (one lever/frame
+    /// — bounds over-promotion against the 3.5GB ceiling), and only replace
+    /// the incumbent on a strictly larger delta (high-water). The mutator
+    /// later pins the matching step into `promoted` for Locate+Amplify.
     ///
-    /// Entirely gated: fires only when `reflexive_lever` is on and the campaign was armed
-    /// (`aposteriori && promoted.is_empty()`), so off-path it is a couple of cheap checks.
+    /// Entirely gated: fires only when `reflexive_lever` is on and the campaign
+    /// was armed (`aposteriori && promoted.is_empty()`), so off-path it is
+    /// a couple of cheap checks.
     fn record_aposteriori_candidate(&self, state: &mut EVMFuzzState, input: &EVMInput) {
         let Some(campaign) = &input.campaign else { return };
         if !campaign.aposteriori || !campaign.promoted.is_empty() {
             return;
         }
 
-        // Snapshot transfers + revert flag, then drop the execution-result borrow so the
-        // metadata write below can take &mut state.
+        // Snapshot transfers + revert flag, then drop the execution-result borrow so
+        // the metadata write below can take &mut state.
         let (transfers, reverted) = {
             let result = state.get_execution_result();
-            (
-                result.new_state.state.erc20_transfers.clone(),
-                result.reverted,
-            )
+            (result.new_state.state.erc20_transfers.clone(), result.reverted)
         };
         if reverted {
             return;
         }
 
-        // Boundary offsets recorded by the campaign executor (one per step + a trailing close).
+        // Boundary offsets recorded by the campaign executor (one per step + a trailing
+        // close).
         let offsets = match state.metadata_map().get::<CampaignInflowBoundaries>() {
             Some(b) if b.offsets.len() == campaign.steps.len() + 1 => b.offsets.clone(),
             _ => return,
         };
 
-        // Attribute per-step attacker inflow; keep the single largest mover above the floor.
+        // Attribute per-step attacker inflow; keep the single largest mover above the
+        // floor.
         let Some((idx, inflow)) = best_inflow_step(
             &campaign.steps,
             &transfers,
@@ -402,18 +414,19 @@ impl<SC> TokenBalanceFeedback<SC> {
         let selector = step.data.as_ref().map(|d| d.function).unwrap_or_default();
         let contract = step.contract;
 
-        // Feature 021 (Taint↔Promotion Weld) — the taint half of the AND-gate. `best_inflow_step`
-        // already enforced materiality (inflow above the a-posteriori floor); the ledger call is
-        // real. Now require the causal receipt: was that ledger move DELIVERED by attacker input?
-        // `injection_causal_link_confirmed()` is fail-OPEN when the taint analysis did not run
-        // (non-concolic builds / step inputs), so this can only ever *reduce* promotions, never
-        // add reach. When the analysis RAN and found no provenance, we suppress: a material state
-        // change with no attacker-delivery path is a source-less phantom (the burn(0)/mint(0)
-        // family). Suppress BEFORE the high-water check so a phantom never sets the incumbent.
-        let mut analysis_ran =
-            crate::evm::middlewares::cmp_linearity::injection_analysis_ran();
-        let mut causally_linked =
-            crate::evm::middlewares::cmp_linearity::injection_causal_link_confirmed();
+        // Feature 021 (Taint↔Promotion Weld) — the taint half of the AND-gate.
+        // `best_inflow_step` already enforced materiality (inflow above the
+        // a-posteriori floor); the ledger call is real. Now require the causal
+        // receipt: was that ledger move DELIVERED by attacker input?
+        // `injection_causal_link_confirmed()` is fail-OPEN when the taint analysis did
+        // not run (non-concolic builds / step inputs), so this can only ever
+        // *reduce* promotions, never add reach. When the analysis RAN and found
+        // no provenance, we suppress: a material state change with no
+        // attacker-delivery path is a source-less phantom (the burn(0)/mint(0)
+        // family). Suppress BEFORE the high-water check so a phantom never sets the
+        // incumbent.
+        let mut analysis_ran = crate::evm::middlewares::cmp_linearity::injection_analysis_ran();
+        let mut causally_linked = crate::evm::middlewares::cmp_linearity::injection_causal_link_confirmed();
 
         #[cfg(feature = "concolic_secant_dispatch")]
         if !analysis_ran {
@@ -429,8 +442,11 @@ impl<SC> TokenBalanceFeedback<SC> {
             // Publish JIT dimension
             {
                 use crate::evm::middlewares::cmp_linearity::{
-                    PRICE_MANIPULATION_FLOW, PROXY_TAINT_FLOW, ACCUMULATOR_INFLATION_FLOW,
-                    TIMESTAMP_TAINT_WRITTEN, TIMESTAMP_DIM_LOCATED,
+                    ACCUMULATOR_INFLATION_FLOW,
+                    PRICE_MANIPULATION_FLOW,
+                    PROXY_TAINT_FLOW,
+                    TIMESTAMP_DIM_LOCATED,
+                    TIMESTAMP_TAINT_WRITTEN,
                 };
                 let dim = if unsafe { PRICE_MANIPULATION_FLOW } {
                     TaintDim::Price
@@ -452,7 +468,10 @@ impl<SC> TokenBalanceFeedback<SC> {
             tracing::info!(
                 "[weld] suppressed SOURCE-LESS candidate: step={} contract={:?} selector=0x{} \
                  inflow={} (materiality present, taint provenance ABSENT)",
-                idx, contract, hex::encode(selector), inflow
+                idx,
+                contract,
+                hex::encode(selector),
+                inflow
             );
             return;
         }
@@ -462,19 +481,33 @@ impl<SC> TokenBalanceFeedback<SC> {
             dim: read_located_dim(),
         };
 
-        // High-water: only a strictly larger delta unseats the incumbent candidate.
-        let incumbent = state
+        // High-water within the Value slot only. Other leak classes keep their own
+        // candidates; a structural/invariant finding should not suppress a
+        // later value inflow merely because it reported first.
+        let existing_candidates = state
             .metadata_map()
-            .get::<PromotionCandidate>()
-            .filter(|c| c.set)
+            .get::<PromotionCandidates>()
+            .cloned()
+            .or_else(|| {
+                state
+                    .metadata_map()
+                    .get::<PromotionCandidate>()
+                    .map(PromotionCandidates::from_singleton)
+            })
+            .unwrap_or_default();
+        let incumbent = existing_candidates
+            .get(LeakClass::Value)
             .map(|c| c.best_inflow)
             .unwrap_or(0);
         if inflow > incumbent {
             tracing::info!(
                 "[aposteriori-tel] promotion candidate: step={} contract={:?} selector=0x{} inflow={}",
-                idx, contract, hex::encode(selector), inflow
+                idx,
+                contract,
+                hex::encode(selector),
+                inflow
             );
-            state.add_metadata(PromotionCandidate {
+            let candidate = PromotionCandidate {
                 contract,
                 selector,
                 best_inflow: inflow,
@@ -486,7 +519,11 @@ impl<SC> TokenBalanceFeedback<SC> {
                 // 023: the belly-call step this inflow was attributed to.
                 phase: Some(idx),
                 set: true,
-            });
+            };
+            let mut candidates = existing_candidates;
+            candidates.record(candidate.clone());
+            state.add_metadata(candidates);
+            state.add_metadata(candidate);
         }
 
         // Feature 029 Phase 2 — compound sequence canary (liquid → amplify edge).
@@ -533,18 +570,21 @@ pub struct CompoundSequenceCanary {
 }
 impl_serdeany!(CompoundSequenceCanary);
 
-/// Feature 015 Phase 2 — dust floor for a-posteriori promotion: an attributed per-step
-/// attacker inflow must clear this to be a candidate (rejects rounding/refund noise). 1e15 raw
-/// units ≈ 0.001 of an 18-decimal token; below-decimal tokens (e.g. 6-dec USDC) clear it at
-/// ~1e9 human units, which is well past dust. A live-tuning parameter, deliberately generous.
+/// Feature 015 Phase 2 — dust floor for a-posteriori promotion: an attributed
+/// per-step attacker inflow must clear this to be a candidate (rejects
+/// rounding/refund noise). 1e15 raw units ≈ 0.001 of an 18-decimal token;
+/// below-decimal tokens (e.g. 6-dec USDC) clear it at ~1e9 human units, which
+/// is well past dust. A live-tuning parameter, deliberately generous.
 const APOSTERIORI_MIN_INFLOW: u128 = 1_000_000_000_000_000;
 
-/// Feature 015 Phase 2 — pure per-step attacker-inflow attribution. Given the campaign's
-/// ordered `erc20_transfers` log, the executor's boundary `offsets` (`len == steps.len()+1`,
-/// so step `i`'s transfers are `[offsets[i]..offsets[i+1]]`), the attacker set and a dust
-/// floor, return the `(step_index, inflow)` of the SINGLE largest ledger-moving belly call, or
-/// `None`. Borrow and selector-less steps are skipped (nothing to pin/tune). Extracted from
-/// `record_aposteriori_candidate` so the attribution is unit-testable without a live fork.
+/// Feature 015 Phase 2 — pure per-step attacker-inflow attribution. Given the
+/// campaign's ordered `erc20_transfers` log, the executor's boundary `offsets`
+/// (`len == steps.len()+1`, so step `i`'s transfers are
+/// `[offsets[i]..offsets[i+1]]`), the attacker set and a dust floor, return the
+/// `(step_index, inflow)` of the SINGLE largest ledger-moving belly call, or
+/// `None`. Borrow and selector-less steps are skipped (nothing to pin/tune).
+/// Extracted from `record_aposteriori_candidate` so the attribution is
+/// unit-testable without a live fork.
 fn best_inflow_step(
     steps: &[ConciseEVMInput],
     transfers: &[(EVMAddress, EVMAddress, EVMAddress, EVMU256)],
@@ -582,12 +622,13 @@ fn best_inflow_step(
 /// per-(attacker, token) inflows, valuing each via the injected `value_one`.
 ///
 /// In production `value_one` calls the liquidation engine
-/// (`EVMExecutor::value_token_inflow_eth`); in tests it is a fake rate table, so the
-/// value-inversion decision (expensive-small pile out-ranks cheap-large pile) is
-/// unit-testable without a live engine or an `EVMFuzzState`. Inflows the valuator
-/// cannot price (`None`) are skipped.
-/// Feature 015 — saturating EVMU256 → u128 (the ledger objective is u128, matching the
-/// secant's arg-amount domain). Values above 2^128 clamp to `u128::MAX`.
+/// (`EVMExecutor::value_token_inflow_eth`); in tests it is a fake rate table,
+/// so the value-inversion decision (expensive-small pile out-ranks cheap-large
+/// pile) is unit-testable without a live engine or an `EVMFuzzState`. Inflows
+/// the valuator cannot price (`None`) are skipped.
+/// Feature 015 — saturating EVMU256 → u128 (the ledger objective is u128,
+/// matching the secant's arg-amount domain). Values above 2^128 clamp to
+/// `u128::MAX`.
 pub(crate) fn evmu256_to_u128_sat_fb(v: EVMU256) -> u128 {
     let limbs = v.as_limbs(); // [u64; 4], little-endian
     if limbs[2] != 0 || limbs[3] != 0 {
@@ -648,9 +689,10 @@ where
         let result = state.get_execution_result();
 
         // Feature 015: publish the raw-inflow AMPLIFY objective on EVERY execution
-        // (reverts / zero-inflow ⇒ 0) BEFORE any early return, so the ledger-secant reads
-        // a wrong lever amount as a drop rather than a stale value. One cheap scan,
-        // engine-free, only when the flag is on ⇒ off-path this global is never written.
+        // (reverts / zero-inflow ⇒ 0) BEFORE any early return, so the ledger-secant
+        // reads a wrong lever amount as a drop rather than a stale value. One
+        // cheap scan, engine-free, only when the flag is on ⇒ off-path this
+        // global is never written.
         if self.reflexive_lever {
             let obj: u128 = if result.reverted {
                 0
@@ -666,14 +708,16 @@ where
             publish_ledger_objective(obj);
         }
 
-        // Feature 015 Phase 2 (a-posteriori Promote): discover the ledger-moving belly call
-        // and record it as a promotion candidate. Self-gates on an armed campaign, so this is
-        // inert unless `--reflexive-lever` is on AND the planner found no a-priori archetype.
+        // Feature 015 Phase 2 (a-posteriori Promote): discover the ledger-moving belly
+        // call and record it as a promotion candidate. Self-gates on an armed
+        // campaign, so this is inert unless `--reflexive-lever` is on AND the
+        // planner found no a-priori archetype.
         if self.reflexive_lever {
             self.record_aposteriori_candidate(state, input);
         }
 
-        // Re-borrow the execution result after the (possibly &mut) candidate write above.
+        // Re-borrow the execution result after the (possibly &mut) candidate write
+        // above.
         let result = state.get_execution_result();
 
         if result.reverted {
@@ -753,8 +797,9 @@ where
         // executor exactly as found — valuation must be side-effect free
         // (`value_token_inflow_eth` snapshots/restores internally per call; we also
         // restore the post-state we install here). The aggregation itself lives in the
-        // pure `aggregate_eth_inflow` seam so the value-inversion logic is unit-testable
-        // without a live engine (the closure is the injection point).
+        // pure `aggregate_eth_inflow` seam so the value-inversion logic is
+        // unit-testable without a live engine (the closure is the injection
+        // point).
         let post_state = state.get_execution_result().new_state.state.clone();
         // Cost/credit already accrued this execution (same scale!() units the engine
         // credits, so directly comparable to the gross inflow value below):
@@ -774,15 +819,17 @@ where
             total
         };
 
-        // NET realized value, not gross. Ranking by gross inflow chases flashloan-funded
-        // swaps (e.g. borrow 4722 ETH → buy USDC) that look enormous but net ~0 after
-        // the spend — observed live on the Yearn fork. Subtracting `owed` makes the
-        // gradient climb actual profit: the mirage collapses to 0, a real drain stands.
+        // NET realized value, not gross. Ranking by gross inflow chases
+        // flashloan-funded swaps (e.g. borrow 4722 ETH → buy USDC) that look
+        // enormous but net ~0 after the spend — observed live on the Yearn
+        // fork. Subtracting `owed` makes the gradient climb actual profit: the
+        // mirage collapses to 0, a real drain stands.
         let net_eth = net_realized(gross_eth, prior_earned, owed);
 
-        // Interesting iff a new realized-NET-ETH ceiling. This is what makes the gradient
-        // value-aware: a small pile of an expensive token out-ranks a large pile of a
-        // thin-liquidity token (SC-2), and a big-but-unprofitable swap out-ranks nothing.
+        // Interesting iff a new realized-NET-ETH ceiling. This is what makes the
+        // gradient value-aware: a small pile of an expensive token out-ranks a
+        // large pile of a thin-liquidity token (SC-2), and a
+        // big-but-unprofitable swap out-ranks nothing.
         if net_eth > self.best_eth_total {
             self.best_eth_total = net_eth;
             self.scheduler.vote(
@@ -796,29 +843,33 @@ where
     }
 }
 
-/// Feature 011 (Part A) — net realized value of an execution, in `scale!()` units.
+/// Feature 011 (Part A) — net realized value of an execution, in `scale!()`
+/// units.
 ///
 /// `gross` = ETH value of attacker token inflows (liquidated via the engine),
-/// `earned` = native ETH already returned to the attacker, `owed` = ETH the attacker
-/// spent/borrowed. Net = (gross + earned) − owed, saturating at 0: a position that
-/// cost more than it returned is not profit and must not advance the gradient.
-/// Pure and unit-tested so the gross-vs-net decision is pinned independent of the engine.
+/// `earned` = native ETH already returned to the attacker, `owed` = ETH the
+/// attacker spent/borrowed. Net = (gross + earned) − owed, saturating at 0: a
+/// position that cost more than it returned is not profit and must not advance
+/// the gradient. Pure and unit-tested so the gross-vs-net decision is pinned
+/// independent of the engine.
 fn net_realized(gross: EVMU512, earned: EVMU512, owed: EVMU512) -> EVMU512 {
     gross.saturating_add(earned).saturating_sub(owed)
 }
 
 /// Feature 029 — DivergenceFeedback (the scheduler gradient for Phase 1).
 ///
-/// Mirrors `TokenBalanceFeedback` but tracks oracle divergence magnitude per `bug_idx`
-/// (not per-token extraction). When divergence hits a new ceiling, the state is marked
-/// interesting and the infant-state scheduler votes, causing the fuzzer to explore
-/// sequences that maximize oracle break magnitude — the "inner loop" that discovers the
-/// compound ceiling before extraction begins.
+/// Mirrors `TokenBalanceFeedback` but tracks oracle divergence magnitude per
+/// `bug_idx` (not per-token extraction). When divergence hits a new ceiling,
+/// the state is marked interesting and the infant-state scheduler votes,
+/// causing the fuzzer to explore sequences that maximize oracle break magnitude
+/// — the "inner loop" that discovers the compound ceiling before extraction
+/// begins.
 ///
-/// Naturally uncontested during Phase 1 because `TokenBalanceFeedback` sees zero
-/// attacker inflow (deposits/donations have no `erc20_transfers` to the attacker set),
-/// so it never votes. Once `DivergenceSecantState.pin_gate` is set (divergence peaked),
-/// this feedback stops voting and Phase 3 extraction takes over.
+/// Naturally uncontested during Phase 1 because `TokenBalanceFeedback` sees
+/// zero attacker inflow (deposits/donations have no `erc20_transfers` to the
+/// attacker set), so it never votes. Once `DivergenceSecantState.pin_gate` is
+/// set (divergence peaked), this feedback stops voting and Phase 3 extraction
+/// takes over.
 pub struct DivergenceFeedback<SC> {
     best_divergence: HashMap<u64, u128>,
     scheduler: SC,
@@ -880,8 +931,9 @@ where
             }
         }
 
-        // Use bug_idx 0 as the aggregate divergence key (the beachhead: one divergence per execution).
-        // Future: key per-oracle bug_idx once multiple divergences publish concurrently.
+        // Use bug_idx 0 as the aggregate divergence key (the beachhead: one divergence
+        // per execution). Future: key per-oracle bug_idx once multiple
+        // divergences publish concurrently.
         let key = 0u64;
         let best = self.best_divergence.entry(key).or_insert(0);
         if divergence > *best {
@@ -906,10 +958,10 @@ mod impact_011_tests {
         EVMAddress::from([b; 20])
     }
 
-    /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed inert —
-    /// no engine ref is held, so `is_interesting` takes the original early-return path
-    /// and the new code is unreachable. (Full byte-for-byte e2e regression is the
-    /// Lane-A run, T8.)
+    /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed
+    /// inert — no engine ref is held, so `is_interesting` takes the
+    /// original early-return path and the new code is unreachable. (Full
+    /// byte-for-byte e2e regression is the Lane-A run, T8.)
     #[test]
     fn eth_gradient_off_is_inert() {
         let fb = TokenBalanceFeedback::<()>::new(HashSet::new(), (), false, None, false);
@@ -918,9 +970,10 @@ mod impact_011_tests {
         assert_eq!(fb.best_eth_total, EVMU512::ZERO);
     }
 
-    /// T7 / SC-2: the gradient must rank by realized ETH, not raw token units. A large
-    /// pile of a cheap token has more *units* but a small pile of an expensive token has
-    /// more *ETH* — the ETH valuation must invert the raw-unit ranking.
+    /// T7 / SC-2: the gradient must rank by realized ETH, not raw token units.
+    /// A large pile of a cheap token has more *units* but a small pile of
+    /// an expensive token has more *ETH* — the ETH valuation must invert
+    /// the raw-unit ranking.
     #[test]
     fn eth_value_beats_token_units() {
         let attacker = addr(1);
@@ -960,7 +1013,8 @@ mod impact_011_tests {
         );
     }
 
-    /// Inflows the valuator cannot price are skipped, not counted as zero-blocking.
+    /// Inflows the valuator cannot price are skipped, not counted as
+    /// zero-blocking.
     #[test]
     fn unpriceable_inflows_are_skipped() {
         let pairs: HashMap<(EVMAddress, EVMAddress), EVMU256> =
@@ -969,45 +1023,53 @@ mod impact_011_tests {
         assert_eq!(total, EVMU512::ZERO);
     }
 
-    /// The gross-inflow mirage: a flashloan-funded swap acquires a huge gross inflow
-    /// but spends just as much (owed). Net must collapse to 0 so it does NOT advance
-    /// the gradient — this is the live Yearn finding (4722 ETH swap, ~0 net) encoded.
+    /// The gross-inflow mirage: a flashloan-funded swap acquires a huge gross
+    /// inflow but spends just as much (owed). Net must collapse to 0 so it
+    /// does NOT advance the gradient — this is the live Yearn finding (4722
+    /// ETH swap, ~0 net) encoded.
     #[test]
     fn gross_mirage_nets_zero() {
         let huge = EVMU512::from(4_722_000_000_000_000_000_000u128); // ~4722 ETH gross
         let owed = EVMU512::from(4_722_000_000_000_000_000_000u128); // spent the same
         assert_eq!(net_realized(huge, EVMU512::ZERO, owed), EVMU512::ZERO);
 
-        // A position that cost MORE than it returned is a loss → saturates to 0, never negative.
+        // A position that cost MORE than it returned is a loss → saturates to 0, never
+        // negative.
         let loss = net_realized(EVMU512::from(100u64), EVMU512::ZERO, EVMU512::from(150u64));
         assert_eq!(loss, EVMU512::ZERO);
     }
 
-    /// A real drain (little spent, much extracted) yields positive net and out-ranks
-    /// the mirage — the gradient now climbs profit, not gross.
+    /// A real drain (little spent, much extracted) yields positive net and
+    /// out-ranks the mirage — the gradient now climbs profit, not gross.
     #[test]
     fn real_profit_beats_mirage() {
         let real = net_realized(EVMU512::from(6u64), EVMU512::ZERO, EVMU512::from(1u64)); // drain
-        let mirage = net_realized(
-            EVMU512::from(4_722_000u64),
-            EVMU512::ZERO,
-            EVMU512::from(4_722_000u64),
-        ); // big swap, ~0 net
-        assert!(real > mirage, "real profit ({real}) must out-rank gross mirage ({mirage})");
+        let mirage = net_realized(EVMU512::from(4_722_000u64), EVMU512::ZERO, EVMU512::from(4_722_000u64)); // big swap, ~0 net
+        assert!(
+            real > mirage,
+            "real profit ({real}) must out-rank gross mirage ({mirage})"
+        );
         assert_eq!(mirage, EVMU512::ZERO);
     }
 
     // ── Feature 015 Phase 2 (T10) — a-posteriori per-step inflow attribution ──
 
-    use crate::evm::abi::{AEmpty, BoxedABI};
-    use crate::evm::input::{ConciseEVMInput, EVMInputTy};
+    use crate::evm::{
+        abi::{AEmpty, BoxedABI},
+        input::{ConciseEVMInput, EVMInputTy},
+    };
 
-    /// A campaign step: `Borrow` (no data) or an `ABI` call carrying an (empty) BoxedABI so
-    /// `data.is_some()`. `best_inflow_step` only checks presence, not the selector bytes.
+    /// A campaign step: `Borrow` (no data) or an `ABI` call carrying an (empty)
+    /// BoxedABI so `data.is_some()`. `best_inflow_step` only checks
+    /// presence, not the selector bytes.
     fn step(borrow: bool, with_data: bool) -> ConciseEVMInput {
         ConciseEVMInput {
             input_type: if borrow { EVMInputTy::Borrow } else { EVMInputTy::ABI },
-            data: if with_data { Some(BoxedABI::new(Box::new(AEmpty {}))) } else { None },
+            data: if with_data {
+                Some(BoxedABI::new(Box::new(AEmpty {})))
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
@@ -1019,14 +1081,16 @@ mod impact_011_tests {
 
     const E18: u128 = 1_000_000_000_000_000_000;
 
-    /// The single largest ledger-moving belly call is attributed to its step. Steps:
-    /// 0=borrow (skipped), 1=big inflow, 2=small inflow. Boundaries carve the ordered log.
+    /// The single largest ledger-moving belly call is attributed to its step.
+    /// Steps: 0=borrow (skipped), 1=big inflow, 2=small inflow. Boundaries
+    /// carve the ordered log.
     #[test]
     fn aposteriori_attributes_largest_step() {
         let attacker = addr(1);
         let attackers: HashSet<EVMAddress> = [attacker].into_iter().collect();
         let steps = [step(true, false), step(false, true), step(false, true)];
-        // step1 = transfers[0..2] (8e18), step2 = transfers[2..3] (1e18); borrow slice empty.
+        // step1 = transfers[0..2] (8e18), step2 = transfers[2..3] (1e18); borrow slice
+        // empty.
         let transfers = vec![
             xfer(attacker, 5 * E18),
             xfer(attacker, 3 * E18),
@@ -1037,7 +1101,8 @@ mod impact_011_tests {
         assert_eq!(got, Some((1, 8 * E18)), "step 1 is the biggest ledger mover");
     }
 
-    /// Dust below the floor produces no candidate (rejects rounding/refund noise).
+    /// Dust below the floor produces no candidate (rejects rounding/refund
+    /// noise).
     #[test]
     fn aposteriori_rejects_below_threshold() {
         let attacker = addr(1);
@@ -1049,8 +1114,9 @@ mod impact_011_tests {
         assert_eq!(got, None, "sub-floor dust must not become a candidate");
     }
 
-    /// Borrow steps and selector-less steps are skipped even with huge inflow in their slice
-    /// (a flashloan credit is not the lever). Only the real ABI call is attributed.
+    /// Borrow steps and selector-less steps are skipped even with huge inflow
+    /// in their slice (a flashloan credit is not the lever). Only the real
+    /// ABI call is attributed.
     #[test]
     fn aposteriori_skips_borrow_and_selectorless() {
         let attacker = addr(1);
@@ -1067,7 +1133,8 @@ mod impact_011_tests {
         assert_eq!(got, Some((2, 2 * E18)), "only the tunable ABI step is a candidate");
     }
 
-    /// Inflow to a non-attacker address is not the adversary's ledger → no candidate.
+    /// Inflow to a non-attacker address is not the adversary's ledger → no
+    /// candidate.
     #[test]
     fn aposteriori_ignores_non_attacker_inflow() {
         let attackers: HashSet<EVMAddress> = [addr(1)].into_iter().collect();
@@ -1078,7 +1145,8 @@ mod impact_011_tests {
         assert_eq!(got, None, "non-attacker inflow is not promotable");
     }
 
-    /// Malformed boundaries (`offsets.len() != steps.len()+1`) are rejected defensively.
+    /// Malformed boundaries (`offsets.len() != steps.len()+1`) are rejected
+    /// defensively.
     #[test]
     fn aposteriori_rejects_malformed_offsets() {
         let attackers: HashSet<EVMAddress> = [addr(1)].into_iter().collect();
@@ -1090,15 +1158,19 @@ mod impact_011_tests {
 
     // ── Phase-1 silence proof: deposit pattern produces zero attacker inflow ──
 
-    /// A deposit-or-donate transfer pattern (to the vault/contract, not the attacker)
-    /// produces zero attacker inflow. This is why TokenBalanceFeedback is naturally
-    /// silent during Phase-1 divergence setup — the scheduler is uncontested.
+    /// A deposit-or-donate transfer pattern (to the vault/contract, not the
+    /// attacker) produces zero attacker inflow. This is why
+    /// TokenBalanceFeedback is naturally silent during Phase-1 divergence
+    /// setup — the scheduler is uncontested.
     ///
     /// Two deposit scenarios:
-    ///   1. Transfer to vault (to != attacker) — skipped by the attacker filter.
-    ///   2. Transfer to attacker but value is 0 (rounding to zero shares) — skipped
-    ///      by the `value > 0` guard in the inflow aggregation (feedbacks.rs:631).
-    /// Both produce empty inflow_by_token → `is_interesting` returns Ok(false) → no vote.
+    ///   1. Transfer to vault (to != attacker) — skipped by the attacker
+    ///      filter.
+    ///   2. Transfer to attacker but value is 0 (rounding to zero shares) —
+    ///      skipped by the `value > 0` guard in the inflow aggregation
+    ///      (feedbacks.rs:631).
+    /// Both produce empty inflow_by_token → `is_interesting` returns Ok(false)
+    /// → no vote.
     #[test]
     fn deposit_transfer_to_contract_yields_no_inflow() {
         let attacker = addr(1);
@@ -1109,9 +1181,7 @@ mod impact_011_tests {
 
         // Scenario 1: underlying token goes to vault, not attacker.
         let mut inflow_by_token: HashMap<EVMAddress, EVMU256> = HashMap::new();
-        let transfers_to_vault = vec![
-            (underlying, attacker, vault, EVMU256::from(100_000u64)),
-        ];
+        let transfers_to_vault = vec![(underlying, attacker, vault, EVMU256::from(100_000u64))];
         for (token, _from, to, value) in &transfers_to_vault {
             if attackers.contains(to) && *value > EVMU256::ZERO {
                 *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;
@@ -1124,9 +1194,7 @@ mod impact_011_tests {
 
         // Scenario 2: share minted to attacker but value is zero (inflation rounding).
         inflow_by_token.clear();
-        let transfers_zero_shares = vec![
-            (share, vault, attacker, EVMU256::ZERO),
-        ];
+        let transfers_zero_shares = vec![(share, vault, attacker, EVMU256::ZERO)];
         for (token, _from, to, value) in &transfers_zero_shares {
             if attackers.contains(to) && *value > EVMU256::ZERO {
                 *inflow_by_token.entry(*token).or_insert(EVMU256::ZERO) += *value;

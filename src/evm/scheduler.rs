@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     host::{BRANCH_STATUS, BRANCH_STATUS_IDX},
-    planner::PromotionCandidate,
+    planner::{PromotionCandidate, PromotionCandidates},
     topology::TopologyHints,
     types::EVMAddress,
 };
@@ -122,16 +122,19 @@ pub struct PowerABITestcaseMetadata {
     pub topology_hits: u32,
     /// Feature 026 Phase A — how many times this testcase received the
     /// Promote→Scheduler economic boost. Sibling of `topology_hits` so the two
-    /// pressures decay independently (a topology-shaped step and a promoted lever
-    /// are different signals). `#[serde(default)]` = corpus back-compat.
+    /// pressures decay independently (a topology-shaped step and a promoted
+    /// lever are different signals). `#[serde(default)]` = corpus
+    /// back-compat.
     #[serde(default)]
     pub promote_hits: u32,
-    /// Feature 026 Phase B — the economic dimension this testcase's execution exhibited,
-    /// snapshotted from the (per-execution) flow-flags at mint time (on_add). Enables the
-    /// `dim_flow→scheduler` energy steer without reading `static mut` flags at score time.
+    /// Feature 026 Phase B — the economic dimension this testcase's execution
+    /// exhibited, snapshotted from the (per-execution) flow-flags at mint
+    /// time (on_add). Enables the `dim_flow→scheduler` energy steer without
+    /// reading `static mut` flags at score time.
     #[serde(default)]
     pub located_dim: TaintDim,
-    /// Feature 026 Phase B — decay counter for the dimension boost (sibling of the other two).
+    /// Feature 026 Phase B — decay counter for the dimension boost (sibling of
+    /// the other two).
     #[serde(default)]
     pub dim_hits: u32,
 }
@@ -140,27 +143,35 @@ impl PowerABITestcaseMetadata {
     /// Create new [`struct@SchedulerTestcaseMetadata`]
     #[must_use]
     pub fn new(lines: usize) -> Self {
-        Self { lines, topology_hits: 0, promote_hits: 0, located_dim: TaintDim::Generic, dim_hits: 0 }
+        Self {
+            lines,
+            topology_hits: 0,
+            promote_hits: 0,
+            located_dim: TaintDim::Generic,
+            dim_hits: 0,
+        }
     }
 }
 
-/// Feature 026 Phase A — the Promote→Scheduler energy multiplier at a given decay tick.
-/// Pure, unit-testable (cf. the 025 `secant_promotable` precedent). `PROMOTE_BOOST` is the
-/// full early boost applied to an input exercising the promoted (contract, selector); it
-/// decays exponentially with each hit (mirror of the topology gamma-ray boost) so a promoted
-/// lever gets front-loaded pressure without permanently trapping the search:
-///   hits=0 → 2.0x   ·   hits→∞ → 1.0x (neutral).
+/// Feature 026 Phase A — the Promote→Scheduler energy multiplier at a given
+/// decay tick. Pure, unit-testable (cf. the 025 `secant_promotable` precedent).
+/// `PROMOTE_BOOST` is the full early boost applied to an input exercising the
+/// promoted (contract, selector); it decays exponentially with each hit (mirror
+/// of the topology gamma-ray boost) so a promoted lever gets front-loaded
+/// pressure without permanently trapping the search:   hits=0 → 2.0x   ·
+/// hits→∞ → 1.0x (neutral).
 fn promote_boost(hits: u32) -> f64 {
     const PROMOTE_BOOST: f64 = 2.0;
     let decay = 0.95_f64.powi(hits as i32);
     1.0 + (PROMOTE_BOOST - 1.0) * decay
 }
 
-/// Feature 026 Phase B — classify the just-executed input's economic dimension from the
-/// (per-execution) flow-flags, called at testcase-mint time (on_add). Most-specific wins:
-/// PRICE > ACCUMULATOR > Generic. The flags are `static mut` set during execution and not yet
-/// cleared at on_add (no intervening execution), so this is a best-effort per-testcase snapshot.
-/// Fail-safe: Generic ⇒ no boost ⇒ byte-identical to pre-026-B.
+/// Feature 026 Phase B — classify the just-executed input's economic dimension
+/// from the (per-execution) flow-flags, called at testcase-mint time (on_add).
+/// Most-specific wins: PRICE > ACCUMULATOR > Generic. The flags are `static
+/// mut` set during execution and not yet cleared at on_add (no intervening
+/// execution), so this is a best-effort per-testcase snapshot. Fail-safe:
+/// Generic ⇒ no boost ⇒ byte-identical to pre-026-B.
 fn classify_flow_dim() -> TaintDim {
     use crate::evm::middlewares::cmp_linearity::{ACCUMULATOR_INFLATION_FLOW, PRICE_MANIPULATION_FLOW};
     unsafe {
@@ -174,9 +185,10 @@ fn classify_flow_dim() -> TaintDim {
     }
 }
 
-/// Feature 026 Phase B — the `dim_flow→scheduler` energy multiplier: PRICE→high, ACCUMULATOR→med,
-/// everything else neutral (dot line 241 weights). Decays `0.95^hits` like the promote/topology
-/// boosts (sibling `dim_hits`) so an economic dimension gets front-loaded budget without trapping.
+/// Feature 026 Phase B — the `dim_flow→scheduler` energy multiplier:
+/// PRICE→high, ACCUMULATOR→med, everything else neutral (dot line 241 weights).
+/// Decays `0.95^hits` like the promote/topology boosts (sibling `dim_hits`) so
+/// an economic dimension gets front-loaded budget without trapping.
 /// Floors at 1.0 (never penalises). Pure, unit-testable.
 fn dim_boost(dim: TaintDim, hits: u32) -> f64 {
     let base = match dim {
@@ -279,8 +291,9 @@ where
     S: State + HasCorpus<Input = EVMInput> + HasTestcase + HasMetadata,
 {
     fn on_add(&mut self, state: &mut Self::State, idx: CorpusId) -> Result<(), Error> {
-        // Feature 026 Phase B — snapshot the economic dimension NOW: the flow-flags reflect the
-        // just-executed interesting input and no execution intervenes before on_add.
+        // Feature 026 Phase B — snapshot the economic dimension NOW: the flow-flags
+        // reflect the just-executed interesting input and no execution
+        // intervenes before on_add.
         let flow_dim = classify_flow_dim();
         // adding power scheduling information based on code size
         {
@@ -505,37 +518,51 @@ where
         }
 
         // Feature 026 Phase A — Promote → Scheduler energy. The reflexive (015) and
-        // parameter-bound (025) levers promote a (contract, selector) via PromotionCandidate,
-        // but the scheduler never learned of it: a promoted step was drilled only when this
-        // scorer happened to serve a matching input — the measured "3x front-loaded cost".
-        // Here we boost power for inputs that exercise the promoted (contract, selector), with
-        // the same exponential decay as the topology boost (a sibling promote_hits counter) so
+        // parameter-bound (025) levers promote a (contract, selector) via
+        // PromotionCandidate, but the scheduler never learned of it: a promoted
+        // step was drilled only when this scorer happened to serve a matching
+        // input — the measured "3x front-loaded cost". Here we boost power for
+        // inputs that exercise the promoted (contract, selector), with the same
+        // exponential decay as the topology boost (a sibling promote_hits counter) so
         // a promoted lever gets early pressure without permanently trapping the search.
-        // With no candidate set (!cand.set), this is inert → power byte-identical to pre-026.
-        if let Some(cand) = state.metadata_map().get::<PromotionCandidate>() {
-            if cand.set {
-                if let Some(input) = entry.input() {
-                    if let Some(abi) = input.get_data_abi() {
-                        if abi.function == cand.selector && input.get_contract() == cand.contract {
-                            let hits = match entry.metadata::<PowerABITestcaseMetadata>() {
-                                Ok(meta) => meta.promote_hits,
-                                Err(_) => 0,
-                            };
-                            power *= promote_boost(hits);
+        // With no candidate set (!cand.set), this is inert → power byte-identical to
+        // pre-026.
+        if let Some(input) = entry.input() {
+            if let Some(abi) = input.get_data_abi() {
+                let matches_promoted = state
+                    .metadata_map()
+                    .get::<PromotionCandidates>()
+                    .map(|candidates| {
+                        candidates.by_kind.values().any(|cand| {
+                            cand.set && abi.function == cand.selector && input.get_contract() == cand.contract
+                        })
+                    })
+                    .or_else(|| {
+                        state.metadata_map().get::<PromotionCandidate>().map(|cand| {
+                            cand.set && abi.function == cand.selector && input.get_contract() == cand.contract
+                        })
+                    })
+                    .unwrap_or(false);
+                if matches_promoted {
+                    let hits = match entry.metadata::<PowerABITestcaseMetadata>() {
+                        Ok(meta) => meta.promote_hits,
+                        Err(_) => 0,
+                    };
+                    power *= promote_boost(hits);
 
-                            if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
-                                meta.promote_hits = meta.promote_hits.saturating_add(1);
-                            }
-                        }
+                    if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
+                        meta.promote_hits = meta.promote_hits.saturating_add(1);
                     }
                 }
             }
         }
 
-        // Feature 026 Phase B — dim_flow → scheduler energy. Boost inputs whose execution
-        // exhibited a high-value economic dimension (PRICE_MANIP→high, ACCUM→med), read from the
-        // per-testcase `located_dim` stamped at mint (not the static-mut flags, which reflect the
-        // wrong execution at score time). Decays like the others. Generic ⇒ inert ⇒ byte-identical.
+        // Feature 026 Phase B — dim_flow → scheduler energy. Boost inputs whose
+        // execution exhibited a high-value economic dimension
+        // (PRICE_MANIP→high, ACCUM→med), read from the per-testcase
+        // `located_dim` stamped at mint (not the static-mut flags, which reflect the
+        // wrong execution at score time). Decays like the others. Generic ⇒ inert ⇒
+        // byte-identical.
         let (dim, dim_hits) = match entry.metadata::<PowerABITestcaseMetadata>() {
             Ok(meta) => (meta.located_dim, meta.dim_hits),
             Err(_) => (TaintDim::Generic, 0),
@@ -590,8 +617,8 @@ mod tests {
         // strictly decreasing as the lever is repeatedly scheduled.
         assert!(promote_boost(1) < promote_boost(0));
         assert!(promote_boost(10) < promote_boost(1));
-        // approaches — but never drops below — neutral (1.0): a promoted lever loses its
-        // front-loaded advantage but is never penalised.
+        // approaches — but never drops below — neutral (1.0): a promoted lever loses
+        // its front-loaded advantage but is never penalised.
         assert!(promote_boost(100) > 1.0, "still above neutral at moderate hits");
         assert!(promote_boost(100) < 1.01, "approaching neutral");
         assert!(promote_boost(100_000) >= 1.0, "never below neutral — 1.0 is the floor");
