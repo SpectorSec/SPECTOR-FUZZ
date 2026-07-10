@@ -16,10 +16,11 @@
 //! `ALL`/`oracles()`/`as_str()` are consumed by `-d` routing; `from_str()` (legacy-alias parse)
 //! and `middleware()` (attach law) are not yet wired, hence their `#[allow(dead_code)]`.
 //!
-//! **Out-of-band oracles (§5.4):** `FreshnessOracle` and `TemporalSkimOracle` are Value-primitive
-//! detectors but have no `OracleType` variant — they auto-activate via ABI fingerprint
-//! (`evm_fuzzer.rs`) and are NOT controllable by `-d`. They are intentionally omitted from
-//! `oracles()` to avoid implying `-d value_leak` selects them; their activation is independent.
+//! **Out-of-band oracles (§5.4 / Feature 036):** `FreshnessOracle` and `TemporalSkimOracle` now
+//! have `OracleType` variants (`Freshness`, `TemporalSkim`) and are bound to `LeakClass::Value`
+//! for taxonomy completeness (ERC4626 precedent). Their *activation* remains independent of `-d`
+//! (ABI fingerprint / `--temporal-skimming` flag — `evm_fuzzer.rs:592-628`). The "out-of-band"
+//! property is now narrowly activation-only, not taxonomy membership.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +70,10 @@ impl LeakClass {
             LeakClass::ControlFlow => &[Reentrancy],
             // §1 audit: Pair (k-constant imbalance drain) + MathCalculate (arbitrary ERC20
             // transfer to attacker) are both direct-value-extraction detectors.
-            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing, ERC4626, Pair, MathCalculate],
+            // Feature 036: Freshness (stale-price/Ghost-#3) and TemporalSkim (time-extracted-value)
+            // are Value-class detectors — same semantic family as ERC4626/Pair/MathCalculate.
+            // Activation remains ABI-fingerprint / flag-driven (independent of -d), same as ERC4626.
+            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing, ERC4626, Pair, MathCalculate, Freshness, TemporalSkim],
             // §1 audit: CrossChain detects attacker calling bridge receive functions
             // (lzReceive/ccipReceive/xReceive) without authorization — message origin forgery.
             LeakClass::Message => &[ArbitraryCall, CrossChain],
@@ -177,6 +181,14 @@ mod tests {
         // ERC4626Oracle (share-price manipulation) is a Value-leak detector — bound into the SSOT
         // (was an orphan: oracle fired via bug_idx / topology auto-activation but unclaimed).
         assert!(LeakClass::Value.oracles().contains(&OracleType::ERC4626));
+    }
+
+    #[test]
+    fn value_binds_freshness_and_temporal_skim() {
+        // Feature 036: both out-of-band Value detectors now have taxonomy identity.
+        // Activation remains independent of -d (ABI fingerprint / flag), same as ERC4626.
+        assert!(LeakClass::Value.oracles().contains(&OracleType::Freshness));
+        assert!(LeakClass::Value.oracles().contains(&OracleType::TemporalSkim));
     }
 
     #[test]

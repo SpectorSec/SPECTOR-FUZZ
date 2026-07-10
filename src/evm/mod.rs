@@ -542,6 +542,8 @@ pub(crate) enum OracleType {
     Function,
     Ownership,
     ERC4626,
+    Freshness,    // Feature 036: stale-price / Ghost-#3 detector (auto-activated, ABI fingerprint)
+    TemporalSkim, // Feature 036: time-extracted-value skim detector (--temporal-skimming flag)
 }
 
 impl OracleType {
@@ -565,6 +567,8 @@ impl OracleType {
             OracleType::Function => "function",
             OracleType::Ownership => "ownership",
             OracleType::ERC4626 => "erc4626",
+            OracleType::Freshness => "freshness",
+            OracleType::TemporalSkim => "temporal_skim",
         }
     }
 
@@ -588,6 +592,8 @@ impl OracleType {
             "function" => OracleType::Function,
             "ownership" | "ownership_leak" => OracleType::Ownership,
             "erc4626" => OracleType::ERC4626,
+            "freshness" => OracleType::Freshness,
+            "temporal_skim" => OracleType::TemporalSkim,
             _ => panic!("Invalid detector type: {}", s),
         }
     }
@@ -621,6 +627,8 @@ impl OracleType {
                     OracleType::Rebasing,
                     OracleType::Function,
                     OracleType::Ownership,
+                    OracleType::Freshness,
+                    OracleType::TemporalSkim,
                 ];
             }
             if detector == "high_confidence" {
@@ -1319,9 +1327,10 @@ mod test {
             OracleType::from_strs("permission_leak"),
             vec![OracleType::Function, OracleType::Approval]
         );
+        // Feature 036: Freshness + TemporalSkim added to Value class.
         assert_eq!(
             OracleType::from_strs("value_leak"),
-            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing, OracleType::ERC4626, OracleType::Pair, OracleType::MathCalculate]
+            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing, OracleType::ERC4626, OracleType::Pair, OracleType::MathCalculate, OracleType::Freshness, OracleType::TemporalSkim]
         );
         assert_eq!(
             OracleType::from_strs("ownership_leak"),
@@ -1334,6 +1343,11 @@ mod test {
         // ERC4626 was previously absent from the "all" list despite being a registered OracleType
         // and listed in LeakClass::Value.oracles(). Fixed: -d all now includes it.
         assert!(OracleType::from_strs("all").contains(&OracleType::ERC4626));
+        // Feature 036: Freshness and TemporalSkim now have OracleType identity and appear in "all".
+        assert!(OracleType::from_strs("all").contains(&OracleType::Freshness));
+        assert!(OracleType::from_strs("all").contains(&OracleType::TemporalSkim));
+        assert!(!OracleType::from_strs("high_confidence").contains(&OracleType::Freshness));
+        assert!(!OracleType::from_strs("high_confidence").contains(&OracleType::TemporalSkim));
         assert!(!OracleType::from_strs("high_confidence").contains(&OracleType::Ownership));
     }
 }
