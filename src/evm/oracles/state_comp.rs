@@ -1,14 +1,17 @@
 use std::str::FromStr;
 
 use bytes::Bytes;
+use libafl::prelude::HasMetadata;
 use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{
         host::STATE_CHANGE,
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::STATE_COMP_BUG_IDX,
+        planner::{PromotionCandidate, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -97,6 +100,31 @@ impl
 
         unsafe {
             if STATE_CHANGE && comp(&ctx.post_state, &self.desired_state) {
+                // Items 3+4 (audit remediation): emit Invariant PromotionCandidate so the
+                // planner locks the violating call into the campaign. Value takes precedence.
+                let already_set = ctx
+                    .fuzz_state
+                    .metadata_map()
+                    .get::<PromotionCandidate>()
+                    .map(|c| c.set)
+                    .unwrap_or(false);
+                if !already_set {
+                    let selector: [u8; 4] = ctx
+                        .input
+                        .data
+                        .as_ref()
+                        .map(|d| d.function)
+                        .unwrap_or_default();
+                    ctx.fuzz_state.metadata_map_mut().insert(PromotionCandidate {
+                        contract: ctx.input.contract,
+                        selector,
+                        best_inflow: 0,
+                        kind: LeakClass::Invariant,
+                        taint_provenance: TaintProvenanceTag::default(),
+                        phase: None,
+                        set: true,
+                    });
+                }
                 EVMBugResult::new_simple(
                     "state_comp".to_string(),
                     STATE_COMP_BUG_IDX,

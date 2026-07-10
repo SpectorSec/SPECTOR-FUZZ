@@ -310,6 +310,10 @@ fn secant_promotable(kind: crate::evm::leak_class::LeakClass, n_args: usize) -> 
     match kind {
         LeakClass::Value => true,
         LeakClass::Permission => n_args >= 1,
+        // Invariant: treat violation magnitude (best_inflow) as unsigned objective — secant
+        // maximizes it the same way it maximizes Value inflow. Producers now emit from
+        // snapshot_delta/invariant/echidna/state_comp (audit items 3+4).
+        LeakClass::Invariant => true,
         _ => false,
     }
 }
@@ -1174,8 +1178,8 @@ where
                     // approve→approve. Economic truth now lives solely at the ledger.
                     // Feature 024 / 031 — kind-aware planner routing.
                     // Permission + Ownership → Prime slot (structural prerequisite).
-                    // Value → Lever slot (magnitude-tunable amplifier, dynamic pin).
-                    // ControlFlow + Invariant have no producer yet (oracle-side gap, not here).
+                    // Value + Invariant → Lever slot (magnitude-tunable, secant-amplified).
+                    // ControlFlow: no producer yet (oracle-side gap).
                     let structural_pin = state
                         .metadata_map()
                         .get::<PromotionCandidate>()
@@ -1187,13 +1191,18 @@ where
                             )
                         })
                         .map(|c| (c.contract, c.selector));
-                    // Feature 031 — dynamic Value lever: runtime-discovered (contract, selector)
-                    // injected as Lever step by the planner. Supersedes the static 14-selector
-                    // list for any target the oracle actually found a lever on.
+                    // Feature 031 — dynamic Value/Invariant lever: runtime-discovered
+                    // (contract, selector) injected as Lever step by the planner. Invariant
+                    // violations join Value here — both maximize an unsigned objective magnitude
+                    // via the same secant loop. Supersedes the static 14-selector list.
                     let value_lever_pin = state
                         .metadata_map()
                         .get::<PromotionCandidate>()
-                        .filter(|c| c.set && c.kind == crate::evm::leak_class::LeakClass::Value)
+                        .filter(|c| c.set && matches!(
+                            c.kind,
+                            crate::evm::leak_class::LeakClass::Value
+                                | crate::evm::leak_class::LeakClass::Invariant
+                        ))
                         .map(|c| (c.contract, c.selector));
                     // §7d content re-point: pick a topology-classified capital-source token for the
                     // Borrow slot — a borrowable whose contract exposes FlashLoan/Lending/ERC4626
@@ -2242,9 +2251,12 @@ mod tests {
         assert!(!secant_promotable(LeakClass::Permission, 0), "no-arg reach → 024 Prime-lock, not secant");
         assert!(secant_promotable(LeakClass::Permission, 1), "setter with one arg → tunable magnitude");
         assert!(secant_promotable(LeakClass::Permission, 4), "setter with several args → tunable");
-        // No other kind is a secant lever.
+        // Invariant is now a magnitude lever: violation depth (best_inflow stores |delta|)
+        // is maximized by the same unsigned secant loop as Value inflow.
+        assert!(secant_promotable(LeakClass::Invariant, 0), "Invariant violation depth is secant-tunable");
+        assert!(secant_promotable(LeakClass::Invariant, 2), "Invariant violation depth is secant-tunable");
+        // Structural kinds that have no magnitude objective are not secant levers.
         assert!(!secant_promotable(LeakClass::Ownership, 2), "Ownership is not a magnitude lever");
-        assert!(!secant_promotable(LeakClass::Invariant, 2), "Invariant is not a magnitude lever");
         assert!(!secant_promotable(LeakClass::Message, 2), "Message is not a magnitude lever");
     }
 

@@ -4,11 +4,15 @@ use bytes::Bytes;
 use itertools::Itertools;
 use revm_interpreter::bytecode::Bytecode;
 
+use libafl::prelude::HasMetadata;
+
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::ECHIDNA_BUG_IDX,
+        planner::{PromotionCandidate, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -72,12 +76,47 @@ impl
         >,
         _stage: u64,
     ) -> Vec<u64> {
-        ctx.call_post_batch(&self.batch_call_txs)
+        let results: Vec<bool> = ctx
+            .call_post_batch(&self.batch_call_txs)
             .iter()
             .map(|out| out.iter().map(|x| *x == 0).all(|x| x))
+            .collect();
+
+        // Items 3+4 (audit remediation): emit Invariant PromotionCandidate on first violation
+        // so the planner locks the violating call into the campaign. No dedup gate here —
+        // echidna.rs re-evaluates every execution, so the high-water check is the dedup.
+        let any_violated = results.iter().any(|&v| v);
+        if any_violated {
+            let already_set = ctx
+                .fuzz_state
+                .metadata_map()
+                .get::<PromotionCandidate>()
+                .map(|c| c.set)
+                .unwrap_or(false);
+            if !already_set {
+                let selector: [u8; 4] = ctx
+                    .input
+                    .data
+                    .as_ref()
+                    .map(|d| d.function)
+                    .unwrap_or_default();
+                ctx.fuzz_state.metadata_map_mut().insert(PromotionCandidate {
+                    contract: ctx.input.contract,
+                    selector,
+                    best_inflow: 0,
+                    kind: LeakClass::Invariant,
+                    taint_provenance: TaintProvenanceTag::default(),
+                    phase: None,
+                    set: true,
+                });
+            }
+        }
+
+        results
+            .into_iter()
             .enumerate()
-            .map(|(idx, x)| {
-                if x {
+            .map(|(idx, violated)| {
+                if violated {
                     let name = self.names.get(&self.batch_call_txs[idx].1.to_vec()).unwrap();
                     let bug_idx = (idx << 8) as u64 + ECHIDNA_BUG_IDX;
                     EVMBugResult::new(

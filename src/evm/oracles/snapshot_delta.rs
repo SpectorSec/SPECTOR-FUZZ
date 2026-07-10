@@ -20,11 +20,15 @@ use bytes::Bytes;
 use itertools::Itertools;
 use revm_interpreter::bytecode::Bytecode;
 
+use libafl::prelude::HasMetadata;
+
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::OWNERSHIP_BUG_IDX,
+        planner::{PromotionCandidate, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -159,6 +163,34 @@ impl
         let relocations = self.detect_relocations(ctx.pre_state, &ctx.post_state);
         if relocations.is_empty() {
             return vec![];
+        }
+
+        // Items 3+4 (audit remediation): emit Ownership PromotionCandidate so the planner
+        // can lock the violating call into the Prime slot (structural_pin). Value takes
+        // precedence — only fill if slot is unclaimed. Mirrors function.rs:248-269 pattern.
+        let already_set = ctx
+            .fuzz_state
+            .metadata_map()
+            .get::<PromotionCandidate>()
+            .map(|c| c.set)
+            .unwrap_or(false);
+        if !already_set {
+            let first = &relocations[0];
+            let selector: [u8; 4] = ctx
+                .input
+                .data
+                .as_ref()
+                .map(|d| d.function)
+                .unwrap_or_default();
+            ctx.fuzz_state.metadata_map_mut().insert(PromotionCandidate {
+                contract: first.contract,
+                selector,
+                best_inflow: relocations.len() as u128,
+                kind: LeakClass::Ownership,
+                taint_provenance: TaintProvenanceTag::default(),
+                phase: None,
+                set: true,
+            });
         }
 
         relocations
