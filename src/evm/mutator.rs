@@ -1262,7 +1262,7 @@ where
                     // Feature 024 / 031 — kind-aware planner routing.
                     // Permission + Ownership → Prime slot (structural prerequisite).
                     // Value + Invariant → Lever slot (magnitude-tunable, secant-amplified).
-                    // ControlFlow: no producer yet (oracle-side gap).
+                    // ControlFlow: producer added in Feature 034 (reentrancy.rs).
                     let singleton_candidate = state.metadata_map().get::<PromotionCandidate>();
                     let owned_candidates;
                     let candidates = if let Some(candidates) = state.metadata_map().get::<PromotionCandidates>() {
@@ -1276,6 +1276,7 @@ where
                             candidates.first_set(&[
                                 crate::evm::leak_class::LeakClass::Ownership,
                                 crate::evm::leak_class::LeakClass::Permission,
+                                crate::evm::leak_class::LeakClass::ControlFlow, // Feature 034
                             ])
                         })
                         .map(|c| (c.contract, c.selector));
@@ -2508,6 +2509,16 @@ mod tests {
         assert!(
             !secant_promotable(LeakClass::Message, 2),
             "Message is not a magnitude lever"
+        );
+        // Feature 034: ControlFlow is a structural-pin kind (same as Ownership) — must never
+        // enter the secant lever path regardless of arg count.
+        assert!(
+            !secant_promotable(LeakClass::ControlFlow, 0),
+            "ControlFlow is not a magnitude lever"
+        );
+        assert!(
+            !secant_promotable(LeakClass::ControlFlow, 5),
+            "ControlFlow is not a magnitude lever"
         );
     }
 }

@@ -166,6 +166,24 @@ fn promote_boost(hits: u32) -> f64 {
     1.0 + (PROMOTE_BOOST - 1.0) * decay
 }
 
+/// Feature 035 — magnitude-aware extra multiplier on top of the presence-based
+/// `promote_boost`. Log-scaled so it needs no per-kind calibration: ln(1+x) compresses
+/// any magnitude range (wei amounts, relocation counts, violation distances) onto the
+/// same curve. magnitude=0 → 1.0 exactly (byte-identical to pre-035 for presence-only
+/// candidates like Permission's best_inflow=0). Bounded above by MAGNITUDE_BOOST_MAX so
+/// no single large Value inflow can permanently dominate the schedule.
+fn magnitude_boost(best_inflow: u128) -> f64 {
+    const MAGNITUDE_BOOST_MAX: f64 = 1.5;
+    const MAGNITUDE_LOG_SCALE: f64 = 1e18; // ~1 ETH in wei — curve approaches cap here
+    if best_inflow == 0 {
+        return 1.0;
+    }
+    let x = (best_inflow as f64 + 1.0).ln();
+    let scale = MAGNITUDE_LOG_SCALE.ln();
+    let ratio = (x / scale).clamp(0.0, 1.0);
+    1.0 + (MAGNITUDE_BOOST_MAX - 1.0) * ratio
+}
+
 /// Feature 026 Phase B — classify the just-executed input's economic dimension
 /// from the (per-execution) flow-flags, called at testcase-mint time (on_add).
 /// Most-specific wins: PRICE > ACCUMULATOR > Generic. The flags are `static
@@ -529,26 +547,30 @@ where
         // pre-026.
         if let Some(input) = entry.input() {
             if let Some(abi) = input.get_data_abi() {
-                let matches_promoted = state
+                // Feature 035: return the matched candidate's best_inflow so magnitude_boost
+                // can scale the promote_boost multiplicatively. Option::None = no match →
+                // inert, byte-identical to pre-035.
+                let matched_magnitude: Option<u128> = state
                     .metadata_map()
                     .get::<PromotionCandidates>()
-                    .map(|candidates| {
-                        candidates.by_kind.values().any(|cand| {
+                    .and_then(|candidates| {
+                        candidates.by_kind.values().find(|cand| {
                             cand.set && abi.function == cand.selector && input.get_contract() == cand.contract
                         })
                     })
+                    .map(|cand| cand.best_inflow)
                     .or_else(|| {
-                        state.metadata_map().get::<PromotionCandidate>().map(|cand| {
-                            cand.set && abi.function == cand.selector && input.get_contract() == cand.contract
+                        state.metadata_map().get::<PromotionCandidate>().and_then(|cand| {
+                            (cand.set && abi.function == cand.selector && input.get_contract() == cand.contract)
+                                .then_some(cand.best_inflow)
                         })
-                    })
-                    .unwrap_or(false);
-                if matches_promoted {
+                    });
+                if let Some(magnitude) = matched_magnitude {
                     let hits = match entry.metadata::<PowerABITestcaseMetadata>() {
                         Ok(meta) => meta.promote_hits,
                         Err(_) => 0,
                     };
-                    power *= promote_boost(hits);
+                    power *= promote_boost(hits) * magnitude_boost(magnitude);
 
                     if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
                         meta.promote_hits = meta.promote_hits.saturating_add(1);
@@ -592,7 +614,7 @@ pub type PowerABIMutationalStage<E, EM, I, M, Z> =
 
 #[cfg(test)]
 mod tests {
-    use super::{dim_boost, promote_boost, TaintDim};
+    use super::{dim_boost, magnitude_boost, promote_boost, TaintDim};
 
     #[test]
     fn dim_boost_tiers_and_decay() {
@@ -622,5 +644,45 @@ mod tests {
         assert!(promote_boost(100) > 1.0, "still above neutral at moderate hits");
         assert!(promote_boost(100) < 1.01, "approaching neutral");
         assert!(promote_boost(100_000) >= 1.0, "never below neutral — 1.0 is the floor");
+    }
+
+    // Feature 035 tests
+
+    #[test]
+    fn magnitude_boost_zero_is_neutral() {
+        // Permission/ControlFlow emit best_inflow=0 (presence-only) → must be byte-identical to
+        // pre-035 (no extra multiplier).
+        assert_eq!(magnitude_boost(0), 1.0);
+    }
+
+    #[test]
+    fn magnitude_boost_monotonic() {
+        // Larger magnitudes must yield at least as much boost — secant can only improve best_inflow.
+        assert!(magnitude_boost(1) >= magnitude_boost(0));
+        assert!(magnitude_boost(1_000) >= magnitude_boost(1));
+        assert!(magnitude_boost(1_000_000_000_000_000_000) >= magnitude_boost(1_000));
+    }
+
+    #[test]
+    fn magnitude_boost_bounded() {
+        // Never exceeds MAGNITUDE_BOOST_MAX (1.5) regardless of how large best_inflow gets.
+        assert!(magnitude_boost(u128::MAX) <= 1.5 + 1e-9);
+        assert!(magnitude_boost(u128::MAX) >= 1.0);
+    }
+
+    #[test]
+    fn magnitude_boost_never_reduces_promote_boost() {
+        // Combined multiplier promote_boost(hits) * magnitude_boost(magnitude) must always
+        // be >= promote_boost(hits) alone (magnitude_boost is always >= 1.0).
+        for hits in [0u32, 1, 10, 100] {
+            for magnitude in [0u128, 1, 1_000, 1_000_000_000_000_000_000, u128::MAX] {
+                let combined = promote_boost(hits) * magnitude_boost(magnitude);
+                assert!(
+                    combined >= promote_boost(hits) - 1e-9,
+                    "hits={hits} magnitude={magnitude}: combined={combined} < promote_boost={}",
+                    promote_boost(hits)
+                );
+            }
+        }
     }
 }

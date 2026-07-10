@@ -12,7 +12,9 @@ use super::{OracleTargetMetadata, REENTRANCY_BUG_IDX};
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
+        planner::{PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -84,6 +86,38 @@ impl
             let key = addr.0 .0;
             let entry = meta.targets.entry(key).or_insert_with(|| ("Reentrancy".to_string(), REENTRANCY_BUG_IDX, 0));
             entry.2 += 1;
+        }
+
+        // Feature 034: emit ControlFlow PromotionCandidate so the planner can lock the
+        // re-entered contract into the Prime slot. best_inflow = distinct reentrant
+        // storage touches (more touches = broader/deeper reentrancy = higher objective).
+        // Mirrors snapshot_delta.rs's Ownership pattern exactly.
+        let first_contract = reetrancy_metadata.found.iter().next().map(|(addr, _)| *addr).unwrap_or_default();
+        let selector: [u8; 4] = ctx.input.data.as_ref().map(|d| d.function).unwrap_or_default();
+        let candidate = PromotionCandidate {
+            contract: first_contract,
+            selector,
+            best_inflow: reetrancy_metadata.found.len() as u128,
+            kind: LeakClass::ControlFlow,
+            taint_provenance: TaintProvenanceTag::default(),
+            phase: None,
+            set: true,
+        };
+        let mut candidates = ctx
+            .fuzz_state
+            .metadata_map()
+            .get::<PromotionCandidates>()
+            .cloned()
+            .or_else(|| {
+                ctx.fuzz_state
+                    .metadata_map()
+                    .get::<PromotionCandidate>()
+                    .map(PromotionCandidates::from_singleton)
+            })
+            .unwrap_or_default();
+        if candidates.record(candidate.clone()) {
+            ctx.fuzz_state.metadata_map_mut().insert(candidates);
+            ctx.fuzz_state.metadata_map_mut().insert(candidate);
         }
 
         reetrancy_metadata
