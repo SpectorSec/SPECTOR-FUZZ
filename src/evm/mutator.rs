@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 
+use alloy_sol_types::SolCall;
 use bytes::Bytes;
+use foundry_cheatcodes::Vm;
 use libafl::{
     corpus::Corpus,
     inputs::Input,
@@ -10,23 +12,24 @@ use libafl::{
     state::{HasCorpus, HasMetadata},
     Error,
 };
-use alloy_sol_types::SolCall;
-use foundry_cheatcodes::Vm;
-use libafl_bolts::{prelude::{Rand, StdRand}, Named};
+use libafl_bolts::{
+    prelude::{Rand, StdRand},
+    Named,
+};
 use revm_interpreter::{interpreter_types::Jumps, Interpreter};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::onchain::flashloan::CAN_LIQUIDATE;
 /// Mutator for EVM inputs
 use crate::evm::input::{CampaignSequence, EVMInputT, NestedAction};
-use crate::evm::oracles::{TrustedCallerMetadata, WhaleAddressMetadata};
-use crate::evm::planner::{plan_campaign_sampled, CampaignTargetCache, PromotionCandidate};
-use crate::evm::topology::{TopologyHints, TopologyReport};
 use crate::{
     evm::{
         abi::{ABIAddressToInstanceMap, BoxedABI},
         input::EVMInputTy::Borrow,
         middlewares::cheatcode::CHEATCODE_ADDRESS,
+        oracles::{TrustedCallerMetadata, WhaleAddressMetadata},
+        planner::{plan_campaign_sampled, CampaignTargetCache, PromotionCandidate, PromotionCandidates},
+        topology::{TopologyHints, TopologyReport},
         types::{convert_u256_to_h160, EVMAddress, EVMU256},
         vm::{Constraint, EVMState, EVMStateT},
     },
@@ -135,7 +138,8 @@ impl AccessPattern {
 // is u128 (not as_u64) to preserve wei-scale accrual/value distances.
 
 /// Saturating EVMU256 → u128. `as_u64` (types.rs) takes only limb 0 and would
-/// truncate wei-scale distances — exactly the accrual case Application C targets.
+/// truncate wei-scale distances — exactly the accrual case Application C
+/// targets.
 #[cfg(feature = "cmp")]
 fn evmu256_to_u128_sat(d: EVMU256) -> u128 {
     let l = d.as_limbs(); // little-endian [u64; 4]
@@ -148,8 +152,8 @@ fn evmu256_to_u128_sat(d: EVMU256) -> u128 {
 
 /// Argmin over CMP_MAP at full 256-bit width. Returns
 /// (pinned_index, owner_fingerprint, distance). The owner fingerprint pins the
-/// specific comparison so later reads can detect slot aliasing (Checkpoint 8.3).
-/// # Safety: reads the global CMP_MAP / CMP_PC statics.
+/// specific comparison so later reads can detect slot aliasing (Checkpoint
+/// 8.3). # Safety: reads the global CMP_MAP / CMP_PC statics.
 #[cfg(feature = "cmp")]
 unsafe fn cmp_argmin() -> Option<(usize, u64, u128)> {
     let mut best: Option<(usize, EVMU256)> = None;
@@ -163,8 +167,8 @@ unsafe fn cmp_argmin() -> Option<(usize, u64, u128)> {
 
 // Time-gated (warp) secant targeting now lives in the campaign executor via
 // controlled probes; it reads the temporal maps through `host::temporal_*`. The
-// former mutator-side copies (cmp_argmin_temporal / cmp_t_read_at / cmp_t_reset_at)
-// were removed as redundant.
+// former mutator-side copies (cmp_argmin_temporal / cmp_t_read_at /
+// cmp_t_reset_at) were removed as redundant.
 
 /// Read the distance at a pinned index, validating that the slot still belongs
 /// to the pinned comparison (`expect_fp`). `None` if the slot was untouched
@@ -194,8 +198,8 @@ unsafe fn cmp_reset_at(idx: usize) {
     crate::evm::host::CMP_PC[idx] = 0;
 }
 
-/// Pure secant computation shared by all three aiming applications (the heart of
-/// the method, extracted so it is unit-testable in isolation).
+/// Pure secant computation shared by all three aiming applications (the heart
+/// of the method, extracted so it is unit-testable in isolation).
 ///
 /// Given input value `x1` at measurement 1, distance `d1` measured at `x1` and
 /// `d2` measured at `x1 + delta`, returns the input value estimated to flip the
@@ -215,20 +219,23 @@ fn secant_step(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     Some(x1.saturating_add(step))
 }
 
-/// Feature 027 (Geometric / Inversion skew) — the secant in LOG space, the non-linear
-/// complement to [`secant_step`]. Many DeFi levers move the comparison distance MULTIPLICATIVELY,
-/// not linearly: AMM reserves (spot price ∝ 1/x), Uniswap-V3 ticks (price = 1.0001^tick), and
-/// any power-law `d ∝ x^k` surface. On those the linear secant mis-steps or stalls (`d1 <= d2`
-/// gives up), because its constant-slope model doesn't hold. In log space a power-law becomes
-/// affine, so one two-point secant on `(ln x, d)` recovers the step:
-///   `L1 = ln x1`, `L2 = ln(x1+δ)`;  root `L* = L1 − d1·(L2−L1)/(d2−d1)`;  `x* = exp(L*)`.
+/// Feature 027 (Geometric / Inversion skew) — the secant in LOG space, the
+/// non-linear complement to [`secant_step`]. Many DeFi levers move the
+/// comparison distance MULTIPLICATIVELY, not linearly: AMM reserves (spot price
+/// ∝ 1/x), Uniswap-V3 ticks (price = 1.0001^tick), and any power-law `d ∝ x^k`
+/// surface. On those the linear secant mis-steps or stalls (`d1 <= d2`
+/// gives up), because its constant-slope model doesn't hold. In log space a
+/// power-law becomes affine, so one two-point secant on `(ln x, d)` recovers
+/// the step:   `L1 = ln x1`, `L2 = ln(x1+δ)`;  root `L* = L1 −
+/// d1·(L2−L1)/(d2−d1)`;  `x* = exp(L*)`.
 ///
-/// Unlike the linear form this handles BOTH directions (a distance that grows with x ⇒ `x* < x1`),
-/// which is exactly the "increasing the amount made it worse — invert" case the linear secant
-/// abandons. Returns `None` on a degenerate probe (`x1 == 0`, flat gradient `d1 == d2`, or a
-/// non-finite / out-of-domain result). Uses f64 intermediates — this is a NEXT-guess heuristic and
-/// the secant re-probes, so exact integer precision is unnecessary; the result is clamped back into
-/// the u128 arg domain.
+/// Unlike the linear form this handles BOTH directions (a distance that grows
+/// with x ⇒ `x* < x1`), which is exactly the "increasing the amount made it
+/// worse — invert" case the linear secant abandons. Returns `None` on a
+/// degenerate probe (`x1 == 0`, flat gradient `d1 == d2`, or a non-finite /
+/// out-of-domain result). Uses f64 intermediates — this is a NEXT-guess
+/// heuristic and the secant re-probes, so exact integer precision is
+/// unnecessary; the result is clamped back into the u128 arg domain.
 #[cfg(feature = "cmp")]
 fn secant_step_geometric(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u128> {
     if x1 == 0 || delta == 0 || d1 == d2 {
@@ -237,7 +244,8 @@ fn secant_step_geometric(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u1
     let l1 = (x1 as f64).ln();
     let l2 = ((x1 as f64) + (delta as f64)).ln();
     if !(l2 > l1) {
-        return None; // ln not strictly increasing (x1 huge / δ negligible in f64)
+        return None; // ln not strictly increasing (x1 huge / δ negligible in
+                     // f64)
     }
     // Root of the log-space affine model: L* = L1 − d1·(L2 − L1)/(d2 − d1).
     let lstar = (l1 as f64) - (d1 as f64) * (l2 - l1) / (d2 as f64 - d1 as f64);
@@ -248,14 +256,16 @@ fn secant_step_geometric(x1: u128, d1: u128, d2: u128, delta: u128) -> Option<u1
     Some(xstar as u128)
 }
 
-/// Feature 028 — does calldata word `arg` reach ANY storage slot, across ALL contracts?
-/// Pure decision behind the LOCATE provenance skip (extracted for unit testing). Cross-contract
-/// by design: an arg whose only storage effect lands in a CALLEE / proxy target still counts —
-/// the pre-028 `*addr == step.contract` filter wrongly returned false for it (dropping the
-/// confused-deputy / proxy lever). Taint + per-slot storage already span CALL/DELEGATECALL
-/// (017 Phase 2), so ORing across every contract's slots is both correct and over-inclusion-safe
-/// (an extra LOCATE probe self-corrects via sensitivity; over-exclusion loses a lever). The
-/// `arg < 64` guard reflects the u64 provenance width (64 tracked args).
+/// Feature 028 — does calldata word `arg` reach ANY storage slot, across ALL
+/// contracts? Pure decision behind the LOCATE provenance skip (extracted for
+/// unit testing). Cross-contract by design: an arg whose only storage effect
+/// lands in a CALLEE / proxy target still counts — the pre-028 `*addr ==
+/// step.contract` filter wrongly returned false for it (dropping the
+/// confused-deputy / proxy lever). Taint + per-slot storage already span
+/// CALL/DELEGATECALL (017 Phase 2), so ORing across every contract's slots is
+/// both correct and over-inclusion-safe (an extra LOCATE probe self-corrects
+/// via sensitivity; over-exclusion loses a lever). The `arg < 64` guard
+/// reflects the u64 provenance width (64 tracked args).
 fn arg_reaches_storage(per_slot: &std::collections::HashMap<(EVMAddress, EVMU256), u64>, arg: usize) -> bool {
     if arg >= 64 {
         return false;
@@ -264,21 +274,23 @@ fn arg_reaches_storage(per_slot: &std::collections::HashMap<(EVMAddress, EVMU256
     bits & (1u64 << arg) != 0
 }
 
-/// Feature 015 — secant on the ledger's DERIVATIVE (finds an interior profit peak).
+/// Feature 015 — secant on the ledger's DERIVATIVE (finds an interior profit
+/// peak).
 ///
-/// The value/calldata secants ([`secant_step`]) drive one monotone comparison distance
-/// to zero. A reflexive-skew lever is different: pushing the amount too far *reverses*
-/// the profit (over-skew pays more slippage than it steals), so the objective is a hump
-/// and the target is its MAXIMUM — where the derivative crosses zero from `+` to `−`.
+/// The value/calldata secants ([`secant_step`]) drive one monotone comparison
+/// distance to zero. A reflexive-skew lever is different: pushing the amount
+/// too far *reverses* the profit (over-skew pays more slippage than it steals),
+/// so the objective is a hump and the target is its MAXIMUM — where the
+/// derivative crosses zero from `+` to `−`.
 ///
-/// `g1`, `g2` are two signed slope samples of the objective, measured at `x1` and
-/// `x1 + delta`. When they bracket a downward zero-crossing (`g1 > 0 > g2`) the peak lies
-/// between the probes; linear-interpolate the derivative's root:
+/// `g1`, `g2` are two signed slope samples of the objective, measured at `x1`
+/// and `x1 + delta`. When they bracket a downward zero-crossing (`g1 > 0 > g2`)
+/// the peak lies between the probes; linear-interpolate the derivative's root:
 ///   `x* = x1 + g1·delta / (g1 − g2)`.
-/// Returns `None` on flat (`g1 == g2`), monotone (both slopes same sign — the peak, if
-/// any, is outside this bracket), or a trough (`g1 < 0 < g2`, a minimum — never the
-/// lever's profit peak). All value math is unsigned wei-scale (u128) to match the
-/// arg-amount domain; only the slopes are signed.
+/// Returns `None` on flat (`g1 == g2`), monotone (both slopes same sign — the
+/// peak, if any, is outside this bracket), or a trough (`g1 < 0 < g2`, a
+/// minimum — never the lever's profit peak). All value math is unsigned
+/// wei-scale (u128) to match the arg-amount domain; only the slopes are signed.
 fn secant_step_signed(x1: u128, g1: i128, g2: i128, delta: u128) -> Option<u128> {
     // Interior maximum only: derivative must fall through zero (`+` → `−`).
     if !(g1 > 0 && g2 < 0) {
@@ -293,18 +305,22 @@ fn secant_step_signed(x1: u128, g1: i128, g2: i128, delta: u128) -> Option<u128>
     Some(x1.saturating_add(step))
 }
 
-/// Feature 025 (Parameter-Bound skew) — pure promotability decision for the ledger secant,
-/// extracted so it is unit-testable in isolation (cf. [`secant_step`]).
+/// Feature 025 (Parameter-Bound skew) — pure promotability decision for the
+/// ledger secant, extracted so it is unit-testable in isolation (cf.
+/// [`secant_step`]).
 ///
-/// The secant tunes a MAGNITUDE on a promoted campaign step. Which candidates carry one:
-/// - `Value`      → always (magnitude = the transferred amount; `n_args` is irrelevant).
-/// - `Permission` → only with ≥1 arg slot (magnitude = the setter argument — setFee /
-///   setRewardRate / …). A no-arg privileged reach has nothing to tune and is left to the
-///   024 Prime-lock path.
+/// The secant tunes a MAGNITUDE on a promoted campaign step. Which candidates
+/// carry one:
+/// - `Value`      → always (magnitude = the transferred amount; `n_args` is
+///   irrelevant).
+/// - `Permission` → only with ≥1 arg slot (magnitude = the setter argument —
+///   setFee / setRewardRate / …). A no-arg privileged reach has nothing to tune
+///   and is left to the 024 Prime-lock path.
 /// - anything else → not a lever here.
 ///
-/// Arg *type* is deliberately not gated: LOCATE rotates args by measured ledger sensitivity,
-/// so a non-numeric arg self-deprioritizes without a hard-coded type check.
+/// Arg *type* is deliberately not gated: LOCATE rotates args by measured ledger
+/// sensitivity, so a non-numeric arg self-deprioritizes without a hard-coded
+/// type check.
 fn secant_promotable(kind: crate::evm::leak_class::LeakClass, n_args: usize) -> bool {
     use crate::evm::leak_class::LeakClass;
     match kind {
@@ -322,13 +338,15 @@ fn secant_promotable(kind: crate::evm::leak_class::LeakClass, n_args: usize) -> 
 ///
 /// When the secant definitively gives up on a comparison (flat gradient,
 /// `secant_step == None`), hand the CURRENT corpus input back to the concolic
-/// queue. Without this, a gate that the dispatch triage routed AWAY from concolic
-/// (classified linear) but the secant can't flip would be a LOST branch. Pushing
-/// it onto `ConcolicPrioritizationMetadata.interesting_idx` guarantees concolic
-/// still gets it → the linear/non-linear mis-route can never cost a branch.
+/// queue. Without this, a gate that the dispatch triage routed AWAY from
+/// concolic (classified linear) but the secant can't flip would be a LOST
+/// branch. Pushing it onto `ConcolicPrioritizationMetadata.interesting_idx`
+/// guarantees concolic still gets it → the linear/non-linear mis-route can
+/// never cost a branch.
 ///
-/// Over-requeue is safe (concolic just runs on a few inputs the secant might have
-/// solved later); under-requeue is not (regression). So this errs toward safety.
+/// Over-requeue is safe (concolic just runs on a few inputs the secant might
+/// have solved later); under-requeue is not (regression). So this errs toward
+/// safety.
 #[cfg(all(feature = "cmp", feature = "concolic_secant_dispatch"))]
 fn requeue_for_concolic<S>(state: &mut S)
 where
@@ -349,7 +367,6 @@ where
     }
 }
 
-
 /// [`FuzzMutator`] is a mutator that mutates the input based on the ABI and
 /// access pattern
 pub struct FuzzMutator<VS, Loc, Addr, SC, CI>
@@ -369,12 +386,13 @@ where
     pub ghost_identities: bool,
     /// Enable Temporal Pre-condition Skimming (multi-block state priming).
     pub temporal_skimming: bool,
-    /// Feature 015: enable reflexive-lever promotion (hoist the skew lever into the
-    /// campaign frame so the ledger-secant can amount-tune it).
+    /// Feature 015: enable reflexive-lever promotion (hoist the skew lever into
+    /// the campaign frame so the ledger-secant can amount-tune it).
     pub reflexive_lever: bool,
-    /// Feature 017: enable dimension-driven warp engagement. When active, the planner
-    /// gates the warp lever on TIMESTAMP_DIM_LOCATED (set when the taint engine's
-    /// ts_seen bit reached SSTORE during reexecution) in addition to --temporal-skimming.
+    /// Feature 017: enable dimension-driven warp engagement. When active, the
+    /// planner gates the warp lever on TIMESTAMP_DIM_LOCATED (set when the
+    /// taint engine's ts_seen bit reached SSTORE during reexecution) in
+    /// addition to --temporal-skimming.
     pub dimension_warp: bool,
     pub phantom: std::marker::PhantomData<(VS, Loc, Addr, CI)>,
 }
@@ -388,7 +406,14 @@ where
     CI: Serialize + DeserializeOwned + Debug + Clone + ConciseSerde,
 {
     /// Create a new [`FuzzMutator`] with the given scheduler
-    pub fn new(infant_scheduler: SC, campaign_orchestrator: bool, ghost_identities: bool, temporal_skimming: bool, reflexive_lever: bool, dimension_warp: bool) -> Self {
+    pub fn new(
+        infant_scheduler: SC,
+        campaign_orchestrator: bool,
+        ghost_identities: bool,
+        temporal_skimming: bool,
+        reflexive_lever: bool,
+        dimension_warp: bool,
+    ) -> Self {
         Self {
             infant_scheduler,
             campaign_orchestrator,
@@ -470,7 +495,6 @@ where
         true
     }
 
-
     /// Snapshot-secant for txn_value / msg.value (Application E).
     ///
     /// Same iteration-based secant as the warp variant, but probes the
@@ -503,9 +527,7 @@ where
         const PROBE_DELTA: u128 = 1_000_000_000_000_000; // 0.001 ETH in wei
         const COOLDOWN: u32 = 8;
 
-        let read_value = |input: &I| -> u128 {
-            input.get_txn_value().map(evmu256_to_u128_sat).unwrap_or(0)
-        };
+        let read_value = |input: &I| -> u128 { input.get_txn_value().map(evmu256_to_u128_sat).unwrap_or(0) };
 
         match secant.phase {
             crate::feedback::SecantPhase::Idle => {
@@ -517,7 +539,9 @@ where
                 if !cmp_interesting {
                     return false;
                 }
-                let Some((pin_idx, pin_pc, d)) = (unsafe { cmp_argmin() }) else { return false };
+                let Some((pin_idx, pin_pc, d)) = (unsafe { cmp_argmin() }) else {
+                    return false;
+                };
                 if d == 0 {
                     return false;
                 }
@@ -575,7 +599,8 @@ where
         }
     }
 
-    /// Snapshot-secant for calldata arguments (Application B — arithmetic-threshold route).
+    /// Snapshot-secant for calldata arguments (Application B —
+    /// arithmetic-threshold route).
     ///
     /// Probes every calldata argument accessed this execution.  Flat-gradient
     /// detection (slope ≈ 0) self-diagnoses non-lever arguments, so no explicit
@@ -626,7 +651,9 @@ where
                 if !cmp_interesting {
                     return false;
                 }
-                let Some((pin_idx, pin_pc, d)) = (unsafe { cmp_argmin() }) else { return false };
+                let Some((pin_idx, pin_pc, d)) = (unsafe { cmp_argmin() }) else {
+                    return false;
+                };
                 if d == 0 {
                     return false;
                 }
@@ -671,7 +698,8 @@ where
                     #[cfg(feature = "concolic_secant_dispatch")]
                     requeue_for_concolic(state);
                 }
-                // 027 Geometric skew: log-space fallback for multiplicative/inverted objectives.
+                // 027 Geometric skew: log-space fallback for multiplicative/inverted
+                // objectives.
                 match linear.or_else(|| secant_step_geometric(secant.x1, secant.d1, d2, PROBE_DELTA)) {
                     None => {
                         state.metadata_map_mut().insert(secant);
@@ -720,25 +748,30 @@ where
 
     /// Feature 015 — LOCATE + AMPLIFY on a promoted reflexive-skew lever.
     ///
-    /// Unlike the value/calldata secants this reads the POST-execution realized-inflow
-    /// ledger (`LEDGER_OBJECTIVE`, published by `TokenBalanceFeedback`) rather than the
-    /// in-execution `CMP_MAP`, and it tunes an argument of a CAMPAIGN STEP (the promoted
-    /// lever) rather than the top-level input. The whole campaign runs atomically in one
-    /// `run_target`, so writing the lever's arg on this clone and reading the ledger next
-    /// call closes the tune→execute→measure loop — the same clone-per-iteration contract
-    /// the value-secant relies on (state lives in `metadata_map`, not on the input).
+    /// Unlike the value/calldata secants this reads the POST-execution
+    /// realized-inflow ledger (`LEDGER_OBJECTIVE`, published by
+    /// `TokenBalanceFeedback`) rather than the in-execution `CMP_MAP`, and
+    /// it tunes an argument of a CAMPAIGN STEP (the promoted lever) rather
+    /// than the top-level input. The whole campaign runs atomically in one
+    /// `run_target`, so writing the lever's arg on this clone and reading the
+    /// ledger next call closes the tune→execute→measure loop — the same
+    /// clone-per-iteration contract the value-secant relies on (state lives
+    /// in `metadata_map`, not on the input).
     ///
-    /// LOCATE: rotate over the lever's args, probe each, keep the arg with the strongest
-    /// |Δledger/Δarg| — that's the amount knob. AMPLIFY: gradient-ascend the knob toward
-    /// the profit peak; when two consecutive local slopes bracket a `+→−` crossing, snap
-    /// to the interpolated peak via `secant_step_signed`. NO concolic requeue: a flat
-    /// ledger slope means "not the lever," never "hand to SMT."
-    /// Feature 015 Phase 2 (a-posteriori Promote) — pin the discovered ledger-moving belly
-    /// call. When a prior execution's feedback recorded a `PromotionCandidate` (the largest
-    /// per-step attacker-inflow belly call), and this input carries an armed campaign whose
-    /// matching `(contract, selector)` step is not yet pinned, mark that step index in
-    /// `promoted`. `apply_ledger_secant` (below, same mutate pass) then Locates + Amplifies it.
-    /// One lever/frame: pins exactly the single candidate step. Inert off the reflexive path.
+    /// LOCATE: rotate over the lever's args, probe each, keep the arg with the
+    /// strongest |Δledger/Δarg| — that's the amount knob. AMPLIFY: gradient-ascend the knob toward
+    /// the profit peak; when two consecutive local slopes bracket a `+→−`
+    /// crossing, snap to the interpolated peak via `secant_step_signed`. NO
+    /// concolic requeue: a flat ledger slope means "not the lever," never
+    /// "hand to SMT." Feature 015 Phase 2 (a-posteriori Promote) — pin the
+    /// discovered ledger-moving belly call. When a prior execution's
+    /// feedback recorded a `PromotionCandidate` (the largest
+    /// per-step attacker-inflow belly call), and this input carries an armed
+    /// campaign whose matching `(contract, selector)` step is not yet
+    /// pinned, mark that step index in `promoted`. `apply_ledger_secant`
+    /// (below, same mutate pass) then Locates + Amplifies it.
+    /// One lever/frame: pins exactly the single candidate step. Inert off the
+    /// reflexive path.
     fn maybe_pin_aposteriori_lever<I, S>(&self, input: &mut I, state: &mut S) -> bool
     where
         I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
@@ -747,18 +780,33 @@ where
         if !self.reflexive_lever {
             return false;
         }
-        // The candidate recorded by a prior execution's feedback (cross-iteration channel).
+        // The candidate recorded by a prior execution's feedback (cross-iteration
+        // channel). Prefer per-kind slots; fall back to the legacy singleton
+        // for older in-memory/corpus state.
         let (contract, selector, kind) = {
-            let Some(cand) = state.metadata_map().get::<PromotionCandidate>() else {
+            let singleton = state.metadata_map().get::<PromotionCandidate>();
+            let owned_candidates;
+            let candidates = if let Some(candidates) = state.metadata_map().get::<PromotionCandidates>() {
+                Some(candidates)
+            } else {
+                owned_candidates = singleton.map(PromotionCandidates::from_singleton);
+                owned_candidates.as_ref()
+            };
+            let Some(cand) = candidates.and_then(|candidates| {
+                candidates.first_set(&[
+                    crate::evm::leak_class::LeakClass::Value,
+                    crate::evm::leak_class::LeakClass::Invariant,
+                    crate::evm::leak_class::LeakClass::Permission,
+                ])
+            }) else {
                 return false;
             };
-            if !cand.set {
-                return false;
-            }
             (cand.contract, cand.selector, cand.kind)
         };
         // Pin the matching step in the current campaign, if any and not already pinned.
-        let Some(campaign) = input.get_campaign_mut() else { return false };
+        let Some(campaign) = input.get_campaign_mut() else {
+            return false;
+        };
         if !campaign.promoted.is_empty() {
             return false;
         }
@@ -770,11 +818,13 @@ where
             // Feature 025 (Parameter-Bound skew): the secant amplifies a MAGNITUDE. A VALUE
             // candidate's magnitude is its transferred amount; a structural (Permission)
             // candidate's magnitude — when it exists — is a *setter argument* (setFee /
-            // setRewardRate / updatePoolParams / …). `secant_promotable` is the pure decision:
-            // Value always; Permission only with ≥1 arg slot (no-arg reach has nothing to tune
-            // → left to 024's Prime-lock); any other kind is not a lever here. Arg *type* is not
-            // gated — LOCATE (below) rotates args by measured ledger sensitivity, so an address/
-            // bool arg self-deprioritizes. (Pre-025 was Value-only; the value path is unchanged.)
+            // setRewardRate / updatePoolParams / …). `secant_promotable` is the pure
+            // decision: Value always; Permission only with ≥1 arg slot (no-arg
+            // reach has nothing to tune → left to 024's Prime-lock); any other
+            // kind is not a lever here. Arg *type* is not gated — LOCATE
+            // (below) rotates args by measured ledger sensitivity, so an address/
+            // bool arg self-deprioritizes. (Pre-025 was Value-only; the value path is
+            // unchanged.)
             let n_args = campaign.steps[idx]
                 .data
                 .as_ref()
@@ -798,16 +848,24 @@ where
             return false;
         }
 
-        // Gate: the input must carry a campaign whose first promoted step has tunable args.
+        // Gate: the input must carry a campaign whose first promoted step has tunable
+        // args.
         let (pin_step, n_args) = {
-            let Some(campaign) = input.get_campaign() else { return false };
-            let Some(&pin) = campaign.promoted.first() else { return false };
-            let Some(step) = campaign.steps.get(pin) else { return false };
+            let Some(campaign) = input.get_campaign() else {
+                return false;
+            };
+            let Some(&pin) = campaign.promoted.first() else {
+                return false;
+            };
+            let Some(step) = campaign.steps.get(pin) else {
+                return false;
+            };
             let n = step.data.as_ref().map(|a| a.get_bytes_vec().len() / 32).unwrap_or(0);
             (pin, n)
         };
         if n_args == 0 {
-            return false; // no addressable arg words (e.g. an empty-ABI fixture) — nothing to tune.
+            return false; // no addressable arg words (e.g. an empty-ABI
+                          // fixture) — nothing to tune.
         }
 
         // Scale-adaptive probe/march, floored so a planner default of 0 can still grow.
@@ -824,7 +882,11 @@ where
             .unwrap_or_default();
         // Re-plan drift: if the pinned frame changed under us, restart bookkeeping.
         if s.pin_step != pin_step || s.n_args != n_args {
-            s = crate::feedback::LedgerSecantState { pin_step, n_args, ..Default::default() };
+            s = crate::feedback::LedgerSecantState {
+                pin_step,
+                n_args,
+                ..Default::default()
+            };
         }
 
         let arg = if s.located { s.arg_idx } else { s.locate_cursor % n_args };
@@ -857,7 +919,10 @@ where
                             }
                             let prov_map = if let Some(cur) = *state.corpus().current() {
                                 if let Ok(tc) = state.corpus().get(cur) {
-                                    tc.borrow().metadata_map().get::<crate::evm::feedbacks::ArgStorageProvenance>().cloned()
+                                    tc.borrow()
+                                        .metadata_map()
+                                        .get::<crate::evm::feedbacks::ArgStorageProvenance>()
+                                        .cloned()
                                 } else {
                                     None
                                 }
@@ -933,8 +998,7 @@ where
                 // AMPLIFY: interpolate the peak on a `+→−` bracket, else march the knob.
                 let next_x = match s.prev_slope {
                     Some(g_prev) if g_prev > 0 && local_slope < 0 && s.x1 > s.prev_x1 => {
-                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1)
-                            .unwrap_or(s.x1)
+                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1).unwrap_or(s.x1)
                     }
                     _ => {
                         // Multiplicative-ish trust-region march, floored for x1 == 0.
@@ -961,14 +1025,16 @@ where
 
     /// Feature 029 — Phase 1 divergence optimization secant.
     ///
-    /// Reads the post-execution oracle divergence magnitude (`read_divergence()`) and
-    /// tunes `txn_value` toward the divergence maximum (compound ceiling). Uses the same
-    /// signed-slope bracket and `secant_step_signed` as the ledger secant, but targets
-    /// oracle divergence instead of profit. No campaign/promoted machinery — tunes the
-    /// top-level `txn_value` directly.
+    /// Reads the post-execution oracle divergence magnitude
+    /// (`read_divergence()`) and tunes `txn_value` toward the divergence
+    /// maximum (compound ceiling). Uses the same signed-slope bracket and
+    /// `secant_step_signed` as the ledger secant, but targets
+    /// oracle divergence instead of profit. No campaign/promoted machinery —
+    /// tunes the top-level `txn_value` directly.
     ///
-    /// Inert after `pin_gate` is set (P1→P3 handoff: divergence peaked, extraction takes over).
-    /// Inert when divergence is 0 (no oracle published) — trivial gate keeps it off-path.
+    /// Inert after `pin_gate` is set (P1→P3 handoff: divergence peaked,
+    /// extraction takes over). Inert when divergence is 0 (no oracle
+    /// published) — trivial gate keeps it off-path.
     fn apply_divergence_secant<I, S>(&self, input: &mut I, state: &mut S) -> bool
     where
         I: VMInputT<VS, Loc, Addr, CI> + EVMInputT,
@@ -991,7 +1057,10 @@ where
         const COOLDOWN: u32 = 8;
 
         let read_value = |input: &I| -> u128 {
-            input.get_txn_value().map(crate::evm::host::evmu256_to_u128_sat).unwrap_or(0)
+            input
+                .get_txn_value()
+                .map(crate::evm::host::evmu256_to_u128_sat)
+                .unwrap_or(0)
         };
 
         match s.phase {
@@ -1033,8 +1102,7 @@ where
                     // +→− bracket: the peak lies between prev_x1 and current x1.
                     Some(g_prev) if g_prev > 0 && local_slope < 0 && s.x1 > s.prev_x1 => {
                         bracketed = true;
-                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1)
-                            .unwrap_or(s.x1)
+                        secant_step_signed(s.prev_x1, g_prev, local_slope, s.x1 - s.prev_x1).unwrap_or(s.x1)
                     }
                     _ => {
                         let march = (s.x1 / 2).max(PROBE_DELTA / 1000);
@@ -1066,8 +1134,8 @@ where
     }
 }
 
-/// Feature 015 — read a promoted campaign step's arg word as u128 (lower 16 bytes).
-/// `0` when the step/arg is absent (empty ABI, out-of-range index).
+/// Feature 015 — read a promoted campaign step's arg word as u128 (lower 16
+/// bytes). `0` when the step/arg is absent (empty ABI, out-of-range index).
 fn read_step_arg_u128(campaign: &Option<CampaignSequence>, pin_step: usize, arg_idx: usize) -> u128 {
     let Some(c) = campaign else { return 0 };
     let Some(step) = c.steps.get(pin_step) else { return 0 };
@@ -1082,8 +1150,9 @@ fn read_step_arg_u128(campaign: &Option<CampaignSequence>, pin_step: usize, arg_
     u128::from_be_bytes(b)
 }
 
-/// Feature 015 — write a u128 into a promoted campaign step's arg word (lower 16 bytes,
-/// big-endian) and re-encode the step's calldata. No-op when the step/arg is absent.
+/// Feature 015 — write a u128 into a promoted campaign step's arg word (lower
+/// 16 bytes, big-endian) and re-encode the step's calldata. No-op when the
+/// step/arg is absent.
 fn write_step_arg_u128(campaign: &mut Option<CampaignSequence>, pin_step: usize, arg_idx: usize, value: u128) {
     let Some(c) = campaign else { return };
     let Some(step) = c.steps.get_mut(pin_step) else { return };
@@ -1115,7 +1184,15 @@ where
 impl<VS, Loc, Addr, I, S, SC, CI> Mutator<I, S> for FuzzMutator<VS, Loc, Addr, SC, CI>
 where
     I: VMInputT<VS, Loc, Addr, CI> + Input + EVMInputT,
-    S: State + HasRand + HasMaxSize + HasItyState<Loc, Addr, VS, CI> + HasCaller<Addr> + HasCaller<EVMAddress> + HasMetadata + HasPresets + HasCorpus,
+    S: State
+        + HasRand
+        + HasMaxSize
+        + HasItyState<Loc, Addr, VS, CI>
+        + HasCaller<Addr>
+        + HasCaller<EVMAddress>
+        + HasMetadata
+        + HasPresets
+        + HasCorpus,
     SC: Scheduler<State = InfantStateState<Loc, Addr, VS, CI>>,
     VS: Default + VMStateT + EVMStateT,
     Addr: PartialEq + Debug + Serialize + DeserializeOwned + Clone,
@@ -1142,7 +1219,11 @@ where
                         // and where. Over a run this shows whether the exploit SHAPE engages
                         // (selectors called in the seeded order) — the controlled-experiment
                         // measurement of intelligence/data-flow alignment.
-                        tracing::info!("[preset-tel] served selector=0x{} target={:?}", hex::encode(abi.function), addr);
+                        tracing::info!(
+                            "[preset-tel] served selector=0x{} target={:?}",
+                            hex::encode(abi.function),
+                            addr
+                        );
                         input.set_contract_and_abi(addr, Some(abi));
                         input.mutate(state);
                         return Ok(MutationResult::Mutated);
@@ -1153,13 +1234,15 @@ where
                 }
             }
         }
-        // Campaign generation: probability scaled by topology confidence when orchestrator is enabled
+        // Campaign generation: probability scaled by topology confidence when
+        // orchestrator is enabled
         if self.campaign_orchestrator {
             let campaign_threshold = if let Some(hints) = state.metadata_map().get::<TopologyHints>() {
                 let max_conf = hints.sets.iter().map(|s| s.confidence).max().unwrap_or(0) as f64;
                 // Scale: base * (1 + (confidence/100) * bias). bias (--topology-bias) dials
                 // the steer from floodlight (1.0) to nudge (0.3 default) to off (0.0).
-                ((CAMPAIGN_CHOICE as f64) * (1.0 + (max_conf / 100.0) * hints.bias)).min(MUTATOR_SAMPLE_MAX as f64) as u64
+                ((CAMPAIGN_CHOICE as f64) * (1.0 + (max_conf / 100.0) * hints.bias)).min(MUTATOR_SAMPLE_MAX as f64)
+                    as u64
             } else {
                 CAMPAIGN_CHOICE
             };
@@ -1180,54 +1263,55 @@ where
                     // Permission + Ownership → Prime slot (structural prerequisite).
                     // Value + Invariant → Lever slot (magnitude-tunable, secant-amplified).
                     // ControlFlow: no producer yet (oracle-side gap).
-                    let structural_pin = state
-                        .metadata_map()
-                        .get::<PromotionCandidate>()
-                        .filter(|c| {
-                            c.set && matches!(
-                                c.kind,
-                                crate::evm::leak_class::LeakClass::Permission
-                                    | crate::evm::leak_class::LeakClass::Ownership
-                            )
+                    let singleton_candidate = state.metadata_map().get::<PromotionCandidate>();
+                    let owned_candidates;
+                    let candidates = if let Some(candidates) = state.metadata_map().get::<PromotionCandidates>() {
+                        Some(candidates)
+                    } else {
+                        owned_candidates = singleton_candidate.map(PromotionCandidates::from_singleton);
+                        owned_candidates.as_ref()
+                    };
+                    let structural_pin = candidates
+                        .and_then(|candidates| {
+                            candidates.first_set(&[
+                                crate::evm::leak_class::LeakClass::Ownership,
+                                crate::evm::leak_class::LeakClass::Permission,
+                            ])
                         })
                         .map(|c| (c.contract, c.selector));
                     // Feature 031 — dynamic Value/Invariant lever: runtime-discovered
                     // (contract, selector) injected as Lever step by the planner. Invariant
                     // violations join Value here — both maximize an unsigned objective magnitude
                     // via the same secant loop. Supersedes the static 14-selector list.
-                    let value_lever_pin = state
-                        .metadata_map()
-                        .get::<PromotionCandidate>()
-                        .filter(|c| c.set && matches!(
-                            c.kind,
-                            crate::evm::leak_class::LeakClass::Value
-                                | crate::evm::leak_class::LeakClass::Invariant
-                        ))
+                    let value_lever_pin = candidates
+                        .and_then(|candidates| {
+                            candidates.first_set(&[
+                                crate::evm::leak_class::LeakClass::Value,
+                                crate::evm::leak_class::LeakClass::Invariant,
+                            ])
+                        })
                         .map(|c| (c.contract, c.selector));
                     // §7d content re-point: pick a topology-classified capital-source token for the
                     // Borrow slot — a borrowable whose contract exposes FlashLoan/Lending/ERC4626
                     // (per-contract families). None ⇒ planner keeps the blind `.first()` behavior.
-                    let borrow_authority = state
-                        .metadata_map()
-                        .get::<TopologyHints>()
-                        .and_then(|h| {
-                            cache
-                                .borrowable_tokens
-                                .iter()
-                                .find(|t| {
-                                    h.contract_families.get(*t).map_or(false, |fams| {
-                                        fams.iter().any(|f| {
-                                            matches!(
-                                                f,
-                                                crate::evm::topology::ProtocolFamily::FlashLoan
-                                                    | crate::evm::topology::ProtocolFamily::Lending
-                                                    | crate::evm::topology::ProtocolFamily::ERC4626
-                                            )
-                                        })
+                    let borrow_authority = state.metadata_map().get::<TopologyHints>().and_then(|h| {
+                        cache
+                            .borrowable_tokens
+                            .iter()
+                            .find(|t| {
+                                h.contract_families.get(*t).map_or(false, |fams| {
+                                    fams.iter().any(|f| {
+                                        matches!(
+                                            f,
+                                            crate::evm::topology::ProtocolFamily::FlashLoan |
+                                                crate::evm::topology::ProtocolFamily::Lending |
+                                                crate::evm::topology::ProtocolFamily::ERC4626
+                                        )
                                     })
                                 })
-                                .copied()
-                        });
+                            })
+                            .copied()
+                    });
                     // Feature 029 Phase 2 — divergence pin: when the secant has converged
                     // (pin_gate), publish the divergence-maximized x so the planner pre-loads
                     // the first non-borrow step's txn_value. None ⇒ no pin (normal path).
@@ -1236,7 +1320,18 @@ where
                         .get::<crate::feedback::DivergenceSecantState>()
                         .filter(|d| d.pin_gate)
                         .map(|d| d.x1);
-                    if let Some(campaign) = plan_campaign_sampled(cache, topology_report, self.temporal_skimming, self.reflexive_lever, self.dimension_warp, structural_pin, value_lever_pin, borrow_authority, divergence_value, &mut plan_rand) {
+                    if let Some(campaign) = plan_campaign_sampled(
+                        cache,
+                        topology_report,
+                        self.temporal_skimming,
+                        self.reflexive_lever,
+                        self.dimension_warp,
+                        structural_pin,
+                        value_lever_pin,
+                        borrow_authority,
+                        divergence_value,
+                        &mut plan_rand,
+                    ) {
                         // Telemetry: the multi-step CHAIN the fuzzer assembled — does it
                         // sequence the exploit selectors (add_liquidity -> remove_imbalance ->
                         // deposit/withdraw) into a real sentence, or just isolated words? This
@@ -1301,9 +1396,10 @@ where
             }
         }
 
-        // Feature 015 Phase 2 (a-posteriori Promote): pin the discovered ledger-moving belly
-        // call BEFORE the AMPLIFY step, so the secant can tune it in this same pass. Inert
-        // until the feedback has recorded a candidate on a novel (archetype-less) target.
+        // Feature 015 Phase 2 (a-posteriori Promote): pin the discovered ledger-moving
+        // belly call BEFORE the AMPLIFY step, so the secant can tune it in this
+        // same pass. Inert until the feedback has recorded a candidate on a
+        // novel (archetype-less) target.
         if self.reflexive_lever {
             if self.maybe_pin_aposteriori_lever(input, state) {
                 mutated = true;
@@ -1311,8 +1407,9 @@ where
         }
 
         // Feature 015: ledger-guided AMPLIFY of a promoted reflexive-skew lever. Not
-        // cmp-gated (its signal is the post-execution ledger, not CMP_MAP); self-gates on
-        // `reflexive_lever` + presence of a promoted step, so it is inert off-path.
+        // cmp-gated (its signal is the post-execution ledger, not CMP_MAP); self-gates
+        // on `reflexive_lever` + presence of a promoted step, so it is inert
+        // off-path.
         if self.reflexive_lever && state.rand_mut().below(100) < 40 {
             if self.apply_ledger_secant(input, state) {
                 mutated = true;
@@ -1377,8 +1474,9 @@ where
                     }
                 }
                 // (Context — the contract being called — is already captured here: you call
-                // it, it returns a value, so it lands in observed_values and thus in `informed`.
-                // That's the natural reentrancy re-entry, arrived at via value flow.)
+                // it, it returns a value, so it lands in observed_values and thus in
+                // `informed`. That's the natural reentrancy re-entry, arrived
+                // at via value flow.)
 
                 let keys: Option<Vec<EVMAddress>> = if !informed.is_empty() {
                     Some(informed)
@@ -1411,7 +1509,14 @@ where
                                 state,
                                 None,
                                 Some(target_addr),
-                                Some(&input.get_state().as_any().downcast_ref::<EVMState>().unwrap().observed_values),
+                                Some(
+                                    &input
+                                        .get_state()
+                                        .as_any()
+                                        .downcast_ref::<EVMState>()
+                                        .unwrap()
+                                        .observed_values,
+                                ),
                             );
                             let calldata = abi.get_bytes();
                             let actions = input.get_nested_actions_mut();
@@ -1424,7 +1529,8 @@ where
                                 // from TrustedCallerMetadata (Ghost Identities feature)
                                 let trusted_addr = if self.ghost_identities {
                                     let key = format!("0x{:?}_0x{:?}", target_addr, selector);
-                                    let trusted_set = state.metadata_map()
+                                    let trusted_set = state
+                                        .metadata_map()
                                         .get::<TrustedCallerMetadata>()
                                         .and_then(|m| m.trusted_callers.get(&key).cloned());
                                     if let Some(set) = trusted_set {
@@ -1444,7 +1550,8 @@ where
 
                                 let prank_addr = trusted_addr.or_else(|| {
                                     // Fallback to WhaleAddressMetadata
-                                    let whale_set = state.metadata_map()
+                                    let whale_set = state
+                                        .metadata_map()
                                         .get::<WhaleAddressMetadata>()
                                         .map(|w| w.addresses.clone());
                                     if let Some(set) = whale_set {
@@ -1517,8 +1624,9 @@ where
 
             // Re-sample function selector with 10% probability
             // Prevents getting stuck on a single function (e.g. deposit()).
-            // Prefers contracts where value flows (value-capture feedback), not oracle-flagged
-            // targets — informs the re-sample from the program, doesn't force it from our prior.
+            // Prefers contracts where value flows (value-capture feedback), not
+            // oracle-flagged targets — informs the re-sample from the program,
+            // doesn't force it from our prior.
             if state.rand_mut().below(100) < 10 {
                 let abi_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
 
@@ -1680,17 +1788,21 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
     use alloy_sol_types::{SolCall, SolInterface};
     use bytes::Bytes;
     use foundry_cheatcodes::Vm::{self, VmCalls};
     use libafl::state::HasMetadata;
     use serde_json;
-    use crate::evm::abi::{AEmpty, A256, A256InnerType, ABIAddressToInstanceMap};
-    use crate::evm::input::{EVMInput, EVMInputT, EVMInputTy};
-    use crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS;
-    use crate::evm::oracles::{OracleTargetMetadata, WhaleAddressMetadata, TrustedCallerMetadata};
-    use crate::evm::types::{EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256};
-    use crate::evm::mutator::BoxedABI;
+
+    use crate::evm::{
+        abi::{A256InnerType, ABIAddressToInstanceMap, AEmpty, A256},
+        input::{EVMInput, EVMInputT, EVMInputTy},
+        middlewares::cheatcode::CHEATCODE_ADDRESS,
+        mutator::BoxedABI,
+        oracles::{OracleTargetMetadata, TrustedCallerMetadata, WhaleAddressMetadata},
+        types::{EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256},
+    };
 
     // Serializes tests that mutate the global CMP_MAP/CMP_PC statics so they don't
     // race each other under parallel execution (cargo's default). Poison-tolerant.
@@ -1708,7 +1820,9 @@ mod tests {
         }
         let meta = state.metadata_map_mut().get_mut::<OracleTargetMetadata>().unwrap();
         let addr = [0x01u8; 20];
-        meta.targets.entry(addr).or_insert_with(|| ("ArbitraryCall".to_string(), 8, 1));
+        meta.targets
+            .entry(addr)
+            .or_insert_with(|| ("ArbitraryCall".to_string(), 8, 1));
         meta.targets.get_mut(&addr).unwrap().2 += 1;
 
         assert_eq!(meta.targets.get(&addr).unwrap().2, 2);
@@ -1747,9 +1861,23 @@ mod tests {
         ];
 
         let abis: Vec<BoxedABI> = vec![
-            BoxedABI { b: Box::new(AEmpty {}), function: selectors[0] },
-            BoxedABI { b: Box::new(A256 { data: vec![0; 32], is_address: false, dont_mutate: false, inner_type: A256InnerType::Uint }), function: selectors[1] },
-            BoxedABI { b: Box::new(AEmpty {}), function: selectors[2] },
+            BoxedABI {
+                b: Box::new(AEmpty {}),
+                function: selectors[0],
+            },
+            BoxedABI {
+                b: Box::new(A256 {
+                    data: vec![0; 32],
+                    is_address: false,
+                    dont_mutate: false,
+                    inner_type: A256InnerType::Uint,
+                }),
+                function: selectors[1],
+            },
+            BoxedABI {
+                b: Box::new(AEmpty {}),
+                function: selectors[2],
+            },
         ];
 
         input.set_contract_and_abi(contract, Some(abis[0].clone()));
@@ -1778,9 +1906,32 @@ mod tests {
         let withdraw_sel = [0x2e, 0x1a, 0x7d, 0x4d];
 
         let mut abi_map = ABIAddressToInstanceMap::new();
-        abi_map.add(contract_a, BoxedABI { b: Box::new(AEmpty {}), function: deposit_sel });
-        abi_map.add(contract_a, BoxedABI { b: Box::new(A256 { data: vec![0; 32], is_address: false, dont_mutate: false, inner_type: A256InnerType::Uint }), function: withdraw_sel });
-        abi_map.add(contract_b, BoxedABI { b: Box::new(AEmpty {}), function: deposit_sel });
+        abi_map.add(
+            contract_a,
+            BoxedABI {
+                b: Box::new(AEmpty {}),
+                function: deposit_sel,
+            },
+        );
+        abi_map.add(
+            contract_a,
+            BoxedABI {
+                b: Box::new(A256 {
+                    data: vec![0; 32],
+                    is_address: false,
+                    dont_mutate: false,
+                    inner_type: A256InnerType::Uint,
+                }),
+                function: withdraw_sel,
+            },
+        );
+        abi_map.add(
+            contract_b,
+            BoxedABI {
+                b: Box::new(AEmpty {}),
+                function: deposit_sel,
+            },
+        );
 
         assert_eq!(abi_map.map.get(&contract_a).unwrap().len(), 2);
         assert_eq!(abi_map.map.get(&contract_b).unwrap().len(), 1);
@@ -1790,7 +1941,10 @@ mod tests {
 
     #[test]
     fn test_prank_action_abi_encoding() {
-        let whale = EVMAddress::from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let whale = EVMAddress::from([
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
 
         // Encode vm.prank(whale)
         let prank_call = Vm::prank_0Call { msgSender: whale };
@@ -1815,7 +1969,10 @@ mod tests {
             calldata: bytes::Bytes::from(encoded),
             value: EVMU256::ZERO,
         };
-        assert_eq!(action.target.as_slice(), crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS.as_slice());
+        assert_eq!(
+            action.target.as_slice(),
+            crate::evm::middlewares::cheatcode::CHEATCODE_ADDRESS.as_slice()
+        );
     }
 
     #[test]
@@ -1825,12 +1982,20 @@ mod tests {
 
         // Simulate what corpus_initializer does: insert WhaleAddressMetadata
         let mut addresses = HashSet::new();
-        addresses.insert(EVMAddress::from([0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]));
-        addresses.insert(EVMAddress::from([0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]));
+        addresses.insert(EVMAddress::from([
+            0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]));
+        addresses.insert(EVMAddress::from([
+            0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]));
         state.metadata_map_mut().insert(WhaleAddressMetadata { addresses });
 
         // Verify metadata is populated
-        let meta = state.metadata_map().get::<WhaleAddressMetadata>()
+        let meta = state
+            .metadata_map()
+            .get::<WhaleAddressMetadata>()
             .expect("WhaleAddressMetadata should exist after insert");
         assert_eq!(meta.addresses.len(), 2, "Should have 2 whale addresses");
 
@@ -1841,7 +2006,10 @@ mod tests {
 
     #[test]
     fn test_start_stop_prank_action_abi_encoding() {
-        let whale = EVMAddress::from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let whale = EVMAddress::from([
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
 
         // 1. Encode vm.startPrank(whale)
         let start_call = Vm::startPrank_0Call { msgSender: whale };
@@ -1859,7 +2027,11 @@ mod tests {
         // 2. Encode vm.stopPrank()
         let stop_call = Vm::stopPrankCall {};
         let stop_encoded = stop_call.abi_encode();
-        assert_eq!(stop_encoded.len(), 4, "stopPrank has no arguments, should be 4-byte selector");
+        assert_eq!(
+            stop_encoded.len(),
+            4,
+            "stopPrank has no arguments, should be 4-byte selector"
+        );
 
         let decoded_stop = VmCalls::abi_decode(&stop_encoded).expect("stopPrank decode should succeed");
         match decoded_stop {
@@ -1888,7 +2060,10 @@ mod tests {
         let encoded = serde_json::to_string(&meta).expect("serialize should succeed");
         let decoded: TrustedCallerMetadata = serde_json::from_str(&encoded).expect("deserialize should succeed");
 
-        let entry = decoded.trusted_callers.get(&key).expect("key should exist after round-trip");
+        let entry = decoded
+            .trusted_callers
+            .get(&key)
+            .expect("key should exist after round-trip");
         assert_eq!(entry.len(), 2, "should have 2 trusted callers");
         assert!(entry.contains(&addr_a));
         assert!(entry.contains(&addr_b));
@@ -1907,10 +2082,14 @@ mod tests {
 
         let mut callers = HashSet::new();
         callers.insert(trusted);
-        let meta = TrustedCallerMetadata { trusted_callers: HashMap::from([(key.clone(), callers)]) };
+        let meta = TrustedCallerMetadata {
+            trusted_callers: HashMap::from([(key.clone(), callers)]),
+        };
         state.metadata_map_mut().insert(meta);
 
-        let stored = state.metadata_map().get::<TrustedCallerMetadata>()
+        let stored = state
+            .metadata_map()
+            .get::<TrustedCallerMetadata>()
             .expect("TrustedCallerMetadata should exist");
         let entry = stored.trusted_callers.get(&key).expect("key should exist");
         assert!(entry.contains(&trusted));
@@ -1924,14 +2103,24 @@ mod tests {
         let mut state = EVMFuzzState::new(0);
 
         let mut whale_addrs = HashSet::new();
-        let whale = EVMAddress::from([0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let whale = EVMAddress::from([
+            0xde, 0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
         whale_addrs.insert(whale);
-        state.metadata_map_mut().insert(WhaleAddressMetadata { addresses: whale_addrs });
+        state
+            .metadata_map_mut()
+            .insert(WhaleAddressMetadata { addresses: whale_addrs });
 
-        assert!(state.metadata_map().get::<TrustedCallerMetadata>().is_none(),
-            "TrustedCallerMetadata should not exist when not inserted");
+        assert!(
+            state.metadata_map().get::<TrustedCallerMetadata>().is_none(),
+            "TrustedCallerMetadata should not exist when not inserted"
+        );
 
-        let whales = state.metadata_map().get::<WhaleAddressMetadata>().expect("WhaleAddressMetadata should exist");
+        let whales = state
+            .metadata_map()
+            .get::<WhaleAddressMetadata>()
+            .expect("WhaleAddressMetadata should exist");
         assert_eq!(whales.addresses.len(), 1);
         assert!(whales.addresses.contains(&whale));
     }
@@ -1939,14 +2128,22 @@ mod tests {
     #[test]
     fn test_trusted_caller_metadata_empty_is_default() {
         let meta = TrustedCallerMetadata::default();
-        assert!(meta.trusted_callers.is_empty(), "default TrustedCallerMetadata should have empty map");
+        assert!(
+            meta.trusted_callers.is_empty(),
+            "default TrustedCallerMetadata should have empty map"
+        );
 
         let mut state = EVMFuzzState::new(0);
         state.metadata_map_mut().insert(TrustedCallerMetadata::default());
 
-        let stored = state.metadata_map().get::<TrustedCallerMetadata>()
+        let stored = state
+            .metadata_map()
+            .get::<TrustedCallerMetadata>()
             .expect("TrustedCallerMetadata should exist after insert");
-        assert!(stored.trusted_callers.is_empty(), "stored metadata should have empty trusted_callers map");
+        assert!(
+            stored.trusted_callers.is_empty(),
+            "stored metadata should have empty trusted_callers map"
+        );
     }
 
     #[test]
@@ -2004,7 +2201,9 @@ mod tests {
             snapshot_block: EVMU256::from(100u64),
         });
 
-        let stored = state.metadata_map().get::<TemporalBalanceSnapshot>()
+        let stored = state
+            .metadata_map()
+            .get::<TemporalBalanceSnapshot>()
             .expect("TemporalBalanceSnapshot should exist");
         assert_eq!(stored.balances.len(), 1);
         assert_eq!(stored.balances[&key], EVMU256::from(500u64));
@@ -2029,10 +2228,17 @@ mod tests {
         assert!(campaign.promoted.is_empty());
         // Verify backward compatibility: default when deserialized from old format
         let json = r#"{"steps":[],"linkages":[]}"#;
-        let decoded: crate::evm::input::CampaignSequence = serde_json::from_str(json).expect("should deserialize without warps field");
-        assert!(decoded.warps.is_empty(), "warps should default to empty for backward compat");
+        let decoded: crate::evm::input::CampaignSequence =
+            serde_json::from_str(json).expect("should deserialize without warps field");
+        assert!(
+            decoded.warps.is_empty(),
+            "warps should default to empty for backward compat"
+        );
         // Feature 015: pre-015 JSON (no `promoted` key) must default to empty.
-        assert!(decoded.promoted.is_empty(), "promoted should default to empty for backward compat");
+        assert!(
+            decoded.promoted.is_empty(),
+            "promoted should default to empty for backward compat"
+        );
     }
 
     #[test]
@@ -2046,8 +2252,7 @@ mod tests {
             aposteriori: false,
         };
         let encoded = serde_json::to_string(&campaign).expect("serialize");
-        let decoded: crate::evm::input::CampaignSequence =
-            serde_json::from_str(&encoded).expect("deserialize");
+        let decoded: crate::evm::input::CampaignSequence = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.promoted, vec![1, 3], "promoted indices round-trip");
         assert_eq!(decoded.warps, vec![(2, 10)]);
     }
@@ -2087,7 +2292,10 @@ mod tests {
         assert_eq!(def.phase, SecantPhase::Idle);
         assert!(!def.located);
         assert_eq!(def.prev_slope, None);
-        assert_eq!(def.located_dim, crate::evm::middlewares::cmp_linearity::TaintDim::Generic);
+        assert_eq!(
+            def.located_dim,
+            crate::evm::middlewares::cmp_linearity::TaintDim::Generic
+        );
     }
 
     // ── Tier 1: snapshot-secant unit fixtures (Feature 008) ─────────────────
@@ -2115,14 +2323,16 @@ mod tests {
             Some(60),
             "bracketed +/− slopes must interpolate the derivative's root (the peak)"
         );
-        // Asymmetric hump: slope still steep (+300) at x1, mildly negative (−100) at x1+δ
-        // ⇒ peak sits closer to the RIGHT probe. x* = 10 + 300·100/400 = 85.
+        // Asymmetric hump: slope still steep (+300) at x1, mildly negative (−100) at
+        // x1+δ ⇒ peak sits closer to the RIGHT probe. x* = 10 + 300·100/400 =
+        // 85.
         assert_eq!(super::secant_step_signed(10, 300, -100, 100), Some(85));
     }
 
     #[test]
     fn test_secant_step_signed_none_when_not_a_peak() {
-        // Monotone increasing (peak beyond the bracket) → None (step further, don't solve).
+        // Monotone increasing (peak beyond the bracket) → None (step further, don't
+        // solve).
         assert_eq!(super::secant_step_signed(10, 200, 100, 100), None);
         // Monotone decreasing (past the peak / wrong side) → None.
         assert_eq!(super::secant_step_signed(10, -100, -200, 100), None);
@@ -2144,37 +2354,55 @@ mod tests {
     #[cfg(feature = "cmp")]
     #[test]
     fn test_secant_step_geometric_recovers_multiplicative_lever() {
-        // The linear secant ABANDONS the "distance grew with x" case (d2 > d1 ⇒ None) — but on a
-        // multiplicative/inverted surface that just means the lever should move the OTHER way.
-        // 027 log-space secant extracts a meaningful step there instead of only requeueing concolic.
+        // The linear secant ABANDONS the "distance grew with x" case (d2 > d1 ⇒ None) —
+        // but on a multiplicative/inverted surface that just means the lever
+        // should move the OTHER way. 027 log-space secant extracts a meaningful
+        // step there instead of only requeueing concolic.
         let x1 = 1_000_000u128;
-        assert_eq!(super::secant_step(x1, 900, 1000, 100), None, "linear gives up when distance grows");
+        assert_eq!(
+            super::secant_step(x1, 900, 1000, 100),
+            None,
+            "linear gives up when distance grows"
+        );
         let g = super::secant_step_geometric(x1, 900, 1000, 100).expect("geometric recovers a step");
-        assert!(g < x1, "distance grew with x ⇒ geometric inverts direction (decrease x)");
+        assert!(
+            g < x1,
+            "distance grew with x ⇒ geometric inverts direction (decrease x)"
+        );
         assert!(g >= 1, "clamped into the arg domain");
 
-        // Same direction as linear when distance shrinks with x (d1 > d2): step UP toward the flip.
+        // Same direction as linear when distance shrinks with x (d1 > d2): step UP
+        // toward the flip.
         let up = super::secant_step_geometric(x1, 1000, 900, 100).expect("geometric solves shrink case");
         assert!(up > x1, "distance shrank with x ⇒ push x up");
 
         // Degenerate probes → None (mirror the linear guards).
-        assert_eq!(super::secant_step_geometric(0, 900, 1000, 100), None, "x1==0 undefined for ln");
+        assert_eq!(
+            super::secant_step_geometric(0, 900, 1000, 100),
+            None,
+            "x1==0 undefined for ln"
+        );
         assert_eq!(super::secant_step_geometric(x1, 500, 500, 100), None, "flat gradient");
         assert_eq!(super::secant_step_geometric(x1, 900, 1000, 0), None, "zero probe delta");
     }
 
     #[test]
     fn arg_reaches_storage_is_cross_contract() {
-        use super::{arg_reaches_storage, EVMAddress, EVMU256};
         use std::collections::HashMap;
+
+        use super::{arg_reaches_storage, EVMAddress, EVMU256};
         let proxy_target = EVMAddress::from([0xBBu8; 20]);
         let own = EVMAddress::from([0xAAu8; 20]);
-        // arg 2's provenance bit is recorded ONLY in a DIFFERENT contract's slot (a callee / proxy
-        // target). 028: this must count as reaching storage — the pre-028 same-contract filter
-        // would have skipped arg 2 and dropped the cross-contract lever.
+        // arg 2's provenance bit is recorded ONLY in a DIFFERENT contract's slot (a
+        // callee / proxy target). 028: this must count as reaching storage —
+        // the pre-028 same-contract filter would have skipped arg 2 and dropped
+        // the cross-contract lever.
         let mut per_slot: HashMap<(EVMAddress, EVMU256), u64> = HashMap::new();
         per_slot.insert((proxy_target, EVMU256::from(7u64)), 1u64 << 2);
-        assert!(arg_reaches_storage(&per_slot, 2), "callee-only storage effect counts (cross-contract)");
+        assert!(
+            arg_reaches_storage(&per_slot, 2),
+            "callee-only storage effect counts (cross-contract)"
+        );
         // an arg touching no storage anywhere is still skippable.
         assert!(!arg_reaches_storage(&per_slot, 5), "no storage effect ⇒ skippable");
         // own-contract storage still counts (common case unchanged).
@@ -2247,17 +2475,39 @@ mod tests {
         // Value is a magnitude regardless of arg count (pre-025 behaviour, unchanged).
         assert!(secant_promotable(LeakClass::Value, 0), "Value always promotes");
         assert!(secant_promotable(LeakClass::Value, 3), "Value always promotes");
-        // 025: a Permission (structural) candidate is a lever ONLY when it carries a setter arg.
-        assert!(!secant_promotable(LeakClass::Permission, 0), "no-arg reach → 024 Prime-lock, not secant");
-        assert!(secant_promotable(LeakClass::Permission, 1), "setter with one arg → tunable magnitude");
-        assert!(secant_promotable(LeakClass::Permission, 4), "setter with several args → tunable");
-        // Invariant is now a magnitude lever: violation depth (best_inflow stores |delta|)
-        // is maximized by the same unsigned secant loop as Value inflow.
-        assert!(secant_promotable(LeakClass::Invariant, 0), "Invariant violation depth is secant-tunable");
-        assert!(secant_promotable(LeakClass::Invariant, 2), "Invariant violation depth is secant-tunable");
+        // 025: a Permission (structural) candidate is a lever ONLY when it carries a
+        // setter arg.
+        assert!(
+            !secant_promotable(LeakClass::Permission, 0),
+            "no-arg reach → 024 Prime-lock, not secant"
+        );
+        assert!(
+            secant_promotable(LeakClass::Permission, 1),
+            "setter with one arg → tunable magnitude"
+        );
+        assert!(
+            secant_promotable(LeakClass::Permission, 4),
+            "setter with several args → tunable"
+        );
+        // Invariant is now a magnitude lever: violation depth (best_inflow stores
+        // |delta|) is maximized by the same unsigned secant loop as Value
+        // inflow.
+        assert!(
+            secant_promotable(LeakClass::Invariant, 0),
+            "Invariant violation depth is secant-tunable"
+        );
+        assert!(
+            secant_promotable(LeakClass::Invariant, 2),
+            "Invariant violation depth is secant-tunable"
+        );
         // Structural kinds that have no magnitude objective are not secant levers.
-        assert!(!secant_promotable(LeakClass::Ownership, 2), "Ownership is not a magnitude lever");
-        assert!(!secant_promotable(LeakClass::Message, 2), "Message is not a magnitude lever");
+        assert!(
+            !secant_promotable(LeakClass::Ownership, 2),
+            "Ownership is not a magnitude lever"
+        );
+        assert!(
+            !secant_promotable(LeakClass::Message, 2),
+            "Message is not a magnitude lever"
+        );
     }
-
 }
