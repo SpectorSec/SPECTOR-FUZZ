@@ -191,6 +191,39 @@ All 7 items from the original remediation order are closed as of HEAD `30efe6f`.
 | 6 | Register 6 orphaned `OracleType` variants into `LeakClass` | `c542a38` | ✅ |
 | 7 | Doc pass (THESIS.md + alignment matrix) | `c542a38` + `30efe6f` | ✅ |
 
+---
+
+## 8. Feature 029 (Divergence Optimization) — a second, parallel channel, independently audited
+
+Not part of the original LeakClass/`PromotionCandidate` remediation — this is a separate objective
+channel (`publish_divergence`/`read_divergence`, `feedbacks.rs:80-87`) that predates 033/034/035
+and was never inventoried against them. Flagged for audit because `045b32f` ("docs(v5.3): draw 029
+divergence optimizer BUILT") is exactly the same shape of overclaim the rest of this document
+exists to catch, and it sits in the same files (`feedbacks.rs`, `mutator.rs`, `campaign_planner.rs`)
+our recent commits touched.
+
+**Verified split: the secant half is live, the sequence-discovery half is dead.**
+
+| Component | Built? | Wired into the running loop? |
+|---|---|---|
+| `publish_divergence`/`read_divergence` thread-local channel | Yes | Yes — `erc4626.rs:154` publishes |
+| `apply_divergence_secant` (Phase 1 magnitude peak-finder) | Yes | Yes — called at `mutator.rs:1427`, gated by `DivergenceSecantState.pin_gate` |
+| `divergence_value` planner pre-load | Yes | Yes — read at `campaign_planner.rs:507`, composes cleanly alongside `structural_pin`/`value_lever_pin` as an independent `Option` param |
+| `DivergenceFeedback` (infant-scheduler vote on divergence-maximizing **sequences**) | Yes (`feedbacks.rs:859-950`) | **No.** Confirmed by grep — referenced nowhere outside its own definition. `evm_fuzzer.rs:472-497` builds the infant-scheduler feedback as `EagerOrFeedback::new(cmp_feedback, balance_feedback)` — a fixed two-slot combinator with no path to include a third feedback. `DivergenceFeedback::is_interesting` (and its `scheduler.vote(...)`) has never executed. |
+| `CompoundSequenceCanary` (compound divergence+inflow telemetry) | Yes (`feedbacks.rs:538-571`) | **No.** `029/plan.md:24` states it "feeds into 026 energy boosts" — grepped `scheduler.rs` and the whole tree: nothing ever reads `CompoundSequenceCanary`. It's write-only metadata, same pattern as every dead producer this document already tracks. |
+
+**Relationship to 033/034/035 (checked, not conflicting):** none of the five recent producers
+(`function.rs`, `snapshot_delta.rs`, `invariant.rs`, `state_comp.rs`, `echidna.rs`, `reentrancy.rs`)
+call `publish_divergence` — grepped, zero hits. This is correct, not a gap in that work: 029's own
+spec calls generic (non-ERC4626) divergence publishing "Tier 2" and explicitly scopes it as not yet
+built. The two channels are independent and compose without collision.
+
+**Completion gap, specced:** `.speckit/features/037-wire-divergence-feedback/specify.md` — wire
+`DivergenceFeedback` into the infant-scheduler feedback tuple and give `CompoundSequenceCanary` a
+real consumer, or correct `029/plan.md`'s claim that it already has one.
+
+---
+
 **Remaining open items — now specced (2026-07-10 re-inventory pass):**
 - ControlFlow producer — **specced, ready to build**: `.speckit/features/034-controlflow-promotion-producer/specify.md`. `reentrancy.rs`'s `reentrancy_metadata.found` already has exactly the (contract, magnitude) shape the existing producers use; routes to `structural_pin` per 031's own suggestion.
 - Objective-magnitude-aware scheduler feedback — **specced, ready to build**: `.speckit/features/035-objective-magnitude-scheduler/specify.md`. Log-scaled, bounded, zero-at-magnitude-0 multiplier on top of the existing `promote_boost`; strict enhancement, never a regression.
