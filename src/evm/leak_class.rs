@@ -15,6 +15,11 @@
 //!
 //! `ALL`/`oracles()`/`as_str()` are consumed by `-d` routing; `from_str()` (legacy-alias parse)
 //! and `middleware()` (attach law) are not yet wired, hence their `#[allow(dead_code)]`.
+//!
+//! **Out-of-band oracles (§5.4):** `FreshnessOracle` and `TemporalSkimOracle` are Value-primitive
+//! detectors but have no `OracleType` variant — they auto-activate via ABI fingerprint
+//! (`evm_fuzzer.rs`) and are NOT controllable by `-d`. They are intentionally omitted from
+//! `oracles()` to avoid implying `-d value_leak` selects them; their activation is independent.
 
 use serde::{Deserialize, Serialize};
 
@@ -62,11 +67,23 @@ impl LeakClass {
         use OracleType::*;
         match self {
             LeakClass::ControlFlow => &[Reentrancy],
-            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing, ERC4626],
-            LeakClass::Message => &[ArbitraryCall],
-            LeakClass::Permission => &[Function],
-            LeakClass::Invariant => &[Invariant, StateComparison, Echidna],
-            LeakClass::Ownership => &[Ownership, NFT], // 020-B SnapshotDelta + NFTOwnershipOracle (028-orphan bind)
+            // §1 audit: Pair (k-constant imbalance drain) + MathCalculate (arbitrary ERC20
+            // transfer to attacker) are both direct-value-extraction detectors.
+            LeakClass::Value => &[FeeOnTransfer, ERC20, Rebasing, ERC4626, Pair, MathCalculate],
+            // §1 audit: CrossChain detects attacker calling bridge receive functions
+            // (lzReceive/ccipReceive/xReceive) without authorization — message origin forgery.
+            LeakClass::Message => &[ArbitraryCall, CrossChain],
+            // §1 audit: Approval detects protocol contracts granting attacker ERC20 allowance —
+            // an unauthorized privilege grant (distinct from the attacker calling a privileged
+            // function directly, which is Function oracle territory, but same Permission class).
+            LeakClass::Permission => &[Function, Approval],
+            // §1 audit: TypedBug fires on user-defined typed invariant assertions (same
+            // semantic class as Echidna/Invariant/StateComparison — declared invariant broken).
+            LeakClass::Invariant => &[Invariant, StateComparison, Echidna, TypedBug],
+            // §1 audit: SelfDestruct = ultimate authority destruction (already aliased to
+            // Ownership in from_str; binds detection to the correct class here).
+            // 020-B SnapshotDelta + NFTOwnershipOracle (028-orphan bind) + SelfdestructOracle.
+            LeakClass::Ownership => &[Ownership, NFT, SelfDestruct],
         }
     }
 
@@ -145,9 +162,13 @@ mod tests {
     #[test]
     fn ownership_binds_to_snapshot_delta_oracle() {
         // 020-B: Ownership's detection home is the SnapshotDelta oracle (OracleType::Ownership);
-        // the NFTOwnershipOracle joined it (orphan bind) — both are Ownership-primitive detectors.
+        // the NFTOwnershipOracle joined it (028-orphan bind); SelfDestructOracle bound §1 audit
+        // (contract destruction = ultimate authority change; already aliased in from_str).
         // Per the Information Availability Law it stays post-hoc (no inline middleware).
-        assert_eq!(LeakClass::Ownership.oracles(), &[OracleType::Ownership, OracleType::NFT]);
+        assert_eq!(
+            LeakClass::Ownership.oracles(),
+            &[OracleType::Ownership, OracleType::NFT, OracleType::SelfDestruct]
+        );
         assert!(LeakClass::Ownership.middleware().is_none());
     }
 

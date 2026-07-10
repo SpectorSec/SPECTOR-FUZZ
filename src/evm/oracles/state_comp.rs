@@ -1,14 +1,17 @@
 use std::str::FromStr;
 
 use bytes::Bytes;
+use libafl::prelude::HasMetadata;
 use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{
         host::STATE_CHANGE,
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::STATE_COMP_BUG_IDX,
+        planner::{PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -97,6 +100,35 @@ impl
 
         unsafe {
             if STATE_CHANGE && comp(&ctx.post_state, &self.desired_state) {
+                // Items 3+4 (audit remediation): emit Invariant PromotionCandidate so the
+                // planner locks the violating call into the campaign. Store it in the Invariant
+                // slot rather than racing structural/value producers for one singleton.
+                let selector: [u8; 4] = ctx.input.data.as_ref().map(|d| d.function).unwrap_or_default();
+                let candidate = PromotionCandidate {
+                    contract: ctx.input.contract,
+                    selector,
+                    best_inflow: 0,
+                    kind: LeakClass::Invariant,
+                    taint_provenance: TaintProvenanceTag::default(),
+                    phase: None,
+                    set: true,
+                };
+                let mut candidates = ctx
+                    .fuzz_state
+                    .metadata_map()
+                    .get::<PromotionCandidates>()
+                    .cloned()
+                    .or_else(|| {
+                        ctx.fuzz_state
+                            .metadata_map()
+                            .get::<PromotionCandidate>()
+                            .map(PromotionCandidates::from_singleton)
+                    })
+                    .unwrap_or_default();
+                if candidates.record(candidate.clone()) {
+                    ctx.fuzz_state.metadata_map_mut().insert(candidates);
+                    ctx.fuzz_state.metadata_map_mut().insert(candidate);
+                }
                 EVMBugResult::new_simple(
                     "state_comp".to_string(),
                     STATE_COMP_BUG_IDX,

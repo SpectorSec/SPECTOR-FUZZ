@@ -109,14 +109,21 @@ because it systematizes the intent-composition process.
 ## What is built vs. what is future
 
 **Built and closed-loop**: Value condition (taint → secant → scheduler). The Value objective
-is the only fully-realized loop end-to-end.
+is the most fully-realized loop end-to-end.
 
-**Built, partial loop**: Identity (Permission oracle → structural_pin → Prime, no scheduler
-feedback on outcomes). Temporal (warp injected, no oracle-driven activation). Ownership
-(structural_pin expanded in 031, no scheduler feedback).
+**Built, near-complete loop**: Permission (oracle → structural_pin → Prime → presence-based
+scheduler boost via promote_boost in scheduler.rs — kind-agnostic but not
+objective-magnitude-aware; closer to complete than previously documented). Invariant (producers
+in invariant.rs/echidna.rs/state_comp.rs now emit PromotionCandidate; routes to value_lever_pin
++ secant; 031-C/033-A). Temporal (warp injected; ALSO has a taint-driven oracle path via
+ts_located / TIMESTAMP_DIM_LOCATED from Feature 017 Wire B — partially oracle-driven, same tier
+as the Value dynamic/static split; "no oracle-driven activation" understated this).
 
-**Specced, not built**: Execution Intent Layer (032). Invariant producer (033). ControlFlow
-producer. N-stage planner.
+**Built, producer gap closed**: Ownership (producer added to snapshot_delta.rs in 031-C;
+structural_pin Ownership branch now live, not dead code).
+
+**Specced, not built**: Execution Intent Layer (032). ControlFlow producer. N-stage planner.
 
 **Not yet specced**: Message condition (019-B gated). Compound intent ordering. Scheduler
-learning from primitive outcomes vs. corpus insertion.
+objective-magnitude weighting (promote_boost is presence-only; no kind-aware magnitude
+scaling yet).

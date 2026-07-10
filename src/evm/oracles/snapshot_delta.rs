@@ -1,30 +1,38 @@
-//! Feature 020-B — SnapshotDelta oracle: the detection home for `LeakClass::Ownership`.
+//! Feature 020-B — SnapshotDelta oracle: the detection home for
+//! `LeakClass::Ownership`.
 //!
-//! Ownership (primitive 06) is authority *relocation*, distinct from Permission (primitive 04,
-//! the *act* of an unauthorized call). Its verdict is a boundary comparison — did an
-//! authority-bearing storage slot change across this tx — so by the Information Availability Law it
-//! needs NO per-opcode witness and is a post-hoc oracle, not an inline middleware
-//! (`LeakClass::Ownership.middleware() == None`).
+//! Ownership (primitive 06) is authority *relocation*, distinct from Permission
+//! (primitive 04, the *act* of an unauthorized call). Its verdict is a boundary
+//! comparison — did an authority-bearing storage slot change across this tx —
+//! so by the Information Availability Law it needs NO per-opcode witness and is
+//! a post-hoc oracle, not an inline middleware (`LeakClass::Ownership.
+//! middleware() == None`).
 //!
-//! Watch set (v1, bounded): the universal EIP-1967 proxy slots (implementation / admin / beacon),
-//! plus any per-contract authority slots explicitly registered via `watch_slot` (topology
-//! intelligence / owner()-backing slots feed this later). Fire condition: a watched slot's value
-//! differs pre-tx vs post-tx. A no-op re-write of the same value (pre == post) does NOT fire —
-//! this mirrors the 019 materiality principle: an authority write that relocates nothing is not a
-//! leak.
+//! Watch set (v1, bounded): the universal EIP-1967 proxy slots (implementation
+//! / admin / beacon), plus any per-contract authority slots explicitly
+//! registered via `watch_slot` (topology intelligence / owner()-backing slots
+//! feed this later). Fire condition: a watched slot's value differs pre-tx vs
+//! post-tx. A no-op re-write of the same value (pre == post) does NOT fire —
+//! this mirrors the 019 materiality principle: an authority write that
+//! relocates nothing is not a leak.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
+};
 
 use bytes::Bytes;
 use itertools::Itertools;
+use libafl::prelude::HasMetadata;
 use revm_interpreter::bytecode::Bytecode;
 
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         oracle::EVMBugResult,
         oracles::OWNERSHIP_BUG_IDX,
+        planner::{PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -41,15 +49,18 @@ pub struct Relocation {
     pub post: EVMU256,
 }
 
-/// Post-hoc governance-state objective gate. Watches authority-bearing storage slots and emits an
-/// objective when one is relocated (value change) across a non-reverting execution.
+/// Post-hoc governance-state objective gate. Watches authority-bearing storage
+/// slots and emits an objective when one is relocated (value change) across a
+/// non-reverting execution.
 pub struct SnapshotDeltaOracle {
-    /// Contracts under test (for naming + scoping — universal slots are only checked on these,
-    /// so a proxy write inside an unrelated dependency doesn't spuriously fire).
+    /// Contracts under test (for naming + scoping — universal slots are only
+    /// checked on these, so a proxy write inside an unrelated dependency
+    /// doesn't spuriously fire).
     pub address_to_name: HashMap<EVMAddress, String>,
     /// The universal EIP-1967 proxy slots, checked on every monitored contract.
     universal_slots: Vec<EVMU256>,
-    /// Extra per-contract authority slots (owner()/admin() backing slots, topology-discovered).
+    /// Extra per-contract authority slots (owner()/admin() backing slots,
+    /// topology-discovered).
     extra_slots: HashMap<EVMAddress, HashSet<EVMU256>>,
 }
 
@@ -69,16 +80,21 @@ impl SnapshotDeltaOracle {
         }
     }
 
-    /// Register an additional authority-bearing slot for a contract (e.g. an `owner()`-backing
-    /// slot discovered by the topology pass). Idempotent.
+    /// Register an additional authority-bearing slot for a contract (e.g. an
+    /// `owner()`-backing slot discovered by the topology pass). Idempotent.
     #[allow(dead_code)]
     pub fn watch_slot(&mut self, contract: EVMAddress, slot: EVMU256) {
         self.extra_slots.entry(contract).or_default().insert(slot);
     }
 
-    /// Read a slot from an `EVMState` storage overlay, treating an absent slot as zero. Absent =
-    /// "not written in this state" — comparing pre vs post overlays isolates exactly this-tx writes.
-    fn slot_value(state_map: &HashMap<EVMAddress, HashMap<EVMU256, EVMU256>>, contract: &EVMAddress, slot: &EVMU256) -> EVMU256 {
+    /// Read a slot from an `EVMState` storage overlay, treating an absent slot
+    /// as zero. Absent = "not written in this state" — comparing pre vs
+    /// post overlays isolates exactly this-tx writes.
+    fn slot_value(
+        state_map: &HashMap<EVMAddress, HashMap<EVMU256, EVMU256>>,
+        contract: &EVMAddress,
+        slot: &EVMU256,
+    ) -> EVMU256 {
         state_map
             .get(contract)
             .and_then(|slots| slots.get(slot))
@@ -86,8 +102,9 @@ impl SnapshotDeltaOracle {
             .unwrap_or(EVMU256::ZERO)
     }
 
-    /// PURE detection core (unit-tested without an executor): diff every watched slot of every
-    /// monitored contract between the pre-tx and post-tx overlays; report those that moved.
+    /// PURE detection core (unit-tested without an executor): diff every
+    /// watched slot of every monitored contract between the pre-tx and
+    /// post-tx overlays; report those that moved.
     pub fn detect_relocations(&self, pre: &EVMState, post: &EVMState) -> Vec<Relocation> {
         let mut out = Vec::new();
         for contract in self.address_to_name.keys() {
@@ -150,8 +167,9 @@ impl
         >,
         _stage: u64,
     ) -> Vec<u64> {
-        // A revert leaves state untouched — no relocation. (Belt-and-suspenders: detect_relocations
-        // would already report nothing, since a reverted tx contributes no storage overlay delta.)
+        // A revert leaves state untouched — no relocation. (Belt-and-suspenders:
+        // detect_relocations would already report nothing, since a reverted tx
+        // contributes no storage overlay delta.)
         if ctx.fuzz_state.get_execution_result().reverted {
             return vec![];
         }
@@ -159,6 +177,38 @@ impl
         let relocations = self.detect_relocations(ctx.pre_state, &ctx.post_state);
         if relocations.is_empty() {
             return vec![];
+        }
+
+        // Items 3+4 (audit remediation): emit Ownership PromotionCandidate so the
+        // planner can lock the violating call into the Prime slot
+        // (structural_pin). Store it in the Ownership slot rather than racing
+        // Permission/Invariant/Value for one singleton.
+        let first = &relocations[0];
+        let selector: [u8; 4] = ctx.input.data.as_ref().map(|d| d.function).unwrap_or_default();
+        let candidate = PromotionCandidate {
+            contract: first.contract,
+            selector,
+            best_inflow: relocations.len() as u128,
+            kind: LeakClass::Ownership,
+            taint_provenance: TaintProvenanceTag::default(),
+            phase: None,
+            set: true,
+        };
+        let mut candidates = ctx
+            .fuzz_state
+            .metadata_map()
+            .get::<PromotionCandidates>()
+            .cloned()
+            .or_else(|| {
+                ctx.fuzz_state
+                    .metadata_map()
+                    .get::<PromotionCandidate>()
+                    .map(PromotionCandidates::from_singleton)
+            })
+            .unwrap_or_default();
+        if candidates.record(candidate.clone()) {
+            ctx.fuzz_state.metadata_map_mut().insert(candidates);
+            ctx.fuzz_state.metadata_map_mut().insert(candidate);
         }
 
         relocations
@@ -230,7 +280,8 @@ mod tests {
 
     #[test]
     fn owner_noop_no_fire() {
-        // Re-writing the SAME value into a watched slot is not a relocation (pre == post).
+        // Re-writing the SAME value into a watched slot is not a relocation (pre ==
+        // post).
         let c = addr(0x22);
         let mut names = HashMap::new();
         names.insert(c, "Vault".to_string());
@@ -287,8 +338,8 @@ mod tests {
 
     #[test]
     fn change_on_unmonitored_contract_ignored() {
-        // Universal slots are only checked on contracts we're monitoring; a proxy write inside an
-        // unrelated dependency does not fire.
+        // Universal slots are only checked on contracts we're monitoring; a proxy write
+        // inside an unrelated dependency does not fire.
         let monitored = addr(0x55);
         let stranger = addr(0x66);
         let mut names = HashMap::new();

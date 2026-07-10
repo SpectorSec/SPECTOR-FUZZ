@@ -12,9 +12,11 @@ use revm_interpreter::bytecode::Bytecode;
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
+        leak_class::LeakClass,
         middlewares::cheatcode::CHEATCODE_ADDRESS,
         oracle::EVMBugResult,
         oracles::INVARIANT_BUG_IDX,
+        planner::{PromotionCandidate, PromotionCandidates, TaintProvenanceTag},
         types::{EVMAddress, EVMFuzzState, EVMOracleCtx, EVMQueueExecutor, EVMU256},
         vm::EVMState,
     },
@@ -104,43 +106,74 @@ impl
         let mut res = vec![];
         for (nth, tx) in self.batch_call_txs.iter().enumerate() {
             let bug_idx = (nth << 8) as u64 + INVARIANT_BUG_IDX;
-            if oracle_should_skip!(ctx, bug_idx) {
-                continue;
-            }
             let (call_res, new_state) = ctx.call_post_batch_dyn(&[tx.clone()]);
             let (msg, succ) = &call_res[0];
-            if *succ &&
-                !{
-                    // assertTrue in Foundry writes to slot
-                    // 0x6661696c65640000000000000000000000000000000000000000000000000000
-                    // if the invariant is violated in cheatcode cotract.
-                    // @shou: tbh, i feel its dumb and wasteful
-                    new_state
-                        .get(&CHEATCODE_ADDRESS)
-                        .map(|data| {
-                            data.get(&self.failed_slot)
-                                .map(|v| v == &EVMU256::from(1))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false)
-                }
-            {
+            let violated = *succ && {
+                // assertTrue in Foundry writes to slot
+                // 0x6661696c65640000000000000000000000000000000000000000000000000000
+                // if the invariant is violated in cheatcode contract.
+                new_state
+                    .get(&CHEATCODE_ADDRESS)
+                    .map(|data| {
+                        data.get(&self.failed_slot)
+                            .map(|v| v == &EVMU256::from(1))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            };
+            if !violated {
                 continue;
             }
+
+            // Items 3+4 (audit remediation): emit Invariant PromotionCandidate so the
+            // planner can lock the violating call into the campaign. Unconditional with
+            // respect to duplicate reporting; stored in the Invariant slot so structural
+            // candidates do not starve it.
+            let selector: [u8; 4] = ctx.input.data.as_ref().map(|d| d.function).unwrap_or_default();
+            let candidate = PromotionCandidate {
+                contract: ctx.input.contract,
+                selector,
+                best_inflow: 0,
+                kind: LeakClass::Invariant,
+                taint_provenance: TaintProvenanceTag::default(),
+                phase: None,
+                set: true,
+            };
+            let mut candidates = ctx
+                .fuzz_state
+                .metadata_map()
+                .get::<PromotionCandidates>()
+                .cloned()
+                .or_else(|| {
+                    ctx.fuzz_state
+                        .metadata_map()
+                        .get::<PromotionCandidate>()
+                        .map(PromotionCandidates::from_singleton)
+                })
+                .unwrap_or_default();
+            if candidates.record(candidate.clone()) {
+                ctx.fuzz_state.metadata_map_mut().insert(candidates);
+                ctx.fuzz_state.metadata_map_mut().insert(candidate);
+            }
+
             let (name, _) = self.names.get(&tx.2.to_vec()).unwrap();
-            EVMBugResult::new(
-                "Invariant".to_string(),
-                bug_idx,
-                format!(
-                    "Invariant {:?} violated, {:?}",
-                    name,
-                    String::from_utf8(msg.iter().filter(|&c| *c > 0).cloned().collect::<Vec<u8>>())
-                ),
-                ConciseEVMInput::from_input(ctx.input, ctx.fuzz_state.get_execution_result()),
-                None,
-                Some(name.clone()),
-            )
-            .push_to_output();
+            // Dedup gate applies only to the human-facing report, not to the promotion
+            // above.
+            if !oracle_should_skip!(ctx, bug_idx) {
+                EVMBugResult::new(
+                    "Invariant".to_string(),
+                    bug_idx,
+                    format!(
+                        "Invariant {:?} violated, {:?}",
+                        name,
+                        String::from_utf8(msg.iter().filter(|&c| *c > 0).cloned().collect::<Vec<u8>>())
+                    ),
+                    ConciseEVMInput::from_input(ctx.input, ctx.fuzz_state.get_execution_result()),
+                    None,
+                    Some(name.clone()),
+                )
+                .push_to_output();
+            }
             res.push(bug_idx);
         }
         res
@@ -159,7 +192,7 @@ mod tests {
         evm::{
             host::FuzzHost,
             middlewares::cheatcode::{Cheatcode, CHEATCODE_ADDRESS},
-            types::{EVMAddress, generate_random_address, EVMFuzzState, EVMU256},
+            types::{generate_random_address, EVMAddress, EVMFuzzState, EVMU256},
             vm::{EVMExecutor, EVMState},
         },
         generic_vm::vm_executor::GenericVM,
@@ -168,7 +201,10 @@ mod tests {
     };
 
     fn load_bytecode(path: &str) -> Bytecode {
-        let hex_code = std::fs::read_to_string(path).expect("bytecode not found").trim().to_string();
+        let hex_code = std::fs::read_to_string(path)
+            .expect("bytecode not found")
+            .trim()
+            .to_string();
         let bytes = hex::decode(&hex_code).unwrap();
         Bytecode::new_raw(revm_primitives::Bytes::from(bytes))
     }
@@ -196,7 +232,9 @@ mod tests {
 
         let mut evm_executor: EVMExecutor<EVMState, crate::evm::input::ConciseEVMInput, StdScheduler<EVMFuzzState>> =
             EVMExecutor::new(fuzz_host, generate_random_address(&mut deploy_state));
-        evm_executor.deploy(counter_code, None, counter_addr, &mut deploy_state).unwrap();
+        evm_executor
+            .deploy(counter_code, None, counter_addr, &mut deploy_state)
+            .unwrap();
 
         let caller = generate_random_address(&mut deploy_state);
 
@@ -233,6 +271,10 @@ mod tests {
             EVMU256::ZERO,
             caller,
         );
-        assert_eq!(after, InstructionResult::Revert, "invariant_value_positive() must revert after drain()");
+        assert_eq!(
+            after,
+            InstructionResult::Revert,
+            "invariant_value_positive() must revert after drain()"
+        );
     }
 }
