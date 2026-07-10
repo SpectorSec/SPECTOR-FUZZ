@@ -1312,14 +1312,20 @@ mod test {
         assert_eq!(OracleType::from_strs("fee_on_transfer"), vec![OracleType::FeeOnTransfer]);
 
         // Canonical class strings expand via LeakClass::oracles() (the SSOT).
-        assert_eq!(OracleType::from_strs("permission_leak"), vec![OracleType::Function]);
+        // §1 audit: orphan bindings added — Permission now includes Approval, Value includes
+        // Pair+MathCalculate, Ownership includes SelfDestruct, Invariant includes TypedBug,
+        // Message includes CrossChain.
+        assert_eq!(
+            OracleType::from_strs("permission_leak"),
+            vec![OracleType::Function, OracleType::Approval]
+        );
         assert_eq!(
             OracleType::from_strs("value_leak"),
-            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing, OracleType::ERC4626]
+            vec![OracleType::FeeOnTransfer, OracleType::ERC20, OracleType::Rebasing, OracleType::ERC4626, OracleType::Pair, OracleType::MathCalculate]
         );
         assert_eq!(
             OracleType::from_strs("ownership_leak"),
-            vec![OracleType::Ownership, OracleType::NFT]
+            vec![OracleType::Ownership, OracleType::NFT, OracleType::SelfDestruct]
         );
         assert_eq!(OracleType::from_strs("control_flow_leak"), vec![OracleType::Reentrancy]);
 
