@@ -411,6 +411,16 @@ where
             crate::evm::feedbacks::clear_divergence();
             crate::evm::feedbacks::clear_ledger_objective();
             crate::evm::feedbacks::clear_located_dim();
+
+            #[cfg(feature = "concolic_secant_dispatch")]
+            {
+                crate::evm::middlewares::cmp_linearity::injection_reset_static();
+                crate::evm::middlewares::oracle_tracker::OracleTracker::reset_static();
+                crate::evm::middlewares::oracle_staleness::OracleStaleness::reset_static();
+                crate::evm::middlewares::empty_state_guard::EmptyStateGuard::reset_static();
+                crate::evm::middlewares::flashloan_oracle::FlashloanOracle::reset_static();
+                crate::evm::middlewares::dos_detector::DoSDetector::reset_static();
+            }
         }
 
         // execute the input
