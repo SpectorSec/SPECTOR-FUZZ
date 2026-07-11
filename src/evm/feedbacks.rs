@@ -508,6 +508,7 @@ impl<SC> TokenBalanceFeedback<SC> {
             .get(LeakClass::Value)
             .map(|c| c.best_inflow)
             .unwrap_or(0);
+        let mut candidates = existing_candidates;
         if inflow > incumbent {
             tracing::info!(
                 "[aposteriori-tel] promotion candidate: step={} contract={:?} selector=0x{} inflow={}",
@@ -529,11 +530,10 @@ impl<SC> TokenBalanceFeedback<SC> {
                 phase: Some(idx),
                 set: true,
             };
-            let mut candidates = existing_candidates;
             candidates.record(candidate.clone());
-            state.add_metadata(candidates);
             state.add_metadata(candidate);
         }
+        state.add_metadata(candidates.clone());
 
         // Feature 029 Phase 2 — compound sequence canary (liquid → amplify edge).
         // When BOTH divergence (Phase 1 success) AND profit (Phase 3 success) are
@@ -544,8 +544,12 @@ impl<SC> TokenBalanceFeedback<SC> {
         // Benjamin's talk proved this matters — when coverage collapsed into
         // `runActions`, compound sequences were invisible. The canary makes them
         // visible to the scheduler (026 energy) and to coverage reporting.
+        //
+        // Generalized: fires on value inflow + divergence OR any live non-Value
+        // leak-class candidate — a structural oracle co-firing with value inflow
+        // is equally a compound manipulate-then-extract signal.
         let divergence = read_divergence();
-        if divergence > 0 && inflow > 0 {
+        if inflow > 0 && (divergence > 0 || has_live_non_value_candidate(&candidates)) {
             let existing = state
                 .metadata_map()
                 .get::<CompoundSequenceCanary>()
@@ -578,6 +582,13 @@ pub struct CompoundSequenceCanary {
     pub set: bool,
 }
 impl_serdeany!(CompoundSequenceCanary);
+
+fn has_live_non_value_candidate(candidates: &PromotionCandidates) -> bool {
+    candidates
+        .by_kind
+        .iter()
+        .any(|(kind, candidate)| *kind != LeakClass::Value && candidate.set)
+}
 
 /// Feature 015 Phase 2 — dust floor for a-posteriori promotion: an attributed
 /// per-step attacker inflow must clear this to be a candidate (rejects
@@ -1236,6 +1247,42 @@ mod impact_011_tests {
         assert!(
             inflow_by_token.is_empty(),
             "combined deposit (to vault + zero shares) must produce no inflow"
+        );
+    }
+
+    fn test_candidate(kind: LeakClass, set: bool) -> PromotionCandidate {
+        PromotionCandidate {
+            contract: addr(0xA5),
+            selector: [0x5A; 4],
+            best_inflow: 1,
+            kind,
+            set,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compound_canary_non_value_gate_ignores_value_only_candidates() {
+        let mut candidates = PromotionCandidates::default();
+        candidates.record(test_candidate(LeakClass::Value, true));
+        assert!(
+            !has_live_non_value_candidate(&candidates),
+            "value inflow alone is not a compound manipulate-then-extract signal"
+        );
+    }
+
+    #[test]
+    fn compound_canary_non_value_gate_requires_live_non_value_candidate() {
+        let mut candidates = PromotionCandidates::default();
+        candidates.record(test_candidate(LeakClass::Invariant, false));
+        assert!(
+            !has_live_non_value_candidate(&candidates),
+            "unset structural candidates must not trip the canary"
+        );
+        candidates.record(test_candidate(LeakClass::Invariant, true));
+        assert!(
+            has_live_non_value_candidate(&candidates),
+            "any live non-value leak-class candidate can co-occur with value inflow"
         );
     }
 }
