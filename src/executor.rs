@@ -30,6 +30,28 @@ use crate::evm::input::EVMInput;
 #[cfg(feature = "evm")]
 use crate::evm::types::EVMU256;
 
+/// Feature 041 (EO-04): write a captured EVMU256 return value into a specific ABI
+/// argument slot of an EVMInput's calldata.  Mirrors the `write_calldata_arg_u128`
+/// pattern in mutator.rs but writes the full 32-byte word (EVMU256) instead of the
+/// lower 16 bytes, since `observed_values` stores full EVMU256 return values.
+///
+/// Offset layout: selector (4 bytes) + arg_index * 32 bytes.  If the calldata is
+/// shorter than required the write is silently skipped (safe no-op, same guard as
+/// the mutator pattern).
+#[cfg(feature = "evm")]
+fn apply_linkage_arg(input: &mut EVMInput, param_index: usize, value: EVMU256) {
+    use bytes::Bytes;
+    use crate::evm::input::EVMInputT;
+    let mut data = input.to_bytes();
+    let offset = 4 + param_index * 32;
+    if offset + 32 > data.len() {
+        return;
+    }
+    let bytes = value.to_be_bytes::<32>();
+    data[offset..offset + 32].copy_from_slice(&bytes);
+    input.set_direct_data(Bytes::from(data));
+}
+
 /// Wrapper of smart contract VM, which implements LibAFL [`Executor`]
 /// TODO: in the future, we may need to add handlers?
 /// handle timeout/crash of executing contract
@@ -145,6 +167,20 @@ where
         _mgr: &mut EM,
         input: &Self::Input,
     ) -> Result<ExitKind, Error> {
+        // Feature 038 (EO-01): clear any campaign-scoped metadata left over from a prior
+        // execution BEFORE either path runs. The campaign path rewrites them with fresh
+        // data; the non-campaign path (and mid-campaign reverts via the early-return below)
+        // must leave them absent so OracleFeedback's OracleCtx never attributes this
+        // execution to a stale prior campaign frame. Use the concrete EVM type aliases
+        // (which are 'static) rather than the generic parameters (which are not).
+        #[cfg(feature = "evm")]
+        {
+            use crate::evm::types::CampaignIntermediateStatesEVM;
+            state.metadata_map_mut().remove::<CampaignIntermediateStatesEVM>();
+            state.metadata_map_mut().remove::<CampaignWarpStates>();
+            state.metadata_map_mut().remove::<crate::evm::planner::CampaignInflowBoundaries>();
+        }
+
         // Campaign mode: execute multi-step atomic sequence.
         // SAFETY: I = EVMInput, and types match, in the EVM monomorphization (cfg evm).
         #[cfg(feature = "evm")]
@@ -174,6 +210,20 @@ where
                         // FunctionAuthTracer can attribute a structural move to its step.
                         crate::evm::middlewares::function_auth::set_campaign_step(Some(i));
                         let (mut step_input, _) = step_ci.to_input(current_state.clone());
+                        // Feature 041 (EO-04): apply any output→input linkages targeting
+                        // this step using observed_values captured by value_capture.rs in
+                        // prior steps. Iterates zero times when linkages is empty (common
+                        // case) so this is byte-identical for all current campaigns.
+                        for linkage in campaign.linkages.iter().filter(|l| l.to_step == i) {
+                            if linkage.from_step >= i {
+                                continue; // malformed: source must precede target
+                            }
+                            if let Some(vals) = current_state.state.observed_values.get(&linkage.from_registry_key) {
+                                if let Some(captured) = vals.last() {
+                                    apply_linkage_arg(&mut step_input, linkage.to_param_index, *captured);
+                                }
+                            }
+                        }
                         // Apply warp delta before execute, so vm.rs:598 picks up the warped env
                         if let Some(delta) = campaign.warps.iter().find(|(idx, _)| *idx == i).map(|(_, d)| d) {
                             step_input.env.block.number += EVMU256::from(*delta);
@@ -182,8 +232,8 @@ where
                         let step_ref: &I = unsafe { &*(&step_input as *const EVMInput as *const I) };
                         let res = self.vm.deref().borrow_mut().execute(step_ref, state);
                         state.set_execution_result(res);
-                        // Capture intermediate state for oracle consumption
-                        intermediate_states.push(current_state);
+                        // Feature 039 (EO-02): check revert BEFORE pushing — a reverted step
+                        // produced no valid post-state, so it should not be recorded.
                         if state.get_execution_result().reverted {
                             return Ok(ExitKind::Ok);
                         }
@@ -192,6 +242,10 @@ where
                             let concrete_ref: &EVMStagedVMState = &*(generic_ref as *const StagedVMState<Loc, Addr, VS, CI> as *const EVMStagedVMState);
                             concrete_ref.clone()
                         };
+                        // Feature 039 (EO-02): push the POST-step state (after reassignment
+                        // above), not the pre-step state. Consumers reading
+                        // intermediate_states[i] now get "state after step i completed."
+                        intermediate_states.push(current_state.clone());
                         if aposteriori {
                             inflow_offsets.push(current_state.state.erc20_transfers.len());
                         }
@@ -215,6 +269,17 @@ where
                     // SAME prefix state, so only the warp varies → a clean slope with
                     // no cross-iteration noise. Compute the warp that flips the
                     // time-gated threshold and use it for the real execution below.
+                    //
+                    // Feature 040 (EO-03): probes are safe because vm.rs:1463 reloads
+                    // evmstate from the input's embedded staged state at the top of every
+                    // execute() call — probe writes cannot persist into the real step.
+                    // divergence/timestamp thread-locals are written only in the
+                    // post-run_target feedback pass (OracleFeedback::is_interesting),
+                    // which is structurally unreachable from inside run_target.
+                    // If a new middleware introduces execution-scoped global state that
+                    // isn't part of EVMState and isn't reset by temporal_reset_all(),
+                    // it must be explicitly reset here or added to the middleware audit
+                    // table in .speckit/research/execution-ordering-audit-2026-07-10.md.
                     #[cfg(feature = "cmp")]
                     if warp_delta > 0 {
                         use crate::evm::host::{temporal_argmin, temporal_read, temporal_reset_all};
@@ -261,7 +326,20 @@ where
                         }
                     }
 
-                    let (mut last_input, _) = steps.last().unwrap().to_input(current_state);
+                    let (mut last_input, _) = steps.last().unwrap().to_input(current_state.clone());
+                    // Feature 041 (EO-04): apply linkages targeting the exploit step using
+                    // observed_values accumulated through the prefix steps. to_input above
+                    // clones current_state so it's still accessible here.
+                    for linkage in campaign.linkages.iter().filter(|l| l.to_step == last_idx) {
+                        if linkage.from_step >= last_idx {
+                            continue;
+                        }
+                        if let Some(vals) = current_state.state.observed_values.get(&linkage.from_registry_key) {
+                            if let Some(captured) = vals.last() {
+                                apply_linkage_arg(&mut last_input, linkage.to_param_index, *captured);
+                            }
+                        }
+                    }
                     if warp_delta > 0 {
                         last_input.env.block.number += EVMU256::from(warp_delta);
                         last_input.env.block.timestamp += EVMU256::from(warp_delta * 12);
