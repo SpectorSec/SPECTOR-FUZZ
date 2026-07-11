@@ -90,6 +90,16 @@ pub fn clear_divergence() {
     DIVERGENCE_OBJECTIVE.with(|c| c.set(0));
 }
 
+/// Clear the per-execution ledger objective before running a new input (Feature 015).
+pub fn clear_ledger_objective() {
+    LEDGER_OBJECTIVE.with(|c| c.set(0));
+}
+
+/// Clear the per-execution located dimension flow type before running a new input (Feature 016).
+pub fn clear_located_dim() {
+    DIMENSION_FLOW.with(|c| c.set(TaintDim::Generic));
+}
+
 /// Read the last published divergence magnitude (Feature 029). `0` before any
 /// publish or after the execution-local clear.
 pub fn read_divergence() -> u128 {
@@ -984,6 +994,19 @@ mod impact_011_tests {
         assert_eq!(read_divergence(), 123);
         clear_divergence();
         assert_eq!(read_divergence(), 0);
+    }
+
+    #[test]
+    fn clear_ledger_objective_and_located_dim_resets_stale_data() {
+        publish_ledger_objective(456);
+        publish_located_dim(TaintDim::Price);
+        assert_eq!(read_ledger_objective(), 456);
+        assert_eq!(read_located_dim(), TaintDim::Price);
+
+        clear_ledger_objective();
+        clear_located_dim();
+        assert_eq!(read_ledger_objective(), 0);
+        assert_eq!(read_located_dim(), TaintDim::Generic);
     }
 
     /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed

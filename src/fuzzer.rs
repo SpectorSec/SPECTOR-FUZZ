@@ -407,7 +407,11 @@ where
         // runs so an execution whose oracles publish no divergence cannot leak
         // the previous iteration's magnitude into DivergenceFeedback.
         #[cfg(feature = "evm")]
-        crate::evm::feedbacks::clear_divergence();
+        {
+            crate::evm::feedbacks::clear_divergence();
+            crate::evm::feedbacks::clear_ledger_objective();
+            crate::evm::feedbacks::clear_located_dim();
+        }
 
         // execute the input
         start_timer!(state);

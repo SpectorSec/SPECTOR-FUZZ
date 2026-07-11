@@ -191,7 +191,13 @@ impl SinglePostExecution {
     pub fn from_interp(interp: &Interpreter, (out_offset, out_len): (usize, usize)) -> Self {
         let input_bytes = match &interp.input.input {
             CallInput::Bytes(b) => b.to_vec(),
-            CallInput::SharedBuffer(_) => vec![],
+            CallInput::SharedBuffer(range) => {
+                if range.start >= range.end {
+                    vec![]
+                } else {
+                    interp.memory.global_slice_range(range.clone()).to_vec()
+                }
+            }
         };
         Self {
             program_counter: interp.bytecode.pc(),
