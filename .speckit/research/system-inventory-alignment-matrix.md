@@ -245,12 +245,47 @@ first draft of 037 proposed nesting `DivergenceFeedback` into `infant_feedback`'
   oracle-produced side-channel, not an execution-result-direct read), and the original spec
   didn't check that distinction before proposing the same combinator slot.
 
-037 is corrected in place to document this and now requires a design decision (reorder the shared
-per-iteration loop vs. compute divergence eagerly, decoupled from the Oracle-trait pass) before any
-implementation — not ready to hand to local Claude as originally written. This is exactly the class
-of finding this document's method (trace actual data flow, not just reachability) is supposed to
-catch — reachability alone ("is it called") is necessary but not sufficient; timing relative to the
-data it depends on is a separate, equally load-bearing question.
+037 was corrected in place to document this, then **built and independently verified**
+(`f338652`): `fuzzer.rs` reordered so `objective`/`OracleFeedback` runs before the infant gate,
+`clear_divergence()` added as a stale-value guard at the top of every `run_target` call,
+`DivergenceFeedback` wired into the infant `EagerOrFeedback` chain, and `CompoundSequenceCanary`
+given a scheduler consumer via a testcase-local snapshot at `on_add` (avoiding the same
+cross-iteration-bleed pattern, not just avoiding it for `DivergenceFeedback`). Compiled clean,
+199/199 tests passing, both new regression tests (`clear_divergence_drops_previous_execution_value`,
+`compound_boost_decays_from_full_to_neutral`) confirmed by name. The reorder also retroactively
+fixed a second, previously undiscovered instance of the same bug:
+`TokenBalanceFeedback::record_aposteriori_candidate` (`feedbacks.rs:538`, which writes
+`CompoundSequenceCanary`) also reads `read_divergence()` and was subject to the identical stale-read
+problem since Feature 029 was written — fixed for free by the same reorder. This is exactly the
+class of finding this document's method (trace actual data flow, not just reachability) is supposed
+to catch — reachability alone ("is it called") is necessary but not sufficient; timing relative to
+the data it depends on is a separate, equally load-bearing question.
+
+---
+
+## 9. Execution-Ordering Audit (PR #2) — a second audit *dimension*, not just more findings
+
+Prompted directly by the §8 finding above: reachability checks (does X get called) are necessary
+but not sufficient — a component can be perfectly reachable and still read the wrong iteration's
+data. PR #2 (`.speckit/research/execution-ordering-audit-2026-07-10.md`, merged `17ea4e7`)
+independently audited the campaign-execution path (`executor.rs::run_target`, not
+`campaign_executor.rs`, which is a stub) for exactly this class of bug. All four findings were
+independently re-verified against source before speccing — one (EO-03) was found to be narrower
+than originally claimed once traced further.
+
+| Finding | Verified? | Spec |
+|---|---|---|
+| EO-01 — stale `CampaignIntermediateStates`/`CampaignWarpStates`/`CampaignInflowBoundaries` bleed into non-campaign executions (non-campaign path never clears them; `OracleFeedback` reads them unconditionally, `feedback.rs:250-258`) | **Confirmed**, exact lines | `.speckit/features/038-clear-campaign-scoped-metadata/specify.md` |
+| EO-02 — `intermediate_states.push(current_state)` (`executor.rs:186`) runs before `current_state` is reassigned to the post-step result (`:190-194`) — records each step's *input* state, not its *output* | **Confirmed**, exact lines | `.speckit/features/039-post-step-intermediate-states/specify.md` |
+| EO-03 — controlled temporal probes (`executor.rs:218-262`) run through the same VM/host as the real exploit step before it executes | **Narrowed, not confirmed at the claimed scope.** Traced whether `execute()` mutates a persistent host or reloads an explicit staged state per call (`vm.rs:1463` — reloads per call), whether `reentrancy_metadata` is part of that reloaded state (confirmed via `reentrancy.rs`), whether coverage is cleared per-call (`vm.rs:1357-1358`'s `clear_branch_status()`), and whether `DIVERGENCE_OBJECTIVE`/`TIMESTAMP_DIM_LOCATED` are reachable from probes at all (they're only written in the post-`run_target` feedback pass — probes execute *inside* `run_target`, before it returns, and structurally cannot reach that code). All four specific channels the original finding worried about check out safe. | `.speckit/features/040-isolate-temporal-probes/specify.md` — scoped to a targeted middleware audit task + regression canary, not the broader "isolate probes into a cloned VM" rewrite originally proposed |
+| EO-04 — `CampaignSequence.linkages`/`StepLinkage` (`input.rs:39-54`) declared, zero consumers anywhere in the executor | **Confirmed** — grepped the whole tree; also confirmed `campaign_planner.rs:542` always emits `linkages: Vec::new()` today, so the fix is purely additive with zero current behavioral impact | `.speckit/features/041-apply-step-linkages/specify.md` |
+
+**The methodological point worth keeping**: EO-03 is the clearest illustration in this whole
+document of why every finding needs independent re-verification rather than trusting a well-written
+audit at face value — even one that's otherwise batting 3-for-4 on the same page. A plausible-sounding
+mechanism ("probes run through the same stack, so state could leak") doesn't automatically survive
+contact with how the specific execution model actually works (per-call state reload +
+post-return-only side-channel writes). Confirm, don't extrapolate from plausibility.
 
 ---
 
