@@ -615,6 +615,13 @@ where
             // Only run in campaign mode where ABI is known and we can mutate args
             return false;
         }
+        // Campaign-bearing inputs are executed via their step chain in run_target;
+        // the top-level input.data/direct_data is never used, so write_calldata_arg_u128
+        // (which writes there via set_direct_data) has zero effect.  The campaign steps'
+        // calldata is tuned separately by apply_ledger_secant via write_step_arg_u128.
+        if input.get_campaign().is_some() {
+            return false;
+        }
 
         let ap = input.get_access_pattern().borrow().clone();
         if ap.calldata_args.is_empty() {
