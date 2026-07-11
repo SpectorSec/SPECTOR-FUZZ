@@ -76,6 +76,7 @@ use crate::{
         vm::{EVMExecutor, EVMState},
     },
     executor::FuzzExecutor,
+    evm::feedbacks::DivergenceFeedback,
     feedback::{CmpFeedback, DataflowFeedback, OracleFeedback},
     fuzzer::{ItyFuzzer, REPLAY, RUN_FOREVER},
     oracle::BugMetadata,
@@ -491,9 +492,16 @@ pub fn evm_fuzzer(
         config.reflexive_lever,
     );
 
-    // Combine: any new coverage ceiling OR any new fund-extraction ceiling
-    // makes the state interesting and gets added to infant corpus.
-    let infant_feedback = libafl::feedbacks::EagerOrFeedback::new(cmp_feedback, balance_feedback);
+    // Combine: any new coverage ceiling OR any new fund-extraction ceiling OR
+    // any new same-execution oracle-divergence ceiling makes the state
+    // interesting and gets added to infant corpus. DivergenceFeedback is safe
+    // here only because ItyFuzzer runs objective/oracle feedback before this
+    // infant gate and clears divergence before each target execution.
+    let divergence_feedback = DivergenceFeedback::new(infant_scheduler.clone());
+    let infant_feedback = libafl::feedbacks::EagerOrFeedback::new(
+        libafl::feedbacks::EagerOrFeedback::new(cmp_feedback, balance_feedback),
+        divergence_feedback,
+    );
     let infant_result_feedback = DataflowFeedback::new(reads, writes);
 
     let mut oracles = config.oracle;

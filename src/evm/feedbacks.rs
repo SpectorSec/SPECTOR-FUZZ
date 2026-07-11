@@ -81,8 +81,17 @@ pub fn publish_divergence(value: u128) {
     DIVERGENCE_OBJECTIVE.with(|c| c.set(value));
 }
 
+/// Clear the per-execution divergence magnitude before running a new input.
+///
+/// Feature 037 wires `DivergenceFeedback` into the infant-feedback gate, so a
+/// missing oracle publication for the current execution must read as zero, not
+/// as the previous execution's divergence.
+pub fn clear_divergence() {
+    DIVERGENCE_OBJECTIVE.with(|c| c.set(0));
+}
+
 /// Read the last published divergence magnitude (Feature 029). `0` before any
-/// publish.
+/// publish or after the execution-local clear.
 pub fn read_divergence() -> u128 {
     DIVERGENCE_OBJECTIVE.with(|c| c.get())
 }
@@ -956,6 +965,14 @@ mod impact_011_tests {
 
     fn addr(b: u8) -> EVMAddress {
         EVMAddress::from([b; 20])
+    }
+
+    #[test]
+    fn clear_divergence_drops_previous_execution_value() {
+        publish_divergence(123);
+        assert_eq!(read_divergence(), 123);
+        clear_divergence();
+        assert_eq!(read_divergence(), 0);
     }
 
     /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed

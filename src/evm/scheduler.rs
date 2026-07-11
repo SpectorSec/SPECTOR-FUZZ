@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     host::{BRANCH_STATUS, BRANCH_STATUS_IDX},
+    feedbacks::CompoundSequenceCanary,
     planner::{PromotionCandidate, PromotionCandidates},
     topology::TopologyHints,
     types::EVMAddress,
@@ -137,6 +138,14 @@ pub struct PowerABITestcaseMetadata {
     /// the other two).
     #[serde(default)]
     pub dim_hits: u32,
+    /// Feature 037 — testcase-local snapshot that this execution produced both
+    /// attacker inflow and oracle divergence. Scheduler scoring must read this
+    /// stamped value, not the global current-execution canary.
+    #[serde(default)]
+    pub compound_sequence: bool,
+    /// Feature 037 — decay counter for the compound-sequence boost.
+    #[serde(default)]
+    pub compound_hits: u32,
 }
 
 impl PowerABITestcaseMetadata {
@@ -149,6 +158,8 @@ impl PowerABITestcaseMetadata {
             promote_hits: 0,
             located_dim: TaintDim::Generic,
             dim_hits: 0,
+            compound_sequence: false,
+            compound_hits: 0,
         }
     }
 }
@@ -164,6 +175,14 @@ fn promote_boost(hits: u32) -> f64 {
     const PROMOTE_BOOST: f64 = 2.0;
     let decay = 0.95_f64.powi(hits as i32);
     1.0 + (PROMOTE_BOOST - 1.0) * decay
+}
+
+/// Feature 037 — modest, decaying scheduler boost for testcases whose own
+/// execution produced the compound sequence canary (inflow + divergence).
+fn compound_boost(hits: u32) -> f64 {
+    const COMPOUND_BOOST: f64 = 1.5;
+    let decay = 0.95_f64.powi(hits as i32);
+    1.0 + (COMPOUND_BOOST - 1.0) * decay
 }
 
 /// Feature 035 — magnitude-aware extra multiplier on top of the presence-based
@@ -313,6 +332,14 @@ where
         // reflect the just-executed interesting input and no execution
         // intervenes before on_add.
         let flow_dim = classify_flow_dim();
+        // Feature 037 — snapshot compound-sequence telemetry NOW. This converts
+        // current-execution metadata into testcase-local metadata before later
+        // scheduler scoring, preventing cross-iteration canary bleed.
+        let compound_sequence = state
+            .metadata_map()
+            .get::<CompoundSequenceCanary>()
+            .map(|canary| canary.set)
+            .unwrap_or(false);
         // adding power scheduling information based on code size
         {
             let mut testcase = state.testcase_mut(idx).unwrap();
@@ -327,6 +354,7 @@ where
                 None => {
                     let mut m = PowerABITestcaseMetadata::new(1);
                     m.located_dim = flow_dim;
+                    m.compound_sequence = compound_sequence;
                     testcase.add_metadata(m);
                     return Ok(());
                 } // some contracts are not in ArtifactInfo, like borrow
@@ -335,6 +363,7 @@ where
                 self.add_abi_metadata(&mut testcase, artifact)?;
                 if let Ok(m) = testcase.metadata_mut::<PowerABITestcaseMetadata>() {
                     m.located_dim = flow_dim;
+                    m.compound_sequence = compound_sequence;
                 }
             }
         }
@@ -579,6 +608,20 @@ where
             }
         }
 
+        // Feature 037 — compound sequence canary → scheduler energy. This reads
+        // testcase-local metadata stamped in on_add, not the global current-execution
+        // canary, so one compound execution cannot boost unrelated later testcases.
+        let (compound_sequence, compound_hits) = match entry.metadata::<PowerABITestcaseMetadata>() {
+            Ok(meta) => (meta.compound_sequence, meta.compound_hits),
+            Err(_) => (false, 0),
+        };
+        if compound_sequence {
+            power *= compound_boost(compound_hits);
+            if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
+                meta.compound_hits = meta.compound_hits.saturating_add(1);
+            }
+        }
+
         // Feature 026 Phase B — dim_flow → scheduler energy. Boost inputs whose
         // execution exhibited a high-value economic dimension
         // (PRICE_MANIP→high, ACCUM→med), read from the per-testcase
@@ -614,7 +657,7 @@ pub type PowerABIMutationalStage<E, EM, I, M, Z> =
 
 #[cfg(test)]
 mod tests {
-    use super::{dim_boost, magnitude_boost, promote_boost, TaintDim};
+    use super::{compound_boost, dim_boost, magnitude_boost, promote_boost, TaintDim};
 
     #[test]
     fn dim_boost_tiers_and_decay() {
@@ -630,6 +673,16 @@ mod tests {
         assert!(dim_boost(TaintDim::Price, 10) < dim_boost(TaintDim::Price, 0));
         assert!(dim_boost(TaintDim::Price, 100) > 1.0);
         assert!(dim_boost(TaintDim::Price, 100) < 1.01);
+    }
+
+    #[test]
+    fn compound_boost_decays_from_full_to_neutral() {
+        assert!((compound_boost(0) - 1.5).abs() < 1e-9, "full boost at hits=0");
+        assert!(compound_boost(1) < compound_boost(0));
+        assert!(compound_boost(10) < compound_boost(1));
+        assert!(compound_boost(100) > 1.0, "still above neutral at moderate hits");
+        assert!(compound_boost(100) < 1.01, "approaching neutral");
+        assert!(compound_boost(100_000) >= 1.0, "never below neutral");
     }
 
     #[test]

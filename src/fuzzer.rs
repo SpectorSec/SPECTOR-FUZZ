@@ -403,6 +403,12 @@ where
         executor.observers_mut().pre_exec_all(state, &input)?;
         mark_feature_time!(state, PerfFeature::PreExecObservers);
 
+        // Feature 037: divergence is execution-local. Clear before the target
+        // runs so an execution whose oracles publish no divergence cannot leak
+        // the previous iteration's magnitude into DivergenceFeedback.
+        #[cfg(feature = "evm")]
+        crate::evm::feedbacks::clear_divergence();
+
         // execute the input
         start_timer!(state);
         let exitkind = executor.run_target(self, state, manager, &input)?;
@@ -419,13 +425,16 @@ where
 
         let reverted = state.get_execution_result().reverted;
 
-        // get new stage first
-        let is_infant_interesting = self
-            .infant_feedback
-            .is_interesting(state, manager, &input, observers, &exitkind)?;
-
+        // Feature 037 ordering: objective/oracle feedback must run before the
+        // infant gate so oracle-produced metrics such as divergence are from
+        // this execution, not from the previous iteration's thread-local cell.
         let is_solution = self
             .objective
+            .is_interesting(state, manager, &input, observers, &exitkind)?;
+
+        // get new stage after objective metrics have been published
+        let is_infant_interesting = self
+            .infant_feedback
             .is_interesting(state, manager, &input, observers, &exitkind)?;
 
         // add the trace of the new state
