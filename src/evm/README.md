@@ -43,3 +43,6 @@ When ItyFuzz encounters a control leak, it will save the post execution so that 
 or execute any new transaction before the execution is finished.
 In the example, ItyFuzz will save the post execution state after `bar` is executed (stuffs for executing `baz`). 
 Then, ItyFuzz will either choose to continue the execution or execute any new transaction before `baz` is executed.
+## revm 41 code-assessment guardrails
+
+This fork uses upstream `revm` 41 through a custom SpectorFuzz interpreter loop. Before changing execution, middleware, snapshot, gas, or worker behavior, review the concrete code assessment in [`docs/revm41-code-assessment.md`](../../docs/revm41-code-assessment.md). The verdict is mixed: core fuzzing capability is preserved, but throughput, control-leak type safety, same-process worker isolation, and centralized snapshot discipline are the most likely regressions versus the old fuzzer-tuned engine.
