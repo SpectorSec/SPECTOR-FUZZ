@@ -2279,3 +2279,47 @@ where
         Ok(AccountInfoLoad::new(info_ref, false, is_empty))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clear_branch_status_resets_all_flags() {
+        unsafe {
+            // Force every execution-scoped flag to a dirty/non-default state
+            BRANCH_STATUS[0] = Some((EVMAddress::default(), 1, true));
+            BRANCH_STATUS_IDX = 10;
+            CONTROL_LEAK_DETECTED = true;
+            ARBITRARY_CALL_DETECTED = true;
+            ARBITRARY_CALL_CALLER = [1u8; 20];
+            ARBITRARY_CALL_TARGET = [2u8; 20];
+            ARBITRARY_CALL_VALUE = EVMU256::from(100);
+            UNBOUNDED_STATIC_CALL_DETECTED = true;
+            #[cfg(feature = "cmp")]
+            {
+                TS_TOUCHED = true;
+            }
+
+            // Run clear_branch_status
+            clear_branch_status();
+
+            // Assert everything was reset cleanly before the next transaction
+            assert_eq!(BRANCH_STATUS_IDX, 0);
+            for x in BRANCH_STATUS.iter() {
+                assert!(x.is_none(), "BRANCH_STATUS should be completely cleared");
+            }
+            assert!(!CONTROL_LEAK_DETECTED, "CONTROL_LEAK_DETECTED was not reset");
+            assert!(!ARBITRARY_CALL_DETECTED, "ARBITRARY_CALL_DETECTED was not reset");
+            assert_eq!(ARBITRARY_CALL_CALLER, [0u8; 20], "ARBITRARY_CALL_CALLER was not reset");
+            assert_eq!(ARBITRARY_CALL_TARGET, [0u8; 20], "ARBITRARY_CALL_TARGET was not reset");
+            assert_eq!(ARBITRARY_CALL_VALUE, EVMU256::ZERO, "ARBITRARY_CALL_VALUE was not reset");
+            assert!(!UNBOUNDED_STATIC_CALL_DETECTED, "UNBOUNDED_STATIC_CALL_DETECTED was not reset");
+            #[cfg(feature = "cmp")]
+            {
+                assert!(!TS_TOUCHED, "TS_TOUCHED was not reset");
+            }
+        }
+    }
+}
+
