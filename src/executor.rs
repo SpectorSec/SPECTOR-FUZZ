@@ -31,25 +31,24 @@ use crate::evm::input::EVMInput;
 use crate::evm::types::EVMU256;
 
 /// Feature 041 (EO-04): write a captured EVMU256 return value into a specific ABI
-/// argument slot of an EVMInput's calldata.  Mirrors the `write_calldata_arg_u128`
-/// pattern in mutator.rs but writes the full 32-byte word (EVMU256) instead of the
-/// lower 16 bytes, since `observed_values` stores full EVMU256 return values.
-///
-/// Offset layout: selector (4 bytes) + arg_index * 32 bytes.  If the calldata is
-/// shorter than required the write is silently skipped (safe no-op, same guard as
-/// the mutator pattern).
+/// argument slot of an EVMInput's calldata.  Mirrors the `write_step_arg_u128`
+/// pattern in mutator.rs — modifies the ABI's inner bytes directly via
+/// `get_bytes_vec` / `set_bytes` so the change is visible through `to_bytes()`,
+/// which is what `execute_abi` actually reads.  Writing to `set_direct_data` is a
+/// no-op when `to_bytes()` is non-empty, which is the case for any input that has
+/// an `ABI` data field (the normal path).
 #[cfg(feature = "evm")]
 fn apply_linkage_arg(input: &mut EVMInput, param_index: usize, value: EVMU256) {
-    use bytes::Bytes;
-    use crate::evm::input::EVMInputT;
-    let mut data = input.to_bytes();
-    let offset = 4 + param_index * 32;
-    if offset + 32 > data.len() {
+    let Some(abi) = &mut input.data else { return };
+    let mut args = abi.get_bytes_vec();
+    let offset = param_index * 32;
+    if offset + 32 > args.len() {
         return;
     }
     let bytes = value.to_be_bytes::<32>();
-    data[offset..offset + 32].copy_from_slice(&bytes);
-    input.set_direct_data(Bytes::from(data));
+    args[offset..offset + 32].copy_from_slice(&bytes);
+    let full = [Vec::from(abi.function), args].concat();
+    abi.set_bytes(full);
 }
 
 /// Wrapper of smart contract VM, which implements LibAFL [`Executor`]
@@ -381,6 +380,468 @@ where
         // later the feedback/objective can run oracle on this result
         state.set_execution_result(res);
         Ok(ExitKind::Ok)
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "evm")]
+mod execution_ordering_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use libafl::executors::Executor;
+    use libafl::prelude::{HasMetadata, StdScheduler};
+    use libafl::state::UsesState;
+    use libafl_bolts::tuples::tuple_list;
+    use bytes::Bytes as StdBytes;
+    use revm_interpreter::bytecode::Bytecode;
+    use revm_primitives::Bytes as RevmBytes;
+
+    use super::FuzzExecutor;
+    use crate::evm::abi::{AEmpty, A256, A256InnerType, BoxedABI};
+    use crate::evm::host::FuzzHost;
+    use crate::evm::input::{CampaignSequence, ConciseEVMInput, EVMInput, EVMInputTy, StepLinkage};
+    use crate::evm::middlewares::value_capture::ValueCaptureMiddleware;
+    use crate::evm::oracles::CampaignWarpStates;
+    use crate::evm::types::{
+        CampaignIntermediateStatesEVM, EVMAddress, EVMFuzzState, EVMStagedVMState, EVMU256,
+    };
+    use crate::evm::vm::{EVMExecutor, EVMState};
+    use crate::generic_vm::vm_executor::GenericVM;
+    use crate::state::{FuzzState, HasExecutionResult};
+    use crate::state_input::StagedVMState;
+
+    struct StubFuzzer;
+    impl UsesState for StubFuzzer {
+        type State = EVMFuzzState;
+    }
+
+    fn addr(b: u8) -> EVMAddress {
+        EVMAddress::from([b; 20])
+    }
+
+    /// Register serdeany types that don't use impl_serdeany! — required before the
+    /// first `state.add_metadata(...)` call for these types in non-autoreg builds.
+    fn register_metadata_types() {
+        #[cfg(any(not(feature = "serdeany_autoreg"), miri))]
+        unsafe {
+            crate::evm::types::CampaignIntermediateStatesEVM::register();
+        }
+    }
+
+    // GenericVM's `By` parameter is bytes::Bytes, not revm_primitives::Bytes.
+    type DynVM = dyn GenericVM<
+        EVMState,
+        Bytecode,
+        StdBytes,
+        EVMAddress,
+        EVMAddress,
+        EVMU256,
+        Vec<u8>,
+        EVMInput,
+        EVMFuzzState,
+        ConciseEVMInput,
+    >;
+
+    fn make_fuzz_executor(
+        host: FuzzHost<StdScheduler<EVMFuzzState>>,
+    ) -> FuzzExecutor<
+        EVMState,
+        EVMAddress,
+        Bytecode,
+        StdBytes,
+        EVMAddress,
+        EVMU256,
+        Vec<u8>,
+        EVMInput,
+        EVMFuzzState,
+        (),
+        ConciseEVMInput,
+    > {
+        let evm_exec: EVMExecutor<EVMState, ConciseEVMInput, StdScheduler<EVMFuzzState>> =
+            EVMExecutor::new(host, addr(0xfe));
+        let vm_rc: Rc<RefCell<DynVM>> = Rc::new(RefCell::new(evm_exec));
+        FuzzExecutor::new(vm_rc, tuple_list!())
+    }
+
+    fn make_fuzz_executor_with_value_capture(
+        host: FuzzHost<StdScheduler<EVMFuzzState>>,
+    ) -> FuzzExecutor<
+        EVMState,
+        EVMAddress,
+        Bytecode,
+        StdBytes,
+        EVMAddress,
+        EVMU256,
+        Vec<u8>,
+        EVMInput,
+        EVMFuzzState,
+        (),
+        ConciseEVMInput,
+    > {
+        let mut evm_exec: EVMExecutor<EVMState, ConciseEVMInput, StdScheduler<EVMFuzzState>> =
+            EVMExecutor::new(host, addr(0xfe));
+        evm_exec
+            .host
+            .add_middlewares(Rc::new(RefCell::new(ValueCaptureMiddleware::new())));
+        let vm_rc: Rc<RefCell<DynVM>> = Rc::new(RefCell::new(evm_exec));
+        FuzzExecutor::new(vm_rc, tuple_list!())
+    }
+
+    fn aempty_abi(selector: [u8; 4]) -> BoxedABI {
+        let mut abi = BoxedABI::new(Box::new(AEmpty {}));
+        abi.set_func(selector);
+        abi
+    }
+
+    fn a256_abi(selector: [u8; 4]) -> BoxedABI {
+        let mut abi = BoxedABI::new(Box::new(A256 {
+            data: vec![0u8; 32],
+            is_address: false,
+            dont_mutate: false,
+            inner_type: A256InnerType::Uint,
+        }));
+        abi.set_func(selector);
+        abi
+    }
+
+    fn step(contract: EVMAddress, selector: [u8; 4], abi: BoxedABI) -> ConciseEVMInput {
+        ConciseEVMInput {
+            contract,
+            caller: addr(0x02),
+            input_type: EVMInputTy::ABI,
+            data: Some(abi),
+            repeat: 1,
+            ..Default::default()
+        }
+    }
+
+    fn campaign_input(
+        steps: Vec<ConciseEVMInput>,
+        linkages: Vec<StepLinkage>,
+        initial: EVMStagedVMState,
+    ) -> EVMInput {
+        let ci = ConciseEVMInput {
+            campaign: Some(CampaignSequence {
+                steps,
+                linkages,
+                warps: vec![],
+                promoted: vec![],
+                aposteriori: false,
+            }),
+            repeat: 1,
+            ..Default::default()
+        };
+        ci.to_input(initial).0
+    }
+
+    /// EO-01 (Feature 038): run_target must clear stale campaign metadata at the
+    /// top of every invocation — including non-campaign inputs.
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
+    #[test]
+    fn eo01_run_target_clears_campaign_metadata_on_non_campaign_input() {
+        register_metadata_types();
+        let work_dir = "/tmp/ityfuzz_eo01_test";
+        let _ = std::fs::create_dir_all(work_dir);
+        let mut state: EVMFuzzState = FuzzState::new(0);
+
+        let host = FuzzHost::new(StdScheduler::new(), work_dir.to_string());
+        let mut fuzz_executor = make_fuzz_executor(host);
+
+        // Pre-populate stale metadata from a previous campaign frame.
+        state.add_metadata(CampaignIntermediateStatesEVM { states: vec![] });
+        state.add_metadata(CampaignWarpStates { warps: vec![] });
+        assert!(state.metadata_map().get::<CampaignIntermediateStatesEVM>().is_some());
+        assert!(state.metadata_map().get::<CampaignWarpStates>().is_some());
+
+        // Non-campaign input targeting an address with no code — reverts but that
+        // is irrelevant; what matters is the metadata cleared at the top.
+        let ci = ConciseEVMInput {
+            contract: addr(0x99),
+            caller: addr(0x02),
+            input_type: EVMInputTy::ABI,
+            repeat: 1,
+            ..Default::default()
+        };
+        let (top_input, _) = ci.to_input(StagedVMState::new_uninitialized());
+
+        let mut z = StubFuzzer;
+        let mut em = StubFuzzer;
+        fuzz_executor
+            .run_target(&mut z, &mut state, &mut em, &top_input)
+            .unwrap();
+
+        assert!(
+            state.metadata_map().get::<CampaignIntermediateStatesEVM>().is_none(),
+            "EO-01: CampaignIntermediateStatesEVM must be absent after non-campaign run_target"
+        );
+        assert!(
+            state.metadata_map().get::<CampaignWarpStates>().is_none(),
+            "EO-01: CampaignWarpStates must be absent after non-campaign run_target"
+        );
+
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    /// EO-02 (Feature 039): intermediate_states[i] must reflect the POST-step state
+    /// (storage written by step i), not the pre-step state.  Also covers the revert
+    /// sub-case: if a prefix step reverts, run_target returns early and leaves
+    /// CampaignIntermediateStatesEVM absent (the EO-01 clear happened, the EO-02
+    /// write never happened).
+    ///
+    /// Increment contract (runtime bytecode):
+    ///   storage[0] += 1; MSTORE(0, storage[0]); RETURN(0, 32)
+    ///   60 00 54 60 01 01 80 60 00 55 60 00 52 60 20 60 00 f3
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
+    #[test]
+    fn eo02_intermediate_states_are_post_step_and_cleared_on_revert() {
+        register_metadata_types();
+        let work_dir = "/tmp/ityfuzz_eo02_test";
+        let _ = std::fs::create_dir_all(work_dir);
+        let mut state: EVMFuzzState = FuzzState::new(0);
+
+        let addr_inc = addr(0x01);
+        let sel_inc = [0x11u8, 0x22, 0x33, 0x44];
+        let increment_bytes =
+            hex::decode("6000546001018060005560005260206000f3").unwrap();
+
+        let mut host = FuzzHost::new(StdScheduler::new(), work_dir.to_string());
+        host.set_code(
+            addr_inc,
+            Bytecode::new_raw(RevmBytes::from(increment_bytes)),
+            &mut state,
+        );
+
+        let initial_vm = host.evmstate.clone();
+        let initial_sstate = EVMStagedVMState::new_with_state(initial_vm);
+
+        let mut fuzz_executor = make_fuzz_executor(host);
+
+        // 3-step campaign: each step increments storage[0] by 1.
+        // After prefix step 0 → storage[0] = 1; after prefix step 1 → storage[0] = 2.
+        let steps = vec![
+            step(addr_inc, sel_inc, aempty_abi(sel_inc)),
+            step(addr_inc, sel_inc, aempty_abi(sel_inc)),
+            step(addr_inc, sel_inc, aempty_abi(sel_inc)),
+        ];
+        let top_input = campaign_input(steps, vec![], initial_sstate);
+
+        let mut z = StubFuzzer;
+        let mut em = StubFuzzer;
+        fuzz_executor
+            .run_target(&mut z, &mut state, &mut em, &top_input)
+            .unwrap();
+
+        let meta = state
+            .metadata_map()
+            .get::<CampaignIntermediateStatesEVM>()
+            .expect("EO-02: CampaignIntermediateStatesEVM must be present after successful campaign");
+
+        // Two prefix steps → two entries (the exploit step is not recorded).
+        assert_eq!(
+            meta.states.len(),
+            2,
+            "EO-02: expected 2 intermediate states for a 3-step campaign"
+        );
+
+        // intermediate_states[0] must reflect POST-step-0 storage (counter = 1).
+        let s0 = meta.states[0].state.state.get(&addr_inc).unwrap();
+        assert_eq!(
+            s0.get(&EVMU256::ZERO).copied().unwrap_or(EVMU256::ZERO),
+            EVMU256::from(1u64),
+            "EO-02: intermediate_states[0] must be the post-step-0 state (counter=1)"
+        );
+
+        // intermediate_states[1] must reflect POST-step-1 storage (counter = 2).
+        let s1 = meta.states[1].state.state.get(&addr_inc).unwrap();
+        assert_eq!(
+            s1.get(&EVMU256::ZERO).copied().unwrap_or(EVMU256::ZERO),
+            EVMU256::from(2u64),
+            "EO-02: intermediate_states[1] must be the post-step-1 state (counter=2)"
+        );
+
+        // ── Revert sub-case ──────────────────────────────────────────────────
+        // A prefix step that reverts (INVALID = 0xfe) causes early return from
+        // run_target before state.add_metadata is called.  The EO-01 clear at the
+        // top means CampaignIntermediateStatesEVM is absent afterward.
+        let mut state2: EVMFuzzState = FuzzState::new(0);
+        state2.add_metadata(CampaignIntermediateStatesEVM { states: vec![] });
+
+        let addr_rev = addr(0x02);
+        let sel_rev = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let revert_bytes = hex::decode("fe").unwrap(); // INVALID always reverts
+
+        let work_dir2 = "/tmp/ityfuzz_eo02b_test";
+        let _ = std::fs::create_dir_all(work_dir2);
+        let mut host2 = FuzzHost::new(StdScheduler::new(), work_dir2.to_string());
+        host2.set_code(
+            addr_rev,
+            Bytecode::new_raw(RevmBytes::from(revert_bytes)),
+            &mut state2,
+        );
+        let initial_sstate2 =
+            EVMStagedVMState::new_with_state(host2.evmstate.clone());
+        let mut fuzz_executor2 = make_fuzz_executor(host2);
+
+        let steps2 = vec![
+            step(addr_rev, sel_rev, aempty_abi(sel_rev)), // reverts immediately
+            step(addr_rev, sel_rev, aempty_abi(sel_rev)),
+            step(addr_rev, sel_rev, aempty_abi(sel_rev)),
+        ];
+        let top_input2 = campaign_input(steps2, vec![], initial_sstate2);
+
+        let mut z2 = StubFuzzer;
+        let mut em2 = StubFuzzer;
+        fuzz_executor2
+            .run_target(&mut z2, &mut state2, &mut em2, &top_input2)
+            .unwrap();
+
+        assert!(
+            state2
+                .metadata_map()
+                .get::<CampaignIntermediateStatesEVM>()
+                .is_none(),
+            "EO-02 revert: CampaignIntermediateStatesEVM must be absent when a prefix step reverts"
+        );
+
+        let _ = std::fs::remove_dir_all(work_dir);
+        let _ = std::fs::remove_dir_all(work_dir2);
+    }
+
+    /// EO-04 (Feature 041): apply_linkage_arg must route a return value captured by
+    /// ValueCaptureMiddleware from step 0 into step 1's calldata argument slot.
+    ///
+    /// Contract A — return-slot0 (addr 0x01):
+    ///   SLOAD(0) → MSTORE(0, val) → RETURN(0, 32)
+    ///   Storage[0] is pre-seeded with NONCE = 42.
+    ///   Bytecode: 60 00 54 60 00 52 60 20 60 00 f3
+    ///
+    /// Contract B — check-nonce (addr 0x02):
+    ///   if CALLDATALOAD(4) == SLOAD(0) { STOP } else { REVERT }
+    ///   Storage[0] is pre-seeded with NONCE = 42.
+    ///   Bytecode: 60 04 35 60 00 54 14 60 0F 57 60 00 60 00 FD 5B 00
+    #[cfg_attr(not(feature = "integration_test"), ignore)]
+    #[test]
+    fn eo04_step_linkage_routes_captured_return_to_next_step_argument() {
+        register_metadata_types();
+        const NONCE: u64 = 42;
+
+        let addr_a = addr(0x01); // return-slot0 contract
+        let addr_b = addr(0x02); // check-nonce contract
+        let sel_a = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let sel_b = [0x11u8, 0x22, 0x33, 0x44];
+
+        // return-slot0: PUSH1 0 / SLOAD / PUSH1 0 / MSTORE / PUSH1 32 / PUSH1 0 / RETURN
+        let return_slot0_bytes = hex::decode("60005460005260206000f3").unwrap();
+        // check-nonce: PUSH1 4 / CALLDATALOAD / PUSH1 0 / SLOAD / EQ / PUSH1 15 / JUMPI
+        //              / PUSH1 0 / PUSH1 0 / REVERT / JUMPDEST / STOP
+        let check_nonce_bytes = hex::decode("60043560005414600f5760006000fd5b00").unwrap();
+
+        let work_dir = "/tmp/ityfuzz_eo04_test";
+        let _ = std::fs::create_dir_all(work_dir);
+        let mut state: EVMFuzzState = FuzzState::new(0);
+
+        let mut host = FuzzHost::new(StdScheduler::new(), work_dir.to_string());
+        host.set_code(
+            addr_a,
+            Bytecode::new_raw(RevmBytes::from(return_slot0_bytes.clone())),
+            &mut state,
+        );
+        host.set_code(
+            addr_b,
+            Bytecode::new_raw(RevmBytes::from(check_nonce_bytes.clone())),
+            &mut state,
+        );
+
+        // Pre-seed storage[0] with NONCE at BOTH contracts so they agree.
+        let mut initial_vm = host.evmstate.clone();
+        initial_vm
+            .state
+            .entry(addr_a)
+            .or_default()
+            .insert(EVMU256::ZERO, EVMU256::from(NONCE));
+        initial_vm
+            .state
+            .entry(addr_b)
+            .or_default()
+            .insert(EVMU256::ZERO, EVMU256::from(NONCE));
+        let initial_sstate = EVMStagedVMState::new_with_state(initial_vm);
+
+        // Step 0 calls addr_a (no args needed — the contract ignores calldata).
+        // Step 1 calls addr_b with a uint256 argument slot that must receive NONCE.
+        let steps = vec![
+            step(addr_a, sel_a, aempty_abi(sel_a)),
+            step(addr_b, sel_b, a256_abi(sel_b)), // arg slot 0 starts as zeros
+        ];
+
+        let registry_key = format!("{:?}_{}_return", addr_a, hex::encode(sel_a));
+        let linkage = StepLinkage {
+            from_step: 0,
+            from_registry_key: registry_key,
+            to_step: 1,
+            to_param_index: 0,
+        };
+
+        // ── WITH linkage ──────────────────────────────────────────────────────
+        let mut host_with = FuzzHost::new(StdScheduler::new(), work_dir.to_string());
+        host_with.set_code(
+            addr_a,
+            Bytecode::new_raw(RevmBytes::from(return_slot0_bytes.clone())),
+            &mut state,
+        );
+        host_with.set_code(
+            addr_b,
+            Bytecode::new_raw(RevmBytes::from(check_nonce_bytes.clone())),
+            &mut state,
+        );
+        let mut fuzz_executor_with =
+            make_fuzz_executor_with_value_capture(host_with);
+
+        let top_with = campaign_input(steps.clone(), vec![linkage], initial_sstate.clone());
+        let mut z = StubFuzzer;
+        let mut em = StubFuzzer;
+        fuzz_executor_with
+            .run_target(&mut z, &mut state, &mut em, &top_with)
+            .unwrap();
+
+        // The exploit step (check-nonce) must NOT have reverted when linkage routed
+        // the captured NONCE into its calldata.
+        let result_with = state.get_execution_result();
+        assert!(
+            !result_with.reverted,
+            "EO-04 WITH linkage: exploit step must succeed when nonce is routed"
+        );
+
+        // ── WITHOUT linkage ───────────────────────────────────────────────────
+        let mut host_without = FuzzHost::new(StdScheduler::new(), work_dir.to_string());
+        host_without.set_code(
+            addr_a,
+            Bytecode::new_raw(RevmBytes::from(return_slot0_bytes)),
+            &mut state,
+        );
+        host_without.set_code(
+            addr_b,
+            Bytecode::new_raw(RevmBytes::from(check_nonce_bytes)),
+            &mut state,
+        );
+        let mut fuzz_executor_without =
+            make_fuzz_executor_with_value_capture(host_without);
+
+        let top_without = campaign_input(steps, vec![], initial_sstate); // no linkages
+        let mut z2 = StubFuzzer;
+        let mut em2 = StubFuzzer;
+        fuzz_executor_without
+            .run_target(&mut z2, &mut state, &mut em2, &top_without)
+            .unwrap();
+
+        // Without linkage the nonce slot stays zero → mismatch → REVERT.
+        let result_without = state.get_execution_result();
+        assert!(
+            result_without.reverted,
+            "EO-04 WITHOUT linkage: exploit step must revert when nonce slot is zero"
+        );
+
+        let _ = std::fs::remove_dir_all(work_dir);
     }
 }
 
