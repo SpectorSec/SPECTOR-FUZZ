@@ -19,7 +19,7 @@ use libafl_bolts::{
 use revm_interpreter::{interpreter_types::Jumps, Interpreter};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use super::onchain::flashloan::CAN_LIQUIDATE;
+
 /// Mutator for EVM inputs
 use crate::evm::input::{CampaignSequence, EVMInputT, NestedAction};
 use crate::{
@@ -1746,7 +1746,11 @@ where
                 let res = match state.rand_mut().below(MUTATOR_SAMPLE_MAX) {
                     0..=LIQUIDATE_CHOICE => {
                         // only when there are more than one liquidation path, we attempt to liquidate
-                        if unsafe { CAN_LIQUIDATE } {
+                        let can_liquidate = state.metadata_map()
+                            .get::<crate::feedback::CampaignLiquidationMetadata>()
+                            .map(|m| m.can_liquidate)
+                            .unwrap_or(false);
+                        if can_liquidate {
                             let prev_percent = input.get_liquidation_percent();
                             input.set_liquidation_percent(if state.rand_mut().below(MUTATOR_SAMPLE_MAX) <
                                 LIQ_PERCENT_CHOICE

@@ -15,7 +15,7 @@ use std::{
 use bytes::Bytes;
 /// EVM executor implementation
 use itertools::Itertools;
-use libafl::schedulers::Scheduler;
+use libafl::{schedulers::Scheduler, state::HasMetadata};
 use revm_interpreter::{
     interpreter::{ExtBytecode, InputsImpl, SharedMemory},
     interpreter_types::{Jumps, ReturnData as ReturnDataTr},
@@ -788,9 +788,10 @@ where
         // A successful engine acquisition proves the round-trip is liquidatable — enable
         // the liquidation machinery (CAN_LIQUIDATE gates liquidation_percent mutation and
         // the loot oracle). Formerly bootstrapped by the System-1 token discovery.
-        unsafe {
-            crate::evm::onchain::flashloan::CAN_LIQUIDATE = true;
+        if state.metadata_map().get::<crate::feedback::CampaignLiquidationMetadata>().is_none() {
+            state.metadata_map_mut().insert(crate::feedback::CampaignLiquidationMetadata { can_liquidate: false });
         }
+        state.metadata_map_mut().get_mut::<crate::feedback::CampaignLiquidationMetadata>().unwrap().can_liquidate = true;
         tracing::info!("[acq-engine] acquired {} of {:?} for {:?}", acquired, token, caller);
         Some(acquired)
     }

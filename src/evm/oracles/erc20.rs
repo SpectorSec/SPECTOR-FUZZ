@@ -6,7 +6,6 @@ use revm_interpreter::bytecode::Bytecode;
 use crate::{
     evm::{
         input::{ConciseEVMInput, EVMInput},
-        onchain::flashloan::CAN_LIQUIDATE,
         oracle::EVMBugResult,
         oracles::{u512_div_float, ERC20_BUG_IDX},
         producers::erc20::ERC20Producer,
@@ -36,11 +35,7 @@ impl IERC20OracleFlashloan {
         }
     }
 
-    pub fn register_token(&mut self, token: EVMAddress, token_ctx: TokenContext, can_liquidate: bool) {
-        // setting can_liquidate to true to turn on liquidation
-        unsafe {
-            CAN_LIQUIDATE |= can_liquidate;
-        }
+    pub fn register_token(&mut self, token: EVMAddress, token_ctx: TokenContext, _can_liquidate: bool) {
         self.known_tokens.borrow_mut().insert(token, token_ctx);
     }
 

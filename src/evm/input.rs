@@ -12,7 +12,6 @@ use crate::evm::types::Env;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    onchain::flashloan::CAN_LIQUIDATE,
     utils::{colored_address, colored_sender, prettify_value},
 };
 use crate::{
@@ -563,7 +562,7 @@ impl ConciseEVMInput {
 
     #[inline]
     fn append_liquidation(&self, indent: String, call: String) -> String {
-        if self.liquidation_percent == 0 || unsafe { !CAN_LIQUIDATE } {
+        if self.liquidation_percent == 0 {
             return call;
         }
         let liq_call = if self.swap_data.contains_key("withdraw") {

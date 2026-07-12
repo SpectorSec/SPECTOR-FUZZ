@@ -43,7 +43,7 @@ use crate::{
     state::{HasCaller, HasItyState},
 };
 
-pub static mut CAN_LIQUIDATE: bool = false;
+
 
 #[macro_export]
 macro_rules! scale {
@@ -193,6 +193,12 @@ impl Flashloan {
                 if oracle.is_ok() {
                     let can_liquidate = !token_ctx.swaps.is_empty();
                     oracle.unwrap().register_token(*addr, token_ctx, can_liquidate);
+                    if can_liquidate {
+                        if _state.metadata_map().get::<crate::feedback::CampaignLiquidationMetadata>().is_none() {
+                            _state.metadata_map_mut().insert(crate::feedback::CampaignLiquidationMetadata { can_liquidate: false });
+                        }
+                        _state.metadata_map_mut().get_mut::<crate::feedback::CampaignLiquidationMetadata>().unwrap().can_liquidate = true;
+                    }
                     self.erc20_address.insert(*addr);
                     is_erc20 = true;
                 } else {
@@ -218,6 +224,7 @@ impl Flashloan {
         pair: EVMAddress,
         reserve_slot: EVMU256,
         host: &FuzzHost<SC>,
+        state: &mut EVMFuzzState,
     ) where
         SC: Scheduler<State = EVMFuzzState> + Clone + 'static,
     {
@@ -278,9 +285,10 @@ impl Flashloan {
                 }
             })) {
                 token_ctx.swaps.push(path_ctx);
-                unsafe {
-                    CAN_LIQUIDATE = true;
+                if state.metadata_map().get::<crate::feedback::CampaignLiquidationMetadata>().is_none() {
+                    state.metadata_map_mut().insert(crate::feedback::CampaignLiquidationMetadata { can_liquidate: false });
                 }
+                state.metadata_map_mut().get_mut::<crate::feedback::CampaignLiquidationMetadata>().unwrap().can_liquidate = true;
                 println!("[FlashloanMiddleware] Registered dynamic local route for {:?} -> {:?} via pair {:?}", token_in, token_out, pair);
             }
         }
@@ -341,8 +349,8 @@ impl Flashloan {
             let t0 = token_candidates[0];
             let t1 = token_candidates[1];
             
-            self.register_local_pair_route(t0, t1, pair, reserve_slot, host);
-            self.register_local_pair_route(t1, t0, pair, reserve_slot, host);
+            self.register_local_pair_route(t0, t1, pair, reserve_slot, host, state);
+            self.register_local_pair_route(t1, t0, pair, reserve_slot, host, state);
         }
     }
 }

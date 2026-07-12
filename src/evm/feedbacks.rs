@@ -1036,6 +1036,21 @@ mod impact_011_tests {
         assert_eq!(read_invariant_objective(), 0);
     }
 
+    #[test]
+    fn test_campaign_liquidation_metadata_isolation() {
+        use crate::feedback::CampaignLiquidationMetadata;
+        use libafl_bolts::serdeany::SerdeAnyMap;
+        let mut map = SerdeAnyMap::new();
+
+        assert!(map.get::<CampaignLiquidationMetadata>().is_none());
+
+        map.insert(CampaignLiquidationMetadata { can_liquidate: true });
+        assert!(map.get::<CampaignLiquidationMetadata>().unwrap().can_liquidate);
+
+        map.remove::<CampaignLiquidationMetadata>();
+        assert!(map.get::<CampaignLiquidationMetadata>().is_none());
+    }
+
     /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed
     /// inert — no engine ref is held, so `is_interesting` takes the
     /// original early-return path and the new code is unreachable. (Full

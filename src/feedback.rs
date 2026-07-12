@@ -870,3 +870,12 @@ pub struct DivergenceSecantState {
 }
 
 impl_serdeany!(DivergenceSecantState);
+
+/// Case 2 — Campaign-local liquidation capability metadata.
+/// Replaces the process-global static mut CAN_LIQUIDATE flag.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CampaignLiquidationMetadata {
+    pub can_liquidate: bool,
+}
+
+impl_serdeany!(CampaignLiquidationMetadata);
