@@ -376,10 +376,25 @@ pub fn evm_fuzzer(
 
     evm_executor.host.add_middlewares(cov_middleware.clone());
 
-    if !config.guidance_file.is_empty() {
-        info!("[guidance] loading compiled semantic guidance from {}", config.guidance_file);
-        let guidance = crate::evm::guidance::Guidance::load(&config.guidance_file)
+    let guidance_path = if !config.guidance_file.is_empty() {
+        Some(config.guidance_file.clone())
+    } else if std::path::Path::new("spectrefuzz.guidance").exists() {
+        info!("[guidance] found default spectrefuzz.guidance in current directory");
+        Some("spectrefuzz.guidance".to_string())
+    } else {
+        info!("[guidance] no compiled semantic guidance file provided or found. Running baseline concolic.");
+        None
+    };
+
+    if let Some(path) = guidance_path {
+        info!("[guidance] loading compiled semantic guidance from {}", path);
+        let guidance = crate::evm::guidance::Guidance::load(&path)
             .expect("Failed to load guidance file");
+        let meta = &guidance.meta;
+        info!(
+            "[guidance] successfully digested: {} contracts, {} functions, {} kill chains, {} invariants",
+            meta.num_contracts, meta.num_functions, meta.num_kill_chains, meta.num_invariants
+        );
         state.add_metadata(crate::evm::guidance::GuidanceMetadata::new(guidance));
     }
 
