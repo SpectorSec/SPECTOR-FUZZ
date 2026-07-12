@@ -146,6 +146,9 @@ pub struct PowerABITestcaseMetadata {
     /// Feature 037 — decay counter for the compound-sequence boost.
     #[serde(default)]
     pub compound_hits: u32,
+    /// INV-016 — testcase-local timestamp located warp scheduling flag.
+    #[serde(default)]
+    pub timestamp_located: bool,
 }
 
 impl PowerABITestcaseMetadata {
@@ -160,6 +163,7 @@ impl PowerABITestcaseMetadata {
             dim_hits: 0,
             compound_sequence: false,
             compound_hits: 0,
+            timestamp_located: false,
         }
     }
 }
@@ -340,6 +344,8 @@ where
             .get::<CompoundSequenceCanary>()
             .map(|canary| canary.set)
             .unwrap_or(false);
+        // INV-016 — snapshot timestamp located taint flag NOW before it is cleared.
+        let timestamp_located = unsafe { crate::evm::middlewares::cmp_linearity::TIMESTAMP_TAINT_WRITTEN };
         // adding power scheduling information based on code size
         {
             let mut testcase = state.testcase_mut(idx).unwrap();
@@ -355,6 +361,7 @@ where
                     let mut m = PowerABITestcaseMetadata::new(1);
                     m.located_dim = flow_dim;
                     m.compound_sequence = compound_sequence;
+                    m.timestamp_located = timestamp_located;
                     testcase.add_metadata(m);
                     return Ok(());
                 } // some contracts are not in ArtifactInfo, like borrow
@@ -364,6 +371,7 @@ where
                 if let Ok(m) = testcase.metadata_mut::<PowerABITestcaseMetadata>() {
                     m.located_dim = flow_dim;
                     m.compound_sequence = compound_sequence;
+                    m.timestamp_located = timestamp_located;
                 }
             }
         }

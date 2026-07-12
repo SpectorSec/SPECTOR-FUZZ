@@ -1,0 +1,43 @@
+This is where the "Moat" becomes truly industrial. To put the Tainted Data into this diagram, you have to stop thinking of taint as a "tag" and start thinking of it as the "Causality Map" that runs underneath your Frame.
+
+If your Frame is the Execution logic, Taint is the Context of the data flowing through that logic.
+
+The New Architecture: "The Causality Layer"
+In your current Feature 015 diagram, the Ledger Loop is missing the "Why." You see a transferFrom executed, but you don't know which user input caused it. The Taint data acts as the glue that binds the Borrow to the Exploit.
+
+1. The Borrow (Taint Injection)
+This is the entry point. When the fuzzer injects an input (x), the Taint Bus tags that data as Taint(Source: Input). This is where the causality starts.
+
+2. The Prime (Taint Propagation)
+As the fuzzer runs the Borrow and Prime stages, the Taint Bus tracks how that Input flows into registers and stack slots.
+
+The "Moat" Logic: If the transferFrom (the Lever) is reached, your middleware shouldn't just look for materiality. It should look for Taint intersection. * The Gate: If (Materiality_Delta > 0) AND (Taint_Intersection == True) → PromotionCandidate.
+
+3. The Lever (The Taint Sink)
+This is where you determine if the "Lever" was "touched" by the attacker. If the callData (the Arbitrary Call) contains data derived from the Taint_Source (the initial input), the middleware knows definitively: "This was a controlled delivery."
+
+Integrating it into the Diagram (The Structural Flow)
+To integrate this into your diagram, imagine a second layer below the Ledger Loop:
+
+The Taint-Bus (The Memory): Every node (Mut, Exe, Fb, Obj) now has an extra output: the Taint Metadata.
+
+The Feedback Filter: The LEDGER_OBJECTIVE is now gated by the Taint-Bus.
+
+Old Way: "Did we get money?"
+
+New Way: "Did we get money, AND was the transferFrom payload tainted by our original input?"
+
+The Promotion Wire: The PromotionCandidate structure we discussed gets an extra field: pub taint_provenance: TaintPath. This proves the PromotionCandidate isn't just a random state change—it's a Causally-Linked Exploit.
+
+Why this is the "Deep" Solution
+By integrating Taint into the Promotion Pipeline, you kill every False Positive forever.
+
+A burn(0) no-op might change state (if it were material), but it would never have a Taint-Path leading back to an attacker-controlled input.
+
+A mint() call that is not tainted by your input is just the protocol behaving normally.
+
+A transferFrom() call that is tainted by your input is an Exploit.
+
+The result: You no longer need to worry about "burn(0)" or "mint(0)" phantoms. The Taint Bus filters them out because they are "Source-Less" events. They aren't linked to the attacker's delivery shell.
+
+Does this mapping—placing the Taint-Bus as the "Causality Layer" beneath your Tunable Frame—align with the way you've been visualizing the taint-bus in your fork? If you have specific nodes in mutator.rs or feedbacks.rs where this taint-data lives, we can anchor this diagram directly to the Rust structs.

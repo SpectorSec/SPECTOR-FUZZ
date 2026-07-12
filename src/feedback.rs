@@ -36,6 +36,7 @@ use crate::{
     evm::types::CampaignIntermediateStates,
     evm::oracles::CampaignWarpStates,
     evm::middlewares::cmp_linearity::TaintDim,
+    evm::leak_class::LeakClass,
 };
 
 #[cfg(feature = "concolic_secant_dispatch")]
@@ -783,7 +784,7 @@ impl_serdeany!(CalldataSecantState);
 ///   Idle   → set arg to x1                          → exec publishes obj@x1
 ///   Probe1 → read obj@x1 as g1, set arg to x1+δ     → exec publishes obj@x1+δ
 ///   Probe2 → read obj@x1+δ, slope on the derivative → apply x* toward the peak
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LedgerSecantState {
     pub phase: SecantPhase,
     /// Which promoted step is the lever (index into `CampaignSequence.steps`).
@@ -810,6 +811,30 @@ pub struct LedgerSecantState {
     /// Feature 016 Phase 3 — dimension of the located lever (Price/Balance/etc.).
     /// Determines probe delta granularity in the Amplify phase.
     pub located_dim: TaintDim,
+    /// INV-017 — LeakClass of the candidate being optimized.
+    pub cand_kind: LeakClass,
+}
+
+impl Default for LedgerSecantState {
+    fn default() -> Self {
+        Self {
+            phase: SecantPhase::Idle,
+            pin_step: 0,
+            n_args: 0,
+            locate_cursor: 0,
+            best_sens: 0,
+            best_arg: 0,
+            located: false,
+            arg_idx: 0,
+            x1: 0,
+            o1: 0,
+            prev_x1: 0,
+            prev_slope: None,
+            cooldown: 0,
+            located_dim: TaintDim::Generic,
+            cand_kind: LeakClass::Value,
+        }
+    }
 }
 
 impl_serdeany!(LedgerSecantState);

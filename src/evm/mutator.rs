@@ -880,21 +880,46 @@ where
         const MAX_ARG: u128 = 1_000_000_000 * BASE; // trust-region ceiling (1e9 tokens)
         const COOLDOWN: u32 = 8;
 
-        let obj = crate::evm::feedbacks::read_ledger_objective();
+        let cand_kind = {
+            let singleton = state.metadata_map().get::<PromotionCandidate>();
+            let owned_candidates;
+            let candidates = if let Some(candidates) = state.metadata_map().get::<PromotionCandidates>() {
+                Some(candidates)
+            } else {
+                owned_candidates = singleton.map(PromotionCandidates::from_singleton);
+                owned_candidates.as_ref()
+            };
+            candidates.and_then(|candidates| {
+                candidates.first_set(&[
+                    crate::evm::leak_class::LeakClass::Value,
+                    crate::evm::leak_class::LeakClass::Invariant,
+                    crate::evm::leak_class::LeakClass::Permission,
+                ])
+            }).map(|cand| cand.kind).unwrap_or(crate::evm::leak_class::LeakClass::Value)
+        };
 
         let mut s = state
             .metadata_map()
             .get::<crate::feedback::LedgerSecantState>()
             .cloned()
             .unwrap_or_default();
+        s.cand_kind = cand_kind;
+
         // Re-plan drift: if the pinned frame changed under us, restart bookkeeping.
         if s.pin_step != pin_step || s.n_args != n_args {
             s = crate::feedback::LedgerSecantState {
                 pin_step,
                 n_args,
+                cand_kind,
                 ..Default::default()
             };
         }
+
+        let obj = if s.cand_kind == crate::evm::leak_class::LeakClass::Invariant {
+            crate::evm::feedbacks::read_invariant_objective()
+        } else {
+            crate::evm::feedbacks::read_ledger_objective()
+        };
 
         let arg = if s.located { s.arg_idx } else { s.locate_cursor % n_args };
         // Feature 016 Phase 3: dimension-appropriate probe delta.
@@ -1328,12 +1353,25 @@ where
                         .get::<crate::feedback::DivergenceSecantState>()
                         .filter(|d| d.pin_gate)
                         .map(|d| d.x1);
+                    let timestamp_located = if let Some(cur) = *state.corpus().current() {
+                        if let Ok(tc) = state.corpus().get(cur) {
+                            tc.borrow()
+                                .metadata_map()
+                                .get::<crate::evm::scheduler::PowerABITestcaseMetadata>()
+                                .map(|m| m.timestamp_located)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     if let Some(campaign) = plan_campaign_sampled(
                         cache,
                         topology_report,
                         self.temporal_skimming,
                         self.reflexive_lever,
-                        self.dimension_warp,
+                        self.dimension_warp && timestamp_located,
                         structural_pin,
                         value_lever_pin,
                         borrow_authority,
@@ -2283,6 +2321,7 @@ mod tests {
             prev_slope: Some(-77),
             cooldown: 8,
             located_dim: crate::evm::middlewares::cmp_linearity::TaintDim::Price,
+            cand_kind: crate::evm::leak_class::LeakClass::Value,
         };
         let encoded = serde_json::to_string(&s).expect("serialize");
         let d: LedgerSecantState = serde_json::from_str(&encoded).expect("deserialize");

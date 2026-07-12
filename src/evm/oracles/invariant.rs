@@ -155,6 +155,7 @@ impl
                 ctx.fuzz_state.metadata_map_mut().insert(candidates);
                 ctx.fuzz_state.metadata_map_mut().insert(candidate);
             }
+            crate::evm::feedbacks::publish_invariant_objective(1_000_000_000_000_000_000);
 
             let (name, _) = self.names.get(&tx.2.to_vec()).unwrap();
             // Dedup gate applies only to the human-facing report, not to the promotion

@@ -411,6 +411,7 @@ where
             crate::evm::feedbacks::clear_divergence();
             crate::evm::feedbacks::clear_ledger_objective();
             crate::evm::feedbacks::clear_located_dim();
+            crate::evm::feedbacks::clear_invariant_objective();
 
             #[cfg(feature = "concolic_secant_dispatch")]
             {

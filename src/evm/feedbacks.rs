@@ -60,6 +60,10 @@ thread_local! {
     /// analysis reexecution. Set after CmpLinearityTaint runs, read by the mutator's
     /// `apply_ledger_secant` to bias probe delta and mutation energy.
     static DIMENSION_FLOW: Cell<TaintDim> = const { Cell::new(TaintDim::Generic) };
+    /// INV-017 — the invariant violation magnitude (optimization mode).
+    /// Invariant oracles publish the break magnitude here; the mutator's
+    /// `apply_ledger_secant` reads it to maximize invariant violation delta.
+    static INVARIANT_OBJECTIVE: Cell<u128> = const { Cell::new(0) };
 }
 
 /// Publish this execution's raw-inflow objective (Feature 015). Only called
@@ -93,6 +97,21 @@ pub fn clear_divergence() {
 /// Clear the per-execution ledger objective before running a new input (Feature 015).
 pub fn clear_ledger_objective() {
     LEDGER_OBJECTIVE.with(|c| c.set(0));
+}
+
+/// INV-017 — publish this execution's invariant violation magnitude.
+pub fn publish_invariant_objective(value: u128) {
+    INVARIANT_OBJECTIVE.with(|c| c.set(value));
+}
+
+/// INV-017 — read the last published invariant violation magnitude.
+pub fn read_invariant_objective() -> u128 {
+    INVARIANT_OBJECTIVE.with(|c| c.get())
+}
+
+/// INV-017 — clear the per-execution invariant objective before running a new input.
+pub fn clear_invariant_objective() {
+    INVARIANT_OBJECTIVE.with(|c| c.set(0));
 }
 
 /// Clear the per-execution located dimension flow type before running a new input (Feature 016).
@@ -1007,6 +1026,14 @@ mod impact_011_tests {
         clear_located_dim();
         assert_eq!(read_ledger_objective(), 0);
         assert_eq!(read_located_dim(), TaintDim::Generic);
+    }
+
+    #[test]
+    fn clear_invariant_objective_resets_stale_data() {
+        publish_invariant_objective(789);
+        assert_eq!(read_invariant_objective(), 789);
+        clear_invariant_objective();
+        assert_eq!(read_invariant_objective(), 0);
     }
 
     /// T6 / SC-3 (unit proxy): with the flag off the feedback is constructed

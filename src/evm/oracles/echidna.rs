@@ -113,6 +113,7 @@ impl
                 ctx.fuzz_state.metadata_map_mut().insert(candidates);
                 ctx.fuzz_state.metadata_map_mut().insert(candidate);
             }
+            crate::evm::feedbacks::publish_invariant_objective(1_000_000_000_000_000_000);
         }
 
         results

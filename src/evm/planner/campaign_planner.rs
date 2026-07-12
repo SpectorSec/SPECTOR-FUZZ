@@ -527,7 +527,7 @@ pub fn plan_campaign_sampled<R: Rand>(
     // Feature 017 Wire B: engage warp when dimension-driven (timestamp taint
     // reached SSTORE) OR flag-driven. dimension_warp gates the static read so
     // the feature is off by default.
-    let ts_located = dimension_warp && unsafe { crate::evm::middlewares::cmp_linearity::TIMESTAMP_DIM_LOCATED };
+    let ts_located = dimension_warp;
     if temporal_skimming || ts_located {
         // The exploit step is always the last step. Insert warp before it.
         // Index is steps.len() - 1 (0-indexed).
@@ -1445,6 +1445,36 @@ mod tests {
             .first_set(&[LeakClass::Value, LeakClass::Invariant])
             .expect("lever candidate");
         assert_eq!(lever.kind, LeakClass::Value);
+    }
+
+    #[test]
+    fn test_planner_adds_warp_when_dimension_warp_enabled() {
+        let mut map = HashMap::new();
+        let prime_addr = EVMAddress::from([0x01; 20]);
+        let exploit_addr = EVMAddress::from([0x02; 20]);
+        map.insert(prime_addr, vec![make_abi(PRIME_SELECTORS[0])]);
+        map.insert(exploit_addr, vec![make_abi(EXPLOIT_SELECTORS[0])]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(0xC0FFEE);
+        // dimension_warp = true → should insert warp before exploit step
+        let campaign = plan_campaign_sampled(
+            &cache,
+            None,
+            false, // temporal_skimming
+            false, // effective_reflexive
+            true,  // dimension_warp
+            None,  // structural_pin
+            None,  // value_lever_pin
+            None,  // borrow_authority
+            None,  // divergence_value
+            &mut rand,
+        ).expect("should produce campaign");
+
+        assert_eq!(campaign.steps.len(), 2);
+        assert_eq!(campaign.warps.len(), 1, "should have 1 warp entry");
+        assert_eq!(campaign.warps[0].0, 1, "warp should be before exploit step (index 1)");
     }
 }
 
