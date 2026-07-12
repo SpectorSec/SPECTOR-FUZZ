@@ -116,11 +116,6 @@ impl_serdeany!(UncoveredBranchesMetadata);
 pub struct PowerABITestcaseMetadata {
     /// Number of lines in source code, initialized in on_add
     lines: usize,
-    /// How many times this testcase has received a topology boost.
-    /// Used to decay the boost: effective_boost = base * 0.95^topology_hits.
-    /// Prevents the fuzzer from getting trapped in a local optimum on
-    /// topology-predicted paths that don't actually yield oracle fires.
-    pub topology_hits: u32,
     /// Feature 026 Phase A — how many times this testcase received the
     /// Promote→Scheduler economic boost. Sibling of `topology_hits` so the two
     /// pressures decay independently (a topology-shaped step and a promoted
@@ -160,7 +155,6 @@ impl PowerABITestcaseMetadata {
     pub fn new(lines: usize) -> Self {
         Self {
             lines,
-            topology_hits: 0,
             promote_hits: 0,
             located_dim: TaintDim::Generic,
             dim_hits: 0,
@@ -564,41 +558,7 @@ where
 
         let mut power = uncov_branch as f64 * POWER_MULTIPLIER;
 
-        // Topology gamma ray: boost power for sequences that match the predicted
-        // exploit shape. The boost decays exponentially with each scheduling hit
-        // so the fuzzer concentrates pressure on topology-predicted paths early
-        // but returns to full exploration as those paths fail to yield new branches.
-        //
-        // Formula: effective_boost = 1.0 + (base_boost - 1.0) * 0.95^hits
-        //   hits=0  → full boost    (e.g. 1.95x at 95% confidence)
-        //   hits=14 → ~50% of boost (1.475x)
-        //   hits=45 → ~10% of boost (effectively neutral)
-        //
-        // v1: counter ticks on scheduling (compute call). v2 should tick only
-        // on trace observation — when the ghost actually sees the selector fire.
-        if let Some(hints) = state.metadata_map().get::<TopologyHints>() {
-            if let Some(input) = entry.input() {
-                if let Some(abi) = input.get_data_abi() {
-                    let selector = abi.function;
-                    if let Some(confidence) = hints.lookup(&selector) {
-                        let hits = match entry.metadata::<PowerABITestcaseMetadata>() {
-                            Ok(meta) => meta.topology_hits,
-                            Err(_) => 0,
-                        };
-                        // --topology-bias scales the confidence steer (floodlight→nudge→off).
-                        let base_boost = 1.0 + (confidence as f64 / 100.0) * hints.bias;
-                        let decay = 0.95_f64.powi(hits as i32);
-                        let effective_boost = 1.0 + (base_boost - 1.0) * decay;
-                        power *= effective_boost;
-
-                        // increment hit counter for decay
-                        if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
-                            meta.topology_hits = meta.topology_hits.saturating_add(1);
-                        }
-                    }
-                }
-            }
-        }
+        // Topology gamma ray removed in favor of Compiled Semantic Guidance.
 
         // Feature 026 Phase A — Promote → Scheduler energy. The reflexive (015) and
         // parameter-bound (025) levers promote a (contract, selector) via

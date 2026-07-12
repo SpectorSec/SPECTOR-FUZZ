@@ -29,7 +29,6 @@ use crate::{
         middlewares::cheatcode::CHEATCODE_ADDRESS,
         oracles::{TrustedCallerMetadata, WhaleAddressMetadata},
         planner::{plan_campaign_sampled, CampaignTargetCache, PromotionCandidate, PromotionCandidates},
-        topology::{TopologyHints, TopologyReport},
         types::{convert_u256_to_h160, EVMAddress, EVMU256},
         vm::{Constraint, EVMState, EVMStateT},
     },
@@ -1273,15 +1272,7 @@ where
         // Campaign generation: probability scaled by topology confidence when
         // orchestrator is enabled
         if self.campaign_orchestrator {
-            let campaign_threshold = if let Some(hints) = state.metadata_map().get::<TopologyHints>() {
-                let max_conf = hints.sets.iter().map(|s| s.confidence).max().unwrap_or(0) as f64;
-                // Scale: base * (1 + (confidence/100) * bias). bias (--topology-bias) dials
-                // the steer from floodlight (1.0) to nudge (0.3 default) to off (0.0).
-                ((CAMPAIGN_CHOICE as f64) * (1.0 + (max_conf / 100.0) * hints.bias)).min(MUTATOR_SAMPLE_MAX as f64)
-                    as u64
-            } else {
-                CAMPAIGN_CHOICE
-            };
+            let campaign_threshold = CAMPAIGN_CHOICE;
             if state.rand_mut().below(MUTATOR_SAMPLE_MAX) < campaign_threshold {
                 // Seed a local RNG from the fuzzer RNG so the planner can SAMPLE the
                 // candidate pool (get_next_call-style) instead of first()/first().
@@ -1289,7 +1280,6 @@ where
                 // simultaneous &mut state / &state conflict.
                 let mut plan_rand = StdRand::with_seed(state.rand_mut().next());
                 if let Some(cache) = state.metadata_map().get::<CampaignTargetCache>() {
-                    let topology_report = state.metadata_map().get::<TopologyReport>();
                     // No per-selector value anchor: the planner samples structure and the
                     // net-realized ledger (objective layer) selects economic survivors.
                     // The removed anchor read observed_values (ABI-return words), which
@@ -1328,27 +1318,7 @@ where
                             ])
                         })
                         .map(|c| (c.contract, c.selector));
-                    // §7d content re-point: pick a topology-classified capital-source token for the
-                    // Borrow slot — a borrowable whose contract exposes FlashLoan/Lending/ERC4626
-                    // (per-contract families). None ⇒ planner keeps the blind `.first()` behavior.
-                    let borrow_authority = state.metadata_map().get::<TopologyHints>().and_then(|h| {
-                        cache
-                            .borrowable_tokens
-                            .iter()
-                            .find(|t| {
-                                h.contract_families.get(*t).map_or(false, |fams| {
-                                    fams.iter().any(|f| {
-                                        matches!(
-                                            f,
-                                            crate::evm::topology::ProtocolFamily::FlashLoan |
-                                                crate::evm::topology::ProtocolFamily::Lending |
-                                                crate::evm::topology::ProtocolFamily::ERC4626
-                                        )
-                                    })
-                                })
-                            })
-                            .copied()
-                    });
+                    let borrow_authority = None;
                     // Feature 029 Phase 2 — divergence pin: when the secant has converged
                     // (pin_gate), publish the divergence-maximized x so the planner pre-loads
                     // the first non-borrow step's txn_value. None ⇒ no pin (normal path).
@@ -1372,7 +1342,7 @@ where
                     };
                     if let Some(campaign) = plan_campaign_sampled(
                         cache,
-                        topology_report,
+                        None,
                         self.temporal_skimming,
                         self.reflexive_lever,
                         self.dimension_warp && timestamp_located,

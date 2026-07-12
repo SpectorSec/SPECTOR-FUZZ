@@ -98,7 +98,7 @@ pub struct EVMInitializationArtifacts {
     pub oracle_contracts: Vec<EVMAddress>,
     /// Topology intelligence report — ranked exploit classes derived from
     /// protocol family co-occurrence across all target contracts.
-    pub topology: Option<crate::evm::topology::TopologyReport>,
+    pub topology: Option<()>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -608,53 +608,7 @@ where
             }
         }
 
-        // Topology intelligence: collect all protocol families detected across
-        // every target contract and derive ranked exploit classes from co-occurrence.
-        {
-            use std::collections::HashSet as FamilySet;
-            use crate::evm::topology::{classify_selector, TopologyReport};
-
-            let mut families = FamilySet::new();
-            for (addr, abis) in &artifacts.address_to_abi {
-                let asts = loader.contracts.iter()
-                    .find(|c| c.deployed_address == *addr)
-                    .and_then(|c| c.build_artifact.as_ref())
-                    .map(|a| &a.asts);
-                for abi in abis {
-                    if let Some(family) = classify_selector(&abi.function, &abi.function_name, asts) {
-                        families.insert(family);
-                    }
-                }
-            }
-            if !families.is_empty() {
-                let report = TopologyReport::analyze(families);
-                report.log();
-
-                // Anti-topology: flag missing safety mechanisms as pre-flight findings.
-                // Runs on the same family set — no extra cost.
-                {
-                    use crate::evm::topology::{check_anti_topology, log_anti_topology};
-                    let anti = check_anti_topology(&report.families, &artifacts.address_to_abi);
-                    log_anti_topology(&anti);
-                }
-
-                artifacts.topology = Some(report);
-            }
-
-            // Build TopologyHints from the topology report and actual ABI selectors
-            // and insert into state metadata so the scheduler's gamma-ray boost
-            // and mutator's campaign probability can consume them.
-            if let Some(ref report) = artifacts.topology {
-                use crate::evm::topology::TopologyHints;
-                // bias defaults to 0.0 (inform-only, no forcing); the fuzzer (evm_fuzzer.rs)
-                // re-injects with the actual --topology-bias value right after initialize().
-                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, 0.0, loader);
-                self.state.add_metadata(hints);
-                // Store the full TopologyReport so campaign planners can
-                // prioritize exploit targets by ranked class.
-                self.state.add_metadata(report.clone());
-            }
-        }
+        // Topology intelligence removed - replaced by Compiled Semantic Guidance
 
         let mut tc = Testcase::new(artifacts.initial_state.clone());
         tc.set_exec_time(Duration::from_secs(0));
