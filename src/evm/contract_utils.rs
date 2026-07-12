@@ -649,17 +649,20 @@ impl ContractLoader {
         for (slug, contract_info) in &offchain_config.configs {
             let mut more_info = None;
             let mut sources = None;
+            let mut asts = None;
 
             for artifact in offchain_artifacts {
                 if artifact.contracts.contains_key(slug) {
                     more_info = Some(artifact.contracts.get(slug).unwrap().clone());
                     sources = Some(artifact.sources.clone()); // <- todo: this is not correct
+                    asts = Some(artifact.asts.clone());
                     break;
                 }
             }
 
             let more_info = more_info.expect("Failed to find contract info");
             let sources = sources.expect("Failed to find sources");
+            let asts = asts.expect("Failed to find asts");
             let abi = Self::parse_abi_str(&more_info.abi);
 
             abis.push(ABIInfo {
@@ -681,8 +684,7 @@ impl ContractLoader {
                     more_info.deploy_bytecode,
                     more_info.abi.clone(),
                     more_info.source_map_replacements.clone(),
-                    // TODO: offchain ast
-                    Vec::new(),
+                    asts,
                 )),
                 files: sources,
                 source_map_replacements: Some(more_info.source_map_replacements),
@@ -792,8 +794,7 @@ impl ContractLoader {
                     more_info.deploy_bytecode.clone(),
                     more_info.abi.clone(),
                     more_info.source_map_replacements.clone(),
-                    // TODO: offchain ast
-                    Vec::new(),
+                    artifact.asts.clone(),
                 )),
                 files: artifact.sources.clone(),
                 source_map_replacements: Some(more_info.source_map_replacements.clone()),
@@ -992,8 +993,7 @@ impl ContractLoader {
                     more_info.deploy_bytecode.clone(),
                     more_info.abi.clone(),
                     more_info.source_map_replacements.clone(),
-                    // TODO: offchain ast
-                    Vec::new(),
+                    artifact.asts.clone(),
                 )),
                 files: artifact.sources.clone(),
                 source_map_replacements: Some(more_info.source_map_replacements.clone()),

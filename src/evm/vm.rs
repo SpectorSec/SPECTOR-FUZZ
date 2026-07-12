@@ -1533,6 +1533,7 @@ where
             self.host.jumpi_trace = 37;
             self.host.current_typed_bug = vec![];
             self.host.randomness = vec![9];
+            crate::evm::host::MODIFIED_SLOTS.clear();
         }
 
         let res = data

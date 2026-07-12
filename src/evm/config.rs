@@ -140,6 +140,7 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     pub empty_state_guard: bool,
     /// Feature 014 Phase 5: DoS via state-dependent revert detection.
     pub dos_detection: bool,
+    pub guidance_file: String,
     #[cfg(feature = "use_presets")]
     pub preset_file_path: String,
     /// Use ONLY --preset-file-path templates, skip the baked-in corpus (isolation).

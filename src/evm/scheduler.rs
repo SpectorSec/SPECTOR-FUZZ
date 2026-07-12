@@ -149,6 +149,9 @@ pub struct PowerABITestcaseMetadata {
     /// INV-016 — testcase-local timestamp located warp scheduling flag.
     #[serde(default)]
     pub timestamp_located: bool,
+    /// Storage slots modified during the execution of this testcase.
+    #[serde(default)]
+    pub modified_slots: Vec<(String, u64)>,
 }
 
 impl PowerABITestcaseMetadata {
@@ -164,6 +167,7 @@ impl PowerABITestcaseMetadata {
             compound_sequence: false,
             compound_hits: 0,
             timestamp_located: false,
+            modified_slots: Vec::new(),
         }
     }
 }
@@ -346,6 +350,23 @@ where
             .unwrap_or(false);
         // INV-016 — snapshot timestamp located taint flag NOW before it is cleared.
         let timestamp_located = unsafe { crate::evm::middlewares::cmp_linearity::TIMESTAMP_TAINT_WRITTEN };
+        let modified_slots_snapshot: Vec<(String, u64)> = unsafe {
+            crate::evm::host::MODIFIED_SLOTS
+                .iter()
+                .map(|(addr, slot)| (format!("0x{}", hex::encode(addr)), slot.to_string().parse::<u64>().unwrap_or(0)))
+                .collect()
+        };
+
+        // Update global SlotNoveltyMap if GuidanceMetadata exists in state
+        if let Some(guidance_meta) = state.metadata_map_mut().get_mut::<crate::evm::guidance::GuidanceMetadata>() {
+            guidance_meta.slot_novelty.record_write(&modified_slots_snapshot);
+            
+            // Decay the novelty map every 1000 sequence executions (campaigns)
+            if guidance_meta.slot_novelty.total_sequences % 1000 == 0 {
+                guidance_meta.slot_novelty.decay(0.95);
+            }
+        }
+
         // adding power scheduling information based on code size
         {
             let mut testcase = state.testcase_mut(idx).unwrap();
@@ -354,6 +375,7 @@ where
                 let current_idx = *state.corpus().current();
                 testcase.set_parent_id_optional(current_idx);
             }
+
             let meta = state.metadata_map().get::<ArtifactInfoMetadata>().unwrap();
             let artifact = match meta.get(&input.contract) {
                 Some(artifact) => artifact,
@@ -362,6 +384,7 @@ where
                     m.located_dim = flow_dim;
                     m.compound_sequence = compound_sequence;
                     m.timestamp_located = timestamp_located;
+                    m.modified_slots = modified_slots_snapshot.clone();
                     testcase.add_metadata(m);
                     return Ok(());
                 } // some contracts are not in ArtifactInfo, like borrow
@@ -372,6 +395,11 @@ where
                     m.located_dim = flow_dim;
                     m.compound_sequence = compound_sequence;
                     m.timestamp_located = timestamp_located;
+                    m.modified_slots = modified_slots_snapshot.clone();
+                }
+            } else {
+                if let Ok(m) = testcase.metadata_mut::<PowerABITestcaseMetadata>() {
+                    m.modified_slots = modified_slots_snapshot.clone();
                 }
             }
         }
@@ -645,6 +673,18 @@ where
             power *= boost;
             if let Ok(meta) = entry.metadata_mut::<PowerABITestcaseMetadata>() {
                 meta.dim_hits = meta.dim_hits.saturating_add(1);
+            }
+        }
+
+        // --- Semantic Guidance Novelty UCB Scaling ---
+        // Priority(S) = Exploitation(R) + c * Sum(Novelty(slot))
+        // Here we integrate this into the power scheduler score.
+        if let Some(guidance_meta) = state.metadata_map().get::<crate::evm::guidance::GuidanceMetadata>() {
+            if let Ok(meta) = entry.metadata::<PowerABITestcaseMetadata>() {
+                let novelty = guidance_meta.slot_novelty.novelty_score(&meta.modified_slots);
+                // Scale factor: c = 0.5.
+                let ucb_factor = 1.0 + 0.5 * novelty;
+                power *= ucb_factor;
             }
         }
 

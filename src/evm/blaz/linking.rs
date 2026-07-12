@@ -281,6 +281,7 @@ impl Linker {
         let mut result = OffChainArtifact {
             contracts: BTreeMap::new(),
             sources: vec![],
+            asts: vec![],
         };
 
         if let Some(errors) = output.get("errors") {

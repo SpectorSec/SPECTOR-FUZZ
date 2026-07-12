@@ -210,6 +210,7 @@ pub static mut WRITE_RELATIONSHIPS: bool = false;
 /// Branch status of the current execution
 pub static mut BRANCH_STATUS: [Option<(EVMAddress, usize, bool)>; MAP_SIZE] = [None; MAP_SIZE];
 pub static mut BRANCH_STATUS_IDX: usize = 0;
+pub static mut MODIFIED_SLOTS: Vec<(EVMAddress, EVMU256)> = Vec::new();
 
 // Control-leak signal flags (replaces custom InstructionResult variants from old revm fork)
 pub static mut CONTROL_LEAK_DETECTED: bool = false;
@@ -226,6 +227,7 @@ pub fn clear_branch_status() {
         }
 
         BRANCH_STATUS_IDX = 0;
+        MODIFIED_SLOTS.clear();
 
         // Control-leak signal flags are per-execution. Without this reset, a
         // flag set during one fuzzer input stays set forever, corrupting
@@ -2166,6 +2168,9 @@ where
         value: U256,
         _skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, LoadError> {
+        unsafe {
+            MODIFIED_SLOTS.push((address, key));
+        }
         match self.evmstate.get_mut(&address) {
             Some(account) => {
                 account.insert(key, value);

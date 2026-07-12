@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::evm::{
     abi::{ABIAddressToInstanceMap, BoxedABI},
-    input::{CampaignSequence, ConciseEVMInput, EVMInputTy},
+    input::{CampaignSequence, ConciseEVMInput, EVMInputTy, StepLinkage},
     leak_class::LeakClass,
     middlewares::cmp_linearity::TaintDim,
-    topology::{ExploitClass, TopologyReport},
+    topology::{ExploitClass, ProtocolFamily, TopologyReport},
     types::{EVMAddress, EVMU256},
 };
 
@@ -226,8 +226,11 @@ impl CampaignTargetCache {
     /// Build the cache from the ABI registry by scanning for known selector
     /// patterns. Delegates with no preset selectors → hardcoded
     /// PRIME/EXPLOIT fallback.
-    pub fn new(abi_map: &ABIAddressToInstanceMap, borrowable_tokens: Vec<EVMAddress>) -> Self {
-        Self::new_with_preset(abi_map, borrowable_tokens, &[])
+    pub fn new(
+        abi_map: &ABIAddressToInstanceMap,
+        borrowable_tokens: Vec<EVMAddress>,
+    ) -> Self {
+        Self::new_with_preset(abi_map, borrowable_tokens, &[], None)
     }
 
     /// Candidate-based target discovery. When `preset_selectors` is non-empty
@@ -243,6 +246,7 @@ impl CampaignTargetCache {
         abi_map: &ABIAddressToInstanceMap,
         borrowable_tokens: Vec<EVMAddress>,
         preset_selectors: &[[u8; 4]],
+        contract_families: Option<&HashMap<EVMAddress, Vec<ProtocolFamily>>>,
     ) -> Self {
         let (prime_sels, exploit_sels): (&[[u8; 4]], &[[u8; 4]]) = if !preset_selectors.is_empty() {
             // Every matched-exploit selector is a candidate for both ends of the chain;
@@ -251,15 +255,60 @@ impl CampaignTargetCache {
         } else {
             (PRIME_SELECTORS, EXPLOIT_SELECTORS)
         };
+        let mut prime_targets = find_targets_by_selector(abi_map, prime_sels);
+        let mut exploit_targets = find_targets_by_selector(abi_map, exploit_sels);
+        let mut reflexive_targets = find_targets_by_selector(abi_map, REFLEXIVE_LEVER_SELECTORS);
+
+        if let Some(cf_map) = contract_families {
+            // Dynamic selector typing: if a contract's lineage tells us it belongs to a protocol family,
+            // we dynamically classify its selectors and append them to prime/exploit/reflexive lists.
+            for (addr, families) in cf_map {
+                if let Some(abis) = abi_map.map.get(addr) {
+                    for abi in abis {
+                        if abi.function == [0u8; 4] {
+                            continue;
+                        }
+                        if let Some(sig) = abi.get_func_signature() {
+                            let fn_name_lc = sig.split('(').next().unwrap_or("").to_lowercase();
+                            for family in families {
+                                match family {
+                                    ProtocolFamily::ERC4626 => {
+                                        if matches!(fn_name_lc.as_str(), "deposit" | "mint" | "withdraw" | "redeem") {
+                                            let entry = (*addr, abi.function, abi.clone());
+                                            if !prime_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
+                                                prime_targets.push(entry.clone());
+                                            }
+                                            if !exploit_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
+                                                exploit_targets.push(entry);
+                                            }
+                                        }
+                                    }
+                                    ProtocolFamily::Lending => {
+                                        if matches!(fn_name_lc.as_str(), "borrow" | "repay" | "liquidate" | "redeem" | "redeemunderlying") {
+                                            let entry = (*addr, abi.function, abi.clone());
+                                            if !reflexive_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
+                                                reflexive_targets.push(entry);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Self {
-            prime_targets: find_targets_by_selector(abi_map, prime_sels),
-            exploit_targets: find_targets_by_selector(abi_map, exploit_sels),
+            prime_targets,
+            exploit_targets,
             borrowable_tokens,
             generic_targets: find_generic_targets(abi_map),
             // Feature 015: independent scan for the data-mined reflexive-lever catalogue
             // (Curve skew levers + lending-fork rate-warpers), regardless of what the
             // prime/exploit allowlists matched.
-            reflexive_targets: find_targets_by_selector(abi_map, REFLEXIVE_LEVER_SELECTORS),
+            reflexive_targets,
         }
     }
 
@@ -444,6 +493,8 @@ pub fn plan_campaign_sampled<R: Rand>(
     // Populate prime + exploit steps (with concrete function ABIs), respecting
     // hints
     let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, rand);
+    let prime_step_clone = prime_step.clone();
+    let exploit_step_clone = exploit_step.clone();
     if let Some((addr, abi)) = prime_step {
         steps.push(build_abi_step(addr, abi));
     }
@@ -537,9 +588,47 @@ pub fn plan_campaign_sampled<R: Rand>(
         warps.push((exploit_idx, 10));
     }
 
+    let mut linkages = Vec::new();
+    let mut prime_idx = None;
+    let mut exploit_idx = None;
+
+    if let Some((prime_addr, Some(ref p_abi))) = prime_step_clone {
+        for (i, step) in steps.iter().enumerate() {
+            if step.contract == prime_addr && step.data.as_ref().map(|d| d.function) == Some(p_abi.function) {
+                prime_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    if let Some((exploit_addr, Some(ref e_abi))) = exploit_step_clone {
+        for (i, step) in steps.iter().enumerate() {
+            if step.contract == exploit_addr && step.data.as_ref().map(|d| d.function) == Some(e_abi.function) {
+                exploit_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    if let Some(p_idx) = prime_idx {
+        if let Some(e_idx) = exploit_idx {
+            if p_idx < e_idx {
+                if let Some((prime_addr, Some(ref p_abi))) = prime_step_clone {
+                    let from_registry_key = format!("{:?}_{}_return", prime_addr, hex::encode(p_abi.function));
+                    linkages.push(StepLinkage {
+                        from_step: p_idx,
+                        from_registry_key,
+                        to_step: e_idx,
+                        to_param_index: 0,
+                    });
+                }
+            }
+        }
+    }
+
     Some(CampaignSequence {
         steps,
-        linkages: Vec::new(),
+        linkages,
         warps,
         promoted,
         aposteriori,
@@ -767,7 +856,6 @@ mod tests {
 
     // Serializes tests that call `set_func_with_signature`, which writes the global
     // `static mut FUNCTION_SIG` HashMap — concurrent writes are a data race (UB).
-    #[cfg(feature = "campaign_generic_fallback")]
     static FUNCTION_SIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn make_abi(selector: [u8; 4]) -> BoxedABI {
@@ -1475,6 +1563,82 @@ mod tests {
         assert_eq!(campaign.steps.len(), 2);
         assert_eq!(campaign.warps.len(), 1, "should have 1 warp entry");
         assert_eq!(campaign.warps[0].0, 1, "warp should be before exploit step (index 1)");
+    }
+
+    #[test]
+    fn test_campaign_target_cache_dynamic_selector_typing() {
+        let _guard = FUNCTION_SIG_TEST_LOCK.lock().unwrap();
+        let mut map = HashMap::new();
+        let target_addr = EVMAddress::from([0x03; 20]);
+        let custom_prime_sel = [0xde, 0xad, 0xbe, 0xef];
+        let mut abi_prime = make_abi(custom_prime_sel);
+        abi_prime.set_func_with_signature(custom_prime_sel, "deposit", "(uint256)");
+
+        let custom_lending_sel = [0xba, 0xad, 0xf0, 0x0d];
+        let mut abi_lending = make_abi(custom_lending_sel);
+        abi_lending.set_func_with_signature(custom_lending_sel, "borrow", "(uint256)");
+
+        map.insert(target_addr, vec![abi_prime, abi_lending]);
+        let abi_map = ABIAddressToInstanceMap { map };
+
+        let cache_static = CampaignTargetCache::new_with_preset(&abi_map, Vec::new(), &[], None);
+        assert!(cache_static.prime_targets.is_empty());
+        assert!(cache_static.reflexive_targets.is_empty());
+
+        let mut contract_families = HashMap::new();
+        contract_families.insert(target_addr, vec![ProtocolFamily::ERC4626, ProtocolFamily::Lending]);
+
+        let cache_dynamic = CampaignTargetCache::new_with_preset(&abi_map, Vec::new(), &[], Some(&contract_families));
+        
+        assert_eq!(cache_dynamic.prime_targets.len(), 1);
+        assert_eq!(cache_dynamic.prime_targets[0].0, target_addr);
+        assert_eq!(cache_dynamic.prime_targets[0].1, custom_prime_sel);
+
+        assert_eq!(cache_dynamic.reflexive_targets.len(), 1);
+        assert_eq!(cache_dynamic.reflexive_targets[0].0, target_addr);
+        assert_eq!(cache_dynamic.reflexive_targets[0].1, custom_lending_sel);
+    }
+
+    #[test]
+    fn test_campaign_step_linkage_planning() {
+        let _guard = FUNCTION_SIG_TEST_LOCK.lock().unwrap();
+        let mut map = HashMap::new();
+        let target_addr = EVMAddress::from([0x03; 20]);
+        let prime_sel = PRIME_SELECTORS[0];
+        let mut abi_prime = make_abi(prime_sel);
+        abi_prime.set_func_with_signature(prime_sel, "deposit", "(uint256)");
+
+        let exploit_sel = EXPLOIT_SELECTORS[0];
+        let mut abi_exploit = make_abi(exploit_sel);
+        abi_exploit.set_func_with_signature(exploit_sel, "withdraw", "(uint256)");
+
+        map.insert(target_addr, vec![abi_prime, abi_exploit]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
+
+        let mut rand = StdRand::with_seed(12345);
+        let campaign = plan_campaign_sampled(
+            &cache,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            &mut rand,
+        ).expect("should plan campaign");
+
+        assert!(!campaign.linkages.is_empty(), "Linkages list must not be empty");
+        let linkage = &campaign.linkages[0];
+        assert_eq!(linkage.from_step, 0);
+        assert_eq!(linkage.to_step, 1);
+        assert_eq!(linkage.to_param_index, 0);
+        assert_eq!(
+            linkage.from_registry_key,
+            format!("{:?}_{}_return", target_addr, hex::encode(prime_sel))
+        );
     }
 }
 

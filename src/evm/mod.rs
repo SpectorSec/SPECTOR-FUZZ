@@ -31,6 +31,7 @@ pub mod tokens;
 pub mod types;
 pub mod utils;
 pub mod vm;
+pub mod guidance;
 
 use std::{
     cell::RefCell,
@@ -431,6 +432,10 @@ pub struct EvmArgs {
     #[arg(long, default_value = "")]
     base_directory: String,
 
+    /// Path to the compiled semantic guidance JSON file.
+    #[arg(long, default_value = "")]
+    guidance_file: String,
+
     /// Command to build the contract. If specified, will use this command to
     /// build contracts instead of using bins and abis.
     #[arg()]
@@ -486,6 +491,7 @@ impl fmt::Display for EvmArgs {
         #[cfg(feature = "use_presets")]
         write!(f, "    preset_file_path: {},\n", self.preset_file_path)?;
         write!(f, "    base_directory: {},\n", self.base_directory)?;
+        write!(f, "    guidance_file: {},\n", self.guidance_file)?;
         write!(f, "    build_command: {:?},\n", self.build_command)?;
         write!(f, "}}")
     }
@@ -1039,6 +1045,7 @@ pub fn evm_main(mut args: EvmArgs) {
         oracle_staleness: args.oracle_staleness,
         empty_state_guard: args.empty_state_guard,
         dos_detection: args.dos_detection,
+        guidance_file: args.guidance_file.clone(),
         etherscan_api_key,
     };
 
@@ -1263,6 +1270,7 @@ fn test_evm_offchain_setup() {
         oracle_staleness: args.oracle_staleness,
         empty_state_guard: args.empty_state_guard,
         dos_detection: args.dos_detection,
+        guidance_file: args.guidance_file.clone(),
         etherscan_api_key: String::from(""),
     };
 

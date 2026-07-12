@@ -220,6 +220,37 @@ where
                             self.sha3_taints.clone(),
                         );
                     }
+
+                    // --- Semantic Footprint Sequence Deduplication ---
+                    let modified_slots_snapshot: Vec<(String, u64)> = unsafe {
+                        crate::evm::host::MODIFIED_SLOTS
+                            .iter()
+                            .map(|(addr, slot)| (format!("0x{}", hex::encode(addr)), slot.to_string().parse::<u64>().unwrap_or(0)))
+                            .collect()
+                    };
+                    let footprint = crate::evm::guidance::SemanticFootprint::new(modified_slots_snapshot);
+
+                    // Calculate current economic realization (immutably borrow state first)
+                    let execution_result = state.get_execution_result();
+                    let net_inflow: f64 = if execution_result.reverted {
+                        0.0
+                    } else {
+                        crate::evm::feedbacks::read_ledger_objective() as f64
+                    };
+
+                    // Now mutably borrow state
+                    if let Some(guidance_meta) = state.metadata_map_mut().get_mut::<crate::evm::guidance::GuidanceMetadata>() {
+                        if let Some(&existing_inflow) = guidance_meta.unique_footprints.get(&footprint) {
+                            if net_inflow <= existing_inflow {
+                                // Discard this sequence because we have already explored this semantic transition
+                                // with an equal or better economic realization.
+                                return Ok(false);
+                            }
+                        }
+                        // Register or replace the footprint
+                        guidance_meta.unique_footprints.insert(footprint, net_inflow);
+                    }
+
                     Ok(true)
                 }
                 Ok(false) => Ok(false),

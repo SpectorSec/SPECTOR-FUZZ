@@ -1187,6 +1187,10 @@ fn read_step_arg_u128(campaign: &Option<CampaignSequence>, pin_step: usize, arg_
 /// step/arg is absent.
 fn write_step_arg_u128(campaign: &mut Option<CampaignSequence>, pin_step: usize, arg_idx: usize, value: u128) {
     let Some(c) = campaign else { return };
+    // Feature 041 / INV-023: If a parameter is target of a linkage, freeze it (skip mutation)
+    if c.linkages.iter().any(|l| l.to_step == pin_step && l.to_param_index == arg_idx) {
+        return;
+    }
     let Some(step) = c.steps.get_mut(pin_step) else { return };
     let Some(abi) = &mut step.data else { return };
     let mut args = abi.get_bytes_vec();
@@ -2305,6 +2309,74 @@ mod tests {
         let decoded: crate::evm::input::CampaignSequence = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.promoted, vec![1, 3], "promoted indices round-trip");
         assert_eq!(decoded.warps, vec![(2, 10)]);
+    }
+
+    #[test]
+    fn test_write_step_arg_u128_linkage_freeze() {
+        use crate::evm::input::{CampaignSequence, ConciseEVMInput, EVMInputTy, StepLinkage};
+        use crate::evm::abi::{BoxedABI, AArray, A256, A256InnerType};
+
+        let selector = [1, 2, 3, 4];
+        let arg0 = BoxedABI::new(Box::new(A256 {
+            data: vec![0u8; 32],
+            is_address: false,
+            dont_mutate: false,
+            inner_type: A256InnerType::Uint,
+        }));
+        let arg1 = BoxedABI::new(Box::new(A256 {
+            data: vec![0u8; 32],
+            is_address: false,
+            dont_mutate: false,
+            inner_type: A256InnerType::Uint,
+        }));
+        let mut abi = BoxedABI::new(Box::new(AArray {
+            data: vec![arg0, arg1],
+            dynamic_size: false,
+        }));
+        abi.function = selector;
+        let bytes = vec![0u8; 64];
+        let full = [Vec::from(selector), bytes].concat();
+        abi.set_bytes(full);
+
+        let step = ConciseEVMInput {
+            input_type: EVMInputTy::ABI,
+            caller: EVMAddress::default(),
+            contract: EVMAddress::default(),
+            data: Some(abi),
+            txn_value: None,
+            ..Default::default()
+        };
+
+        let linkage = StepLinkage {
+            from_step: 0,
+            from_registry_key: "key".to_string(),
+            to_step: 1,
+            to_param_index: 0,
+        };
+
+        let mut campaign = Some(CampaignSequence {
+            steps: vec![step.clone(), step],
+            linkages: vec![linkage],
+            warps: Vec::new(),
+            promoted: Vec::new(),
+            aposteriori: false,
+        });
+
+        // Mutating target step 1 parameter 0 should be frozen (noop)
+        super::write_step_arg_u128(&mut campaign, 1, 0, 9999);
+        let updated_step = campaign.as_ref().unwrap().steps.get(1).unwrap();
+        let updated_bytes = updated_step.data.as_ref().unwrap().get_bytes_vec();
+        let val = &updated_bytes[16..32];
+        assert_eq!(val, &vec![0u8; 16][..], "Argument 0 must be frozen and not mutated");
+
+        // Mutating target step 1 parameter 1 should NOT be frozen (should be mutated)
+        super::write_step_arg_u128(&mut campaign, 1, 1, 9999);
+        let updated_step = campaign.as_ref().unwrap().steps.get(1).unwrap();
+        let updated_bytes = updated_step.data.as_ref().unwrap().get_bytes_vec();
+        let val2 = &updated_bytes[48..64];
+        let mut expected = [0u8; 16];
+        expected[8..16].copy_from_slice(&9999u128.to_be_bytes()[8..16]);
+        assert_eq!(val2, &expected[..], "Argument 1 is not linked, should be mutated");
     }
 
     #[test]

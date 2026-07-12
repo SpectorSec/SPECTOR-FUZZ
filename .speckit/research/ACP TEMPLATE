@@ -1,0 +1,8 @@
+
+   acp_template/acp_l_constitution.md
+
+  Specifically, the archive contains:
+
+  1.  acp_template/acp_l_constitution.md  — The immutable step-by-step Execution Constitution playbook.
+  2.  acp_template/architectural_cognition_protocol_lifecycle_spec_v4.md  — The V4 Protocol Lifecycle Specification detailing the minimal ontology, drift metrics, and audit checkpoints.
+  3.  acp_template/architectural_cognition_protocol_spec.md  — The retrospective ACP Specification for verifying existing systems.

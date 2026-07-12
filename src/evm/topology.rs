@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::evm::{
-    contract_utils::ABIConfig,
+    contract_utils::{ABIConfig, ContractLoader},
     oracles::function::is_privileged_fn,
     types::EVMAddress,
 };
@@ -263,7 +263,41 @@ impl TopologyReport {
 /// Delegates to existing detection functions where they already exist
 /// (`is_oracle_interface`, `is_privileged_fn`) so classification logic
 /// stays in one place.
-pub fn classify_selector(selector: &[u8; 4], fn_name: &str) -> Option<ProtocolFamily> {
+fn extract_inherited_contracts(ast: &serde_json::Value) -> Vec<String> {
+    let mut inherited = vec![];
+    fn walk(value: &serde_json::Value, inherited: &mut Vec<String>) {
+        if let Some(obj) = value.as_object() {
+            if let Some(node_type) = obj.get("nodeType").and_then(|t| t.as_str()) {
+                if node_type == "ContractDefinition" {
+                    if let Some(base_contracts) = obj.get("baseContracts").and_then(|b| b.as_array()) {
+                        for base in base_contracts {
+                            if let Some(base_name) = base.get("baseName") {
+                                if let Some(name) = base_name.get("name").and_then(|n| n.as_str()) {
+                                    inherited.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (_, val) in obj {
+                walk(val, inherited);
+            }
+        } else if let Some(arr) = value.as_array() {
+            for val in arr {
+                walk(val, inherited);
+            }
+        }
+    }
+    walk(ast, &mut inherited);
+    inherited
+}
+
+pub fn classify_selector(
+    selector: &[u8; 4],
+    fn_name: &str,
+    asts: Option<&Vec<(String, serde_json::Value)>>,
+) -> Option<ProtocolFamily> {
     // Chainlink: existing detection function owns these selectors
     if crate::evm::oracles::freshness::is_oracle_interface(selector) {
         return Some(ProtocolFamily::Chainlink);
@@ -271,6 +305,34 @@ pub fn classify_selector(selector: &[u8; 4], fn_name: &str) -> Option<ProtocolFa
 
     let n = fn_name.to_lowercase();
 
+    // AST-based dynamic semantic verification (Primary)
+    if let Some(ast_list) = asts {
+        let mut inherits_erc4626 = false;
+        let mut inherits_ctoken = false;
+
+        for (_, ast) in ast_list {
+            let parents = extract_inherited_contracts(ast);
+            for parent in parents {
+                let p = parent.to_lowercase();
+                if p.contains("erc4626") {
+                    inherits_erc4626 = true;
+                }
+                if p.contains("ctoken") || p.contains("cerc20") {
+                    inherits_ctoken = true;
+                }
+            }
+        }
+
+        if inherits_erc4626 && matches!(n.as_str(), "deposit" | "mint" | "withdraw" | "redeem" | "asset") {
+            return Some(ProtocolFamily::ERC4626);
+        }
+
+        if inherits_ctoken && matches!(n.as_str(), "mint" | "borrow" | "redeem" | "redeemunderlying") {
+            return Some(ProtocolFamily::Lending);
+        }
+    }
+
+    // Heuristics fallback (Secondary / Onchain Fork Environment)
     // ERC-4626 vault — names unique enough to not require sig disambiguation
     if matches!(
         n.as_str(),
@@ -441,6 +503,7 @@ impl TopologyHints {
         report: &TopologyReport,
         address_to_abi: &HashMap<EVMAddress, Vec<ABIConfig>>,
         bias: f64,
+        artifacts: &ContractLoader,
     ) -> Self {
         // Build family → selectors from already-loaded ABIs using the same
         // classify_selector logic that produced the topology report.
@@ -448,8 +511,12 @@ impl TopologyHints {
         // §7d/§7e #2: keep the per-CONTRACT attribution the flat map discards (address key).
         let mut contract_families: HashMap<EVMAddress, Vec<ProtocolFamily>> = HashMap::new();
         for (addr, abis) in address_to_abi {
+            let asts = artifacts.contracts.iter()
+                .find(|c| c.deployed_address == *addr)
+                .and_then(|c| c.build_artifact.as_ref())
+                .map(|a| &a.asts);
             for abi in abis {
-                if let Some(family) = classify_selector(&abi.function, &abi.function_name) {
+                if let Some(family) = classify_selector(&abi.function, &abi.function_name, asts) {
                     family_selectors
                         .entry(family.clone())
                         .or_default()
@@ -760,6 +827,47 @@ mod reflexive_topology_tests {
         assert!(
             !ranked.iter().any(|(c, _)| *c == ExploitClass::ReflexiveSkew),
             "lending alone is not reflexive"
+        );
+    }
+
+    #[test]
+    fn test_classify_selector_with_ast_inheritance() {
+        let selector = [0x00, 0x00, 0x00, 0x00];
+        
+        assert_eq!(classify_selector(&selector, "mint", None), Some(ProtocolFamily::Privileged));
+
+        let ast_json = serde_json::json!({
+            "nodeType": "ContractDefinition",
+            "name": "MyVault",
+            "baseContracts": [
+                {
+                    "baseName": {
+                        "name": "ERC4626"
+                    }
+                }
+            ]
+        });
+        let asts = vec![("MyVault.sol".to_string(), ast_json)];
+        assert_eq!(
+            classify_selector(&selector, "mint", Some(&asts)),
+            Some(ProtocolFamily::ERC4626)
+        );
+
+        let ast_json_lending = serde_json::json!({
+            "nodeType": "ContractDefinition",
+            "name": "cToken",
+            "baseContracts": [
+                {
+                    "baseName": {
+                        "name": "CErc20"
+                    }
+                }
+            ]
+        });
+        let asts_lending = vec![("cToken.sol".to_string(), ast_json_lending)];
+        assert_eq!(
+            classify_selector(&selector, "mint", Some(&asts_lending)),
+            Some(ProtocolFamily::Lending)
         );
     }
 }

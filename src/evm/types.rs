@@ -118,7 +118,9 @@ where
     /// # Safety
     /// This may never be called concurrently as it dereferences the `RegistryBuilder` without acquiring a lock.
     pub unsafe fn register() {
-        libafl_bolts::serdeany::RegistryBuilder::register::<CampaignIntermediateStates<Loc, Addr, VS, CI>>();
+        unsafe {
+            libafl_bolts::serdeany::RegistryBuilder::register::<CampaignIntermediateStates<Loc, Addr, VS, CI>>();
+        }
     }
 }
 

@@ -295,7 +295,7 @@ pub fn evm_fuzzer(
     if !config.no_topology {
         if let Some(ref report) = artifacts.topology {
             use crate::evm::topology::TopologyHints;
-            state.add_metadata(TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, config.topology_bias));
+            state.add_metadata(TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, config.topology_bias, &config.contract_loader));
         }
     }
 
@@ -376,6 +376,13 @@ pub fn evm_fuzzer(
 
     evm_executor.host.add_middlewares(cov_middleware.clone());
 
+    if !config.guidance_file.is_empty() {
+        info!("[guidance] loading compiled semantic guidance from {}", config.guidance_file);
+        let guidance = crate::evm::guidance::Guidance::load(&config.guidance_file)
+            .expect("Failed to load guidance file");
+        state.add_metadata(crate::evm::guidance::GuidanceMetadata::new(guidance));
+    }
+
     state.add_metadata(instance_map);
 
     evm_executor.host.initialize(state);
@@ -438,10 +445,12 @@ pub fn evm_fuzzer(
         unsafe {
             crate::evm::types::CampaignIntermediateStatesEVM::register();
         }
+        let hints = state.metadata_map().get::<crate::evm::topology::TopologyHints>();
+        let contract_families = hints.map(|h| &h.contract_families);
         let instance_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
         let cache = instance_map
-            .map(|m| CampaignTargetCache::new_with_preset(&m, Vec::new(), &preset_chain_selectors))
-            .unwrap_or_else(|| CampaignTargetCache::new_with_preset(&ABIAddressToInstanceMap::default(), Vec::new(), &preset_chain_selectors));
+            .map(|m| CampaignTargetCache::new_with_preset(&m, Vec::new(), &preset_chain_selectors, contract_families))
+            .unwrap_or_else(|| CampaignTargetCache::new_with_preset(&ABIAddressToInstanceMap::default(), Vec::new(), &preset_chain_selectors, contract_families));
         // [pool-tel] one-shot: how many (contract,selector) entries per selector in the
         // campaign candidate pool. Exposes contract-multiplicity bias (e.g. approve on
         // every ERC20 → over-weighted in uniform (contract,selector) sampling).

@@ -615,9 +615,13 @@ where
             use crate::evm::topology::{classify_selector, TopologyReport};
 
             let mut families = FamilySet::new();
-            for (_, abis) in &artifacts.address_to_abi {
+            for (addr, abis) in &artifacts.address_to_abi {
+                let asts = loader.contracts.iter()
+                    .find(|c| c.deployed_address == *addr)
+                    .and_then(|c| c.build_artifact.as_ref())
+                    .map(|a| &a.asts);
                 for abi in abis {
-                    if let Some(family) = classify_selector(&abi.function, &abi.function_name) {
+                    if let Some(family) = classify_selector(&abi.function, &abi.function_name, asts) {
                         families.insert(family);
                     }
                 }
@@ -644,7 +648,7 @@ where
                 use crate::evm::topology::TopologyHints;
                 // bias defaults to 0.0 (inform-only, no forcing); the fuzzer (evm_fuzzer.rs)
                 // re-injects with the actual --topology-bias value right after initialize().
-                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, 0.0);
+                let hints = TopologyHints::from_report_and_abi(report, &artifacts.address_to_abi, 0.0, loader);
                 self.state.add_metadata(hints);
                 // Store the full TopologyReport so campaign planners can
                 // prioritize exploit targets by ranked class.

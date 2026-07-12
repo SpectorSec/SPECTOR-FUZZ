@@ -41,6 +41,7 @@ pub struct ContractArtifact {
 pub struct OffChainArtifact {
     pub contracts: BTreeMap<(String, String), ContractArtifact>,
     pub sources: Vec<(String, String)>,
+    pub asts: Vec<(String, serde_json::Value)>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +155,7 @@ impl OffChainArtifact {
             artifacts.push(Self {
                 contracts,
                 sources: all_sources,
+                asts: vec![],
             })
         }
         Ok(artifacts)
@@ -350,7 +352,16 @@ impl OffChainArtifact {
         let mut result = Self {
             contracts: BTreeMap::new(),
             sources: vec![],
+            asts: vec![],
         };
+
+        if let Some(sources_obj) = output.get("sources").and_then(|s| s.as_object()) {
+            for (name, source_entry) in sources_obj {
+                if let Some(ast_val) = source_entry.get("ast").or_else(|| source_entry.get("AST")) {
+                    result.asts.push((name.clone(), ast_val.clone()));
+                }
+            }
+        }
 
         if let Some(errors) = output.get("errors") {
             for error in errors.as_array().expect("get errors failed") {
