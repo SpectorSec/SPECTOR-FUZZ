@@ -102,6 +102,92 @@ pub fn evm_fuzzer(
     state: &mut EVMFuzzState,
 ) {
     info!("\n\n ================ EVM Fuzzer Start ===================\n\n");
+    let mut config = config;
+
+    // --- Dynamic Auto-Activation based on Compiled Guidance ---
+    let guidance_path = if !config.guidance_file.is_empty() {
+        Some(config.guidance_file.clone())
+    } else if std::path::Path::new("spectrefuzz.guidance").exists() {
+        info!("[guidance] found default spectrefuzz.guidance in current directory");
+        Some("spectrefuzz.guidance".to_string())
+    } else {
+        info!("[guidance] no compiled semantic guidance file provided or found. Running baseline concolic.");
+        None
+    };
+
+    let mut loaded_guidance = None;
+    if let Some(path) = guidance_path {
+        info!("[guidance] loading compiled semantic guidance from {}", path);
+        if let Ok(guidance) = crate::evm::guidance::Guidance::load(&path) {
+            let meta = &guidance.meta;
+            info!(
+                "[guidance] successfully digested: {} contracts, {} functions, {} kill chains, {} invariants",
+                meta.num_contracts, meta.num_functions, meta.num_kill_chains, meta.num_invariants
+            );
+            
+            // Auto-configure config flags based on guidance content:
+            // 1. Invariants -> InvariantOracle
+            if !guidance.oracle.invariants.is_empty() && !config.invariant_oracle {
+                config.invariant_oracle = true;
+                info!("[guidance] invariants found: auto-activating InvariantOracle");
+            }
+            
+            // 2. Scan functions for sinks
+            let mut has_delegatecall = false;
+            let mut has_selfdestruct = false;
+            for fn_entry in guidance.functions.values() {
+                for chain in &fn_entry.kill_chains.chains {
+                    if chain.sink.contains("delegatecall") || chain.sink.contains("call") {
+                        has_delegatecall = true;
+                    }
+                    if chain.sink.contains("selfdestruct") {
+                        has_selfdestruct = true;
+                    }
+                }
+            }
+            
+            if has_delegatecall && !config.arbitrary_external_call {
+                config.arbitrary_external_call = true;
+                info!("[guidance] delegatecall/call sinks found: auto-activating ArbitraryCallOracle");
+            }
+            if has_selfdestruct && !config.selfdestruct_oracle {
+                config.selfdestruct_oracle = true;
+                info!("[guidance] selfdestruct sinks found: auto-activating SelfdestructOracle");
+            }
+            
+            // 3. Scan state variables for oracle-related names
+            let mut has_oracle_feeds = false;
+            for slots in guidance.slot_influence_weights.values() {
+                for state_var in slots.keys() {
+                    let sv_lower = state_var.to_lowercase();
+                    if sv_lower.contains("oracle") || sv_lower.contains("feed") || sv_lower.contains("aggregator") || sv_lower.contains("price") {
+                        has_oracle_feeds = true;
+                        break;
+                    }
+                }
+            }
+            if has_oracle_feeds {
+                if !config.reentrancy_oracle {
+                    config.reentrancy_oracle = true;
+                    info!("[guidance] oracle-related variables found: auto-activating ReentrancyOracle");
+                }
+                if !config.oracle_staleness {
+                    config.oracle_staleness = true;
+                    info!("[guidance] oracle-related variables found: auto-activating OracleStaleness middleware");
+                }
+            }
+            
+            // 4. Force enable economic/flashloans if guidance is loaded
+            if !config.flashloan {
+                config.flashloan = true;
+                info!("[guidance] economic exploit path loaded: auto-activating flashloan simulation and economic oracle");
+            }
+            
+            loaded_guidance = Some(guidance);
+        } else {
+            error!("[guidance] failed to parse guidance file at {}", path);
+        }
+    }
 
     // create work dir if not exists
     let _path = Path::new(config.work_dir.as_str());
@@ -376,25 +462,7 @@ pub fn evm_fuzzer(
 
     evm_executor.host.add_middlewares(cov_middleware.clone());
 
-    let guidance_path = if !config.guidance_file.is_empty() {
-        Some(config.guidance_file.clone())
-    } else if std::path::Path::new("spectrefuzz.guidance").exists() {
-        info!("[guidance] found default spectrefuzz.guidance in current directory");
-        Some("spectrefuzz.guidance".to_string())
-    } else {
-        info!("[guidance] no compiled semantic guidance file provided or found. Running baseline concolic.");
-        None
-    };
-
-    if let Some(path) = guidance_path {
-        info!("[guidance] loading compiled semantic guidance from {}", path);
-        let guidance = crate::evm::guidance::Guidance::load(&path)
-            .expect("Failed to load guidance file");
-        let meta = &guidance.meta;
-        info!(
-            "[guidance] successfully digested: {} contracts, {} functions, {} kill chains, {} invariants",
-            meta.num_contracts, meta.num_functions, meta.num_kill_chains, meta.num_invariants
-        );
+    if let Some(guidance) = loaded_guidance {
         state.add_metadata(crate::evm::guidance::GuidanceMetadata::new(guidance));
     }
 
@@ -757,7 +825,8 @@ pub fn evm_fuzzer(
     // For invariant-leak exploit classes we use ReentrancyOracle + ArbitraryCallOracle
     // which observe the execution trace and catch the state violation at runtime.
     // Skipped under --no-topology so detectors run without topology-driven activation.
-    if let Some(topo) = artifacts.topology.as_ref().filter(|_| !config.no_topology) {
+    let has_guidance = state.metadata_map().get::<crate::evm::guidance::GuidanceMetadata>().is_some();
+    if let Some(topo) = artifacts.topology.as_ref().filter(|_| !config.no_topology && !has_guidance) {
         use crate::evm::topology::ExploitClass;
         use crate::evm::oracles::rebasing::RebasingOracle;
 
