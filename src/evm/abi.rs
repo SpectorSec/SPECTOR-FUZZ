@@ -523,6 +523,35 @@ impl BoxedABI {
                 if data_len == 0 {
                     return MutationResult::Skipped;
                 }
+
+                // High-value parameter mutation guidance
+                if self.function != [0; 4] {
+                    let guidance_meta = state.metadata_map().get::<crate::evm::guidance::GuidanceMetadata>();
+                    let func_name = unsafe {
+                        crate::evm::abi::FUNCTION_SIG.get(&self.function)
+                            .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
+                    };
+                    if let (Some(func_name), Some(guidance_meta)) = (func_name, &guidance_meta) {
+                        let high_value_params = guidance_meta.guidance.mutator.for_function(&func_name);
+                        if !high_value_params.is_empty() {
+                            let mut valid_indices = Vec::new();
+                            for hvp in high_value_params {
+                                if hvp.param_index < data_len {
+                                    valid_indices.push(hvp.param_index);
+                                }
+                            }
+                            if !valid_indices.is_empty() {
+                                // 80% bias to mutate a high-value parameter
+                                if state.rand_mut().below(100) < 80 {
+                                    let idx = valid_indices[state.rand_mut().below(valid_indices.len() as u64) as usize];
+                                    let result = aarray.data[idx].mutate_with_vm_slots(state, vm_slots, active_contract, observed_values);
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if aarray.dynamic_size {
                     match state.rand_mut().below(SAMPLE_MAX) {
                         0..=MUTATE_CHOICE_MAX => {

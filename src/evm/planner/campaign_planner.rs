@@ -11,6 +11,7 @@ use crate::evm::{
     input::{CampaignSequence, ConciseEVMInput, EVMInputTy, StepLinkage},
     leak_class::LeakClass,
     middlewares::cmp_linearity::TaintDim,
+    guidance::Guidance,
     types::{EVMAddress, EVMU256},
 };
 
@@ -296,7 +297,7 @@ impl CampaignTargetCache {
 /// `None` if insufficient targets were found.
 pub fn plan_campaign(
     cache: &CampaignTargetCache,
-    topology_report: Option<()>,
+    guidance: Option<&Guidance>,
     temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
     // Deterministic entry (tests / no live fuzzer RNG): seed a fixed local RNG.
@@ -308,7 +309,7 @@ pub fn plan_campaign(
     // (mutator) passes `self.effective_reflexive`.
     plan_campaign_sampled(
         cache,
-        topology_report,
+        guidance,
         temporal_skimming,
         false,
         false,
@@ -416,7 +417,7 @@ fn build_structural_step(
 /// of economic truth.
 pub fn plan_campaign_sampled<R: Rand>(
     cache: &CampaignTargetCache,
-    topology_report: Option<()>,
+    guidance: Option<&Guidance>,
     temporal_skimming: bool,
     effective_reflexive: bool,
     dimension_warp: bool,
@@ -452,7 +453,7 @@ pub fn plan_campaign_sampled<R: Rand>(
 
     // Populate prime + exploit steps (with concrete function ABIs), respecting
     // hints
-    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, topology_report, rand);
+    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, guidance, rand);
     let prime_step_clone = prime_step.clone();
     let exploit_step_clone = exploit_step.clone();
     if let Some((addr, abi)) = prime_step {
@@ -603,64 +604,49 @@ type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
 
 fn pick_prime_and_exploit<R: Rand>(
     cache: &CampaignTargetCache,
-    topology_report: Option<()>,
+    guidance: Option<&Guidance>,
     rand: &mut R,
 ) -> (PickedStep, PickedStep) {
-    let prefer_same_contract = false;
+    // 1. Uniform selector-level sample for the prime step
+    let prime = sample_by_selector(&cache.prime_targets, rand).map(|(a, _, abi)| (*a, Some(abi.clone())));
 
-    if prefer_same_contract {
-        // Sample among same-contract prime/exploit pairs (not the first pair), each
-        // side's concrete function pinned. Topology INFORMS the preference (same
-        // contract); the draw within that preference stays a coverage-style sample.
-        let pairs: Vec<(usize, usize)> = cache
-            .prime_targets
-            .iter()
-            .enumerate()
-            .filter_map(|(pi, (addr, p_sel, _))| {
-                // Same-contract exploit candidates, EXCLUDING the prime's own selector.
-                // A step calling the same function twice on the same contract is a
-                // degenerate chain, not a prime→exploit — and it's exactly how a
-                // single-vocabulary contract (e.g. 3Crv, whose only matched selector is
-                // approve) forces X→X. Excluding p_sel drops such a prime out of the
-                // same-contract pairing entirely (falls through to the default sampler).
-                let exps: Vec<usize> = cache
-                    .exploit_targets
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (a, sel, _))| a == addr && sel != p_sel)
-                    .map(|(i, _)| i)
-                    .collect();
-                sample_idx(exps.len(), rand).map(|k| (pi, exps[k]))
-            })
-            .collect();
-        if let Some((pi, ei)) = sample_idx(pairs.len(), rand).map(|k| pairs[k]) {
-            let (p_addr, _, p_abi) = &cache.prime_targets[pi];
-            let (_, _, e_abi) = &cache.exploit_targets[ei];
-            return (
-                Some((*p_addr, Some(p_abi.clone()))),
-                Some((*p_addr, Some(e_abi.clone()))),
-            );
+    // 2. If a prime step was selected and guidance is available, try to pick a matching next candidate as exploit step
+    if let Some((prime_addr, Some(prime_abi))) = &prime {
+        let prime_name = unsafe {
+            crate::evm::abi::FUNCTION_SIG.get(&prime_abi.function)
+                .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
+        };
+        if let (Some(p_name), Some(g)) = (prime_name, guidance) {
+            let next_candidates = g.scheduler.next_candidates(&p_name);
+            if !next_candidates.is_empty() {
+                // Find all exploit targets matching any next candidate function name
+                let mut guided_exploits = Vec::new();
+                for (exp_addr, exp_sel, exp_abi) in &cache.exploit_targets {
+                    if let Some(exp_name) = unsafe {
+                        crate::evm::abi::FUNCTION_SIG.get(exp_sel)
+                            .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
+                    } {
+                        if next_candidates.contains(&exp_name) {
+                            guided_exploits.push((*exp_addr, Some(exp_abi.clone())));
+                        }
+                    }
+                }
+                if !guided_exploits.is_empty() {
+                    if let Some(idx) = sample_idx(guided_exploits.len(), rand) {
+                        return (Some((*prime_addr, Some(prime_abi.clone()))), Some(guided_exploits[idx].clone()));
+                    }
+                }
+            }
         }
     }
 
-    // Default: SELECTOR-LEVEL sample from each candidate pool, exactly like the
-    // original fuzzland's get_next_call (draw from `interesting_signatures`, a SET
-    // of selectors, then resolve to a contract). Sampling raw `(contract,
-    // selector)` entries would weight a selector by how many contracts expose
-    // it, so a ubiquitous ERC-20 method (approve, on every token) drowns out
-    // the exploit-specific words — the [pool-tel]-confirmed approve=3/7 skew.
-    // Two-stage sampling (uniform over distinct selectors, then a contract
-    // carrying it) restores one-word-one-vote while keeping contract diversity.
-    // Coverage-guided steps sequence the survivors.
-    let prime = sample_by_selector(&cache.prime_targets, rand).map(|(a, _, abi)| (*a, Some(abi.clone())));
+    // 3. Fallback: Uniform selector-level sample for the exploit step
     let exploit = sample_by_selector(&cache.exploit_targets, rand).map(|(a, _, abi)| (*a, Some(abi.clone())));
     if prime.is_some() && exploit.is_some() {
         return (prime, exploit);
     }
 
-    // Fallback: name-heuristic single-contract target (sampled). Pin the trigger
-    // function as the exploit step (so the executor probe calls it, not the
-    // fallback) and a different function as the benign prime step.
+    // 4. Second fallback: generic target matching
     if let Some(gi) = sample_idx(cache.generic_targets.len(), rand) {
         let (addr, prime_abi, exploit_abi) = &cache.generic_targets[gi];
         return (Some((*addr, prime_abi.clone())), Some((*addr, exploit_abi.clone())));
@@ -1520,6 +1506,86 @@ mod tests {
             linkage.from_registry_key,
             format!("{:?}_{}_return", target_addr, hex::encode(prime_sel))
         );
+    }
+
+    #[test]
+    fn test_campaign_planning_with_guidance() {
+        let _g = FUNCTION_SIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let target_addr = EVMAddress::from([0x03; 20]);
+        let borrow_sel = [0xde, 0xad, 0xbe, 0xef];
+        let withdraw_sel = [0xca, 0xfe, 0xba, 0xbe];
+        let unrelated_sel = [0xba, 0xad, 0xf0, 0x0d];
+
+        unsafe {
+            crate::evm::abi::FUNCTION_SIG.insert(borrow_sel, "borrow(uint256)".to_string());
+            crate::evm::abi::FUNCTION_SIG.insert(withdraw_sel, "withdraw(uint256)".to_string());
+            crate::evm::abi::FUNCTION_SIG.insert(unrelated_sel, "unrelated(uint256)".to_string());
+        }
+
+        let mut map = HashMap::new();
+        map.insert(target_addr, vec![
+            make_abi(borrow_sel),
+            make_abi(withdraw_sel),
+            make_abi(unrelated_sel),
+        ]);
+        let abi_map = ABIAddressToInstanceMap { map };
+        let cache = CampaignTargetCache::new_with_preset(
+            &abi_map,
+            Vec::new(),
+            &[borrow_sel, withdraw_sel, unrelated_sel],
+            None,
+        );
+
+        // Construct mock guidance: after "borrow" -> ["withdraw"]
+        let mut after = HashMap::new();
+        after.insert("borrow".to_string(), vec!["withdraw".to_string()]);
+
+        let guidance = Guidance {
+            version: 1,
+            generated_at: 0.0,
+            meta: crate::evm::guidance::Meta {
+                num_functions: 3,
+                num_params: 3,
+                num_kill_chains: 0,
+                num_invariants: 0,
+                num_contracts: 1,
+            },
+            functions: HashMap::new(),
+            scheduler: crate::evm::guidance::SchedulerIndex {
+                after,
+                entry_points: Vec::new(),
+            },
+            mutator: crate::evm::guidance::MutatorIndex {
+                high_value_params: Vec::new(),
+            },
+            oracle: crate::evm::guidance::OracleIndex {
+                invariants: Vec::new(),
+                num_invariants: 0,
+            },
+            contracts: Vec::new(),
+            slot_influence_weights: HashMap::new(),
+            storage_layout: HashMap::new(),
+        };
+
+        let mut rand = StdRand::with_seed(12345);
+        let campaign = plan_campaign_sampled(
+            &cache,
+            Some(&guidance),
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            &mut rand,
+        ).expect("should plan campaign");
+
+        // The exploit step must be withdraw_sel because guidance prioritized it
+        let exploit_step = &campaign.steps[1];
+        let exploit_sig = exploit_step.data.as_ref().map(|d| d.function).unwrap_or_default();
+        assert_eq!(exploit_sig, withdraw_sel);
     }
 }
 

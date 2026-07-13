@@ -288,25 +288,27 @@ impl<S> PowerABIScheduler<S> {
             format!("{}:{}", name, amount_args)
         };
         for (_filename, ast) in artifact.asts.iter() {
-            let contracts = ast["contracts"].as_array().unwrap();
-            for contract in contracts {
-                let funcs = contract["functions"].as_array().unwrap();
-                for func in funcs {
-                    let func_slug = {
-                        let arg_len = func["args"].as_array().unwrap().len();
-                        let name = func["name"].as_str().unwrap();
-                        format!("{}:{}", name, arg_len)
-                    };
-
-                    if tc_func_slug == func_slug {
-                        let func_source = func["source"].as_str().unwrap();
-                        let num_lines = func_source.matches('\n').count() + 1;
-                        if num_lines <= 1 {
-                            break; // not true function implementation, break to
-                                   // find in next contract
+            if let Some(contracts) = ast.get("contracts").and_then(|v| v.as_array()) {
+                for contract in contracts {
+                    if let Some(funcs) = contract.get("functions").and_then(|v| v.as_array()) {
+                        for func in funcs {
+                            if let (Some(args), Some(name)) = (
+                                func.get("args").and_then(|v| v.as_array()),
+                                func.get("name").and_then(|v| v.as_str()),
+                            ) {
+                                let func_slug = format!("{}:{}", name, args.len());
+                                if tc_func_slug == func_slug {
+                                    if let Some(func_source) = func.get("source").and_then(|v| v.as_str()) {
+                                        let num_lines = func_source.matches('\n').count() + 1;
+                                        if num_lines <= 1 {
+                                            break; // not true function implementation, break to find in next contract
+                                        }
+                                        testcase.add_metadata(PowerABITestcaseMetadata::new(num_lines));
+                                        return Ok(());
+                                    }
+                                }
+                            }
                         }
-                        testcase.add_metadata(PowerABITestcaseMetadata::new(num_lines));
-                        return Ok(());
                     }
                 }
             }
