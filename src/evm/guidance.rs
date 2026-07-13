@@ -306,16 +306,20 @@ pub struct GuidanceMetadata {
     pub guidance: Guidance,
     pub slot_novelty: SlotNoveltyMap,
     pub unique_footprints: HashMap<SemanticFootprint, f64>,
+    pub addr_to_name: HashMap<String, String>,
 }
 
 impl GuidanceMetadata {
     pub fn new(guidance: Guidance) -> Self {
         let mut resolved_weights: HashMap<String, HashMap<u64, f64>> = HashMap::new();
 
-        // 1. Build a lookup for contract name -> address
+        // 1. Build a lookup for contract name -> address and address -> name
         let mut name_to_addr = HashMap::new();
+        let mut addr_to_name = HashMap::new();
         for c in &guidance.contracts {
-            name_to_addr.insert(c.name.clone(), c.address.to_lowercase());
+            let addr_lower = c.address.to_lowercase();
+            name_to_addr.insert(c.name.clone(), addr_lower.clone());
+            addr_to_name.insert(addr_lower, c.name.clone());
         }
 
         // 2. Resolve slot influence weights to (contract_address, slot_index)
@@ -353,6 +357,7 @@ impl GuidanceMetadata {
                 total_sequences: 0,
             },
             unique_footprints: HashMap::new(),
+            addr_to_name,
         }
     }
 }

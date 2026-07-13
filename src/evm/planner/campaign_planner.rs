@@ -11,7 +11,7 @@ use crate::evm::{
     input::{CampaignSequence, ConciseEVMInput, EVMInputTy, StepLinkage},
     leak_class::LeakClass,
     middlewares::cmp_linearity::TaintDim,
-    guidance::Guidance,
+    guidance::{Guidance, GuidanceMetadata},
     types::{EVMAddress, EVMU256},
 };
 
@@ -297,7 +297,7 @@ impl CampaignTargetCache {
 /// `None` if insufficient targets were found.
 pub fn plan_campaign(
     cache: &CampaignTargetCache,
-    guidance: Option<&Guidance>,
+    guidance_meta: Option<&GuidanceMetadata>,
     temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
     // Deterministic entry (tests / no live fuzzer RNG): seed a fixed local RNG.
@@ -309,7 +309,7 @@ pub fn plan_campaign(
     // (mutator) passes `self.effective_reflexive`.
     plan_campaign_sampled(
         cache,
-        guidance,
+        guidance_meta,
         temporal_skimming,
         false,
         false,
@@ -417,7 +417,7 @@ fn build_structural_step(
 /// of economic truth.
 pub fn plan_campaign_sampled<R: Rand>(
     cache: &CampaignTargetCache,
-    guidance: Option<&Guidance>,
+    guidance_meta: Option<&GuidanceMetadata>,
     temporal_skimming: bool,
     effective_reflexive: bool,
     dimension_warp: bool,
@@ -453,7 +453,7 @@ pub fn plan_campaign_sampled<R: Rand>(
 
     // Populate prime + exploit steps (with concrete function ABIs), respecting
     // hints
-    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, guidance, rand);
+    let (prime_step, exploit_step) = pick_prime_and_exploit(cache, guidance_meta, rand);
     let prime_step_clone = prime_step.clone();
     let exploit_step_clone = exploit_step.clone();
     if let Some((addr, abi)) = prime_step {
@@ -604,7 +604,7 @@ type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
 
 fn pick_prime_and_exploit<R: Rand>(
     cache: &CampaignTargetCache,
-    guidance: Option<&Guidance>,
+    guidance_meta: Option<&GuidanceMetadata>,
     rand: &mut R,
 ) -> (PickedStep, PickedStep) {
     // 1. Uniform selector-level sample for the prime step
@@ -616,8 +616,14 @@ fn pick_prime_and_exploit<R: Rand>(
             crate::evm::abi::FUNCTION_SIG.get(&prime_abi.function)
                 .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
         };
-        if let (Some(p_name), Some(g)) = (prime_name, guidance) {
-            let next_candidates = g.scheduler.next_candidates(&p_name);
+        if let (Some(p_name), Some(g_meta)) = (prime_name, guidance_meta) {
+            let prime_contract_name = g_meta.addr_to_name.get(&format!("{:?}", prime_addr).to_lowercase());
+            let lookup_key = match prime_contract_name {
+                Some(c_name) => format!("{}:{}", c_name, p_name),
+                None => p_name.clone(),
+            };
+
+            let next_candidates = g_meta.guidance.scheduler.next_candidates(&lookup_key);
             if !next_candidates.is_empty() {
                 // Find all exploit targets matching any next candidate function name
                 let mut guided_exploits = Vec::new();
@@ -626,7 +632,13 @@ fn pick_prime_and_exploit<R: Rand>(
                         crate::evm::abi::FUNCTION_SIG.get(exp_sel)
                             .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
                     } {
-                        if next_candidates.contains(&exp_name) {
+                        let exp_contract_name = g_meta.addr_to_name.get(&format!("{:?}", exp_addr).to_lowercase());
+                        let exp_key = match exp_contract_name {
+                            Some(c_name) => format!("{}:{}", c_name, exp_name),
+                            None => exp_name.clone(),
+                        };
+
+                        if next_candidates.contains(&exp_key) || next_candidates.contains(&exp_name) {
                             guided_exploits.push((*exp_addr, Some(exp_abi.clone())));
                         }
                     }
@@ -1537,9 +1549,9 @@ mod tests {
             None,
         );
 
-        // Construct mock guidance: after "borrow" -> ["withdraw"]
+        // Construct mock guidance: after "Target:borrow" -> ["Target:withdraw"]
         let mut after = HashMap::new();
-        after.insert("borrow".to_string(), vec!["withdraw".to_string()]);
+        after.insert("Target:borrow".to_string(), vec!["Target:withdraw".to_string()]);
 
         let guidance = Guidance {
             version: 1,
@@ -1563,15 +1575,27 @@ mod tests {
                 invariants: Vec::new(),
                 num_invariants: 0,
             },
-            contracts: Vec::new(),
+            contracts: vec![
+                crate::evm::guidance::ContractEntry {
+                    id: "1".to_string(),
+                    name: "Target".to_string(),
+                    address: format!("{:?}", target_addr),
+                    is_library: None,
+                    is_interface: None,
+                    is_proxy: None,
+                    protocol: None,
+                }
+            ],
             slot_influence_weights: HashMap::new(),
             storage_layout: HashMap::new(),
         };
 
+        let guidance_meta = GuidanceMetadata::new(guidance);
+
         let mut rand = StdRand::with_seed(12345);
         let campaign = plan_campaign_sampled(
             &cache,
-            Some(&guidance),
+            Some(&guidance_meta),
             false,
             false,
             false,

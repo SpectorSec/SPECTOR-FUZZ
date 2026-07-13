@@ -532,7 +532,13 @@ impl BoxedABI {
                             .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
                     };
                     if let (Some(func_name), Some(guidance_meta)) = (func_name, &guidance_meta) {
-                        let high_value_params = guidance_meta.guidance.mutator.for_function(&func_name);
+                        let mut lookup_key = func_name.clone();
+                        if let Some(c_addr) = active_contract {
+                            if let Some(c_name) = guidance_meta.addr_to_name.get(&format!("{:?}", c_addr).to_lowercase()) {
+                                lookup_key = format!("{}:{}", c_name, func_name);
+                            }
+                        }
+                        let high_value_params = guidance_meta.guidance.mutator.for_function(&lookup_key);
                         if !high_value_params.is_empty() {
                             let mut valid_indices = Vec::new();
                             for hvp in high_value_params {

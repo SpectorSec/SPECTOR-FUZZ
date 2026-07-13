@@ -1340,12 +1340,11 @@ where
                     } else {
                         false
                     };
-                    let guidance = state.metadata_map()
-                        .get::<crate::evm::guidance::GuidanceMetadata>()
-                        .map(|g| &g.guidance);
+                    let guidance_meta = state.metadata_map()
+                        .get::<crate::evm::guidance::GuidanceMetadata>();
                     if let Some(campaign) = plan_campaign_sampled(
                         cache,
-                        guidance,
+                        guidance_meta,
                         self.temporal_skimming,
                         self.reflexive_lever,
                         self.dimension_warp && timestamp_located,
