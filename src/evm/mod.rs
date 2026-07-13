@@ -17,7 +17,7 @@ pub mod mutator;
 pub mod liquidation;
 pub mod liquidation_router;
 pub mod onchain;
-pub mod topology;
+
 pub mod oracle;
 pub mod oracles;
 pub mod planner;

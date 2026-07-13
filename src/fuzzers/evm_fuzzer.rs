@@ -520,12 +520,10 @@ pub fn evm_fuzzer(
         unsafe {
             crate::evm::types::CampaignIntermediateStatesEVM::register();
         }
-        let hints = state.metadata_map().get::<crate::evm::topology::TopologyHints>();
-        let contract_families = hints.map(|h| &h.contract_families);
         let instance_map = state.metadata_map().get::<ABIAddressToInstanceMap>().cloned();
         let cache = instance_map
-            .map(|m| CampaignTargetCache::new_with_preset(&m, Vec::new(), &preset_chain_selectors, contract_families))
-            .unwrap_or_else(|| CampaignTargetCache::new_with_preset(&ABIAddressToInstanceMap::default(), Vec::new(), &preset_chain_selectors, contract_families));
+            .map(|m| CampaignTargetCache::new_with_preset(&m, Vec::new(), &preset_chain_selectors, None))
+            .unwrap_or_else(|| CampaignTargetCache::new_with_preset(&ABIAddressToInstanceMap::default(), Vec::new(), &preset_chain_selectors, None));
         // [pool-tel] one-shot: how many (contract,selector) entries per selector in the
         // campaign candidate pool. Exposes contract-multiplicity bias (e.g. approve on
         // every ERC20 → over-weighted in uniform (contract,selector) sampling).

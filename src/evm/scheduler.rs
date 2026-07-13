@@ -18,7 +18,6 @@ use super::{
     host::{BRANCH_STATUS, BRANCH_STATUS_IDX},
     feedbacks::CompoundSequenceCanary,
     planner::{PromotionCandidate, PromotionCandidates},
-    topology::TopologyHints,
     types::EVMAddress,
 };
 use crate::{

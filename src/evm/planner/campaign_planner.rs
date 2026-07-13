@@ -11,7 +11,6 @@ use crate::evm::{
     input::{CampaignSequence, ConciseEVMInput, EVMInputTy, StepLinkage},
     leak_class::LeakClass,
     middlewares::cmp_linearity::TaintDim,
-    topology::{ExploitClass, ProtocolFamily, TopologyReport},
     types::{EVMAddress, EVMU256},
 };
 
@@ -246,7 +245,7 @@ impl CampaignTargetCache {
         abi_map: &ABIAddressToInstanceMap,
         borrowable_tokens: Vec<EVMAddress>,
         preset_selectors: &[[u8; 4]],
-        contract_families: Option<&HashMap<EVMAddress, Vec<ProtocolFamily>>>,
+        _contract_families: Option<()>,
     ) -> Self {
         let (prime_sels, exploit_sels): (&[[u8; 4]], &[[u8; 4]]) = if !preset_selectors.is_empty() {
             // Every matched-exploit selector is a candidate for both ends of the chain;
@@ -259,46 +258,7 @@ impl CampaignTargetCache {
         let mut exploit_targets = find_targets_by_selector(abi_map, exploit_sels);
         let mut reflexive_targets = find_targets_by_selector(abi_map, REFLEXIVE_LEVER_SELECTORS);
 
-        if let Some(cf_map) = contract_families {
-            // Dynamic selector typing: if a contract's lineage tells us it belongs to a protocol family,
-            // we dynamically classify its selectors and append them to prime/exploit/reflexive lists.
-            for (addr, families) in cf_map {
-                if let Some(abis) = abi_map.map.get(addr) {
-                    for abi in abis {
-                        if abi.function == [0u8; 4] {
-                            continue;
-                        }
-                        if let Some(sig) = abi.get_func_signature() {
-                            let fn_name_lc = sig.split('(').next().unwrap_or("").to_lowercase();
-                            for family in families {
-                                match family {
-                                    ProtocolFamily::ERC4626 => {
-                                        if matches!(fn_name_lc.as_str(), "deposit" | "mint" | "withdraw" | "redeem") {
-                                            let entry = (*addr, abi.function, abi.clone());
-                                            if !prime_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
-                                                prime_targets.push(entry.clone());
-                                            }
-                                            if !exploit_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
-                                                exploit_targets.push(entry);
-                                            }
-                                        }
-                                    }
-                                    ProtocolFamily::Lending => {
-                                        if matches!(fn_name_lc.as_str(), "borrow" | "repay" | "liquidate" | "redeem" | "redeemunderlying") {
-                                            let entry = (*addr, abi.function, abi.clone());
-                                            if !reflexive_targets.iter().any(|(a, f, _)| *a == *addr && *f == abi.function) {
-                                                reflexive_targets.push(entry);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+
 
         Self {
             prime_targets,
@@ -336,7 +296,7 @@ impl CampaignTargetCache {
 /// `None` if insufficient targets were found.
 pub fn plan_campaign(
     cache: &CampaignTargetCache,
-    topology_report: Option<&TopologyReport>,
+    topology_report: Option<()>,
     temporal_skimming: bool,
 ) -> Option<CampaignSequence> {
     // Deterministic entry (tests / no live fuzzer RNG): seed a fixed local RNG.
@@ -456,7 +416,7 @@ fn build_structural_step(
 /// of economic truth.
 pub fn plan_campaign_sampled<R: Rand>(
     cache: &CampaignTargetCache,
-    topology_report: Option<&TopologyReport>,
+    topology_report: Option<()>,
     temporal_skimming: bool,
     effective_reflexive: bool,
     dimension_warp: bool,
@@ -643,25 +603,10 @@ type PickedStep = Option<(EVMAddress, Option<BoxedABI>)>;
 
 fn pick_prime_and_exploit<R: Rand>(
     cache: &CampaignTargetCache,
-    topology_report: Option<&TopologyReport>,
+    topology_report: Option<()>,
     rand: &mut R,
 ) -> (PickedStep, PickedStep) {
-    // No per-selector "value-flow" anchor: economic truth is the net-realized
-    // ledger at the objective layer (see plan_campaign_sampled docs). The
-    // planner only samples structure; topology INFORMS a same-contract
-    // preference, nothing FORCES an aim.
-    let prefer_same_contract = topology_report
-        .and_then(|r| r.ranked.first())
-        .map(|(cls, _)| {
-            matches!(
-                cls,
-                ExploitClass::PriceGatedVault |
-                    ExploitClass::FlashDepositDrain |
-                    ExploitClass::RewardAccumulator |
-                    ExploitClass::ReflexiveSkew
-            )
-        })
-        .unwrap_or(false);
+    let prefer_same_contract = false;
 
     if prefer_same_contract {
         // Sample among same-contract prime/exploit pairs (not the first pair), each
@@ -984,37 +929,6 @@ mod tests {
         assert_eq!(campaign.steps[2].input_type, EVMInputTy::ABI);
     }
 
-    #[test]
-    fn test_plan_campaign_same_contract_with_topology() {
-        use crate::evm::topology::{ExploitClass, ProtocolFamily, TopologyReport};
-        let mut map = HashMap::new();
-        let vault_addr = EVMAddress::from([0x10; 20]);
-        // Same contract has both prime (deposit) and exploit (redeem) selectors
-        map.insert(
-            vault_addr,
-            vec![
-                make_abi(PRIME_SELECTORS[0]),
-                make_abi(EXPLOIT_SELECTORS[1]), // redeem
-            ],
-        );
-        let abi_map = ABIAddressToInstanceMap { map };
-        let cache = CampaignTargetCache::new(&abi_map, Vec::new());
-        assert!(cache.is_viable());
-
-        // Build a topology report that ranks PriceGatedVault (same-contract class)
-        // highest
-        let mut families = HashSet::new();
-        families.insert(ProtocolFamily::ERC4626);
-        families.insert(ProtocolFamily::Chainlink);
-        let report = TopologyReport::analyze(families);
-        // Same address has both prime+exploit selectors → should pair on same contract
-        let campaign = plan_campaign(&cache, Some(&report), false).expect("should produce campaign");
-        assert_eq!(campaign.steps.len(), 2);
-        assert_eq!(
-            campaign.steps[0].contract, campaign.steps[1].contract,
-            "topology with same-contract class should pick same address"
-        );
-    }
 
     #[test]
     fn test_planner_adds_warp_when_temporal_skimming_enabled() {
@@ -1565,39 +1479,6 @@ mod tests {
         assert_eq!(campaign.warps[0].0, 1, "warp should be before exploit step (index 1)");
     }
 
-    #[test]
-    fn test_campaign_target_cache_dynamic_selector_typing() {
-        let _guard = FUNCTION_SIG_TEST_LOCK.lock().unwrap();
-        let mut map = HashMap::new();
-        let target_addr = EVMAddress::from([0x03; 20]);
-        let custom_prime_sel = [0xde, 0xad, 0xbe, 0xef];
-        let mut abi_prime = make_abi(custom_prime_sel);
-        abi_prime.set_func_with_signature(custom_prime_sel, "deposit", "(uint256)");
-
-        let custom_lending_sel = [0xba, 0xad, 0xf0, 0x0d];
-        let mut abi_lending = make_abi(custom_lending_sel);
-        abi_lending.set_func_with_signature(custom_lending_sel, "borrow", "(uint256)");
-
-        map.insert(target_addr, vec![abi_prime, abi_lending]);
-        let abi_map = ABIAddressToInstanceMap { map };
-
-        let cache_static = CampaignTargetCache::new_with_preset(&abi_map, Vec::new(), &[], None);
-        assert!(cache_static.prime_targets.is_empty());
-        assert!(cache_static.reflexive_targets.is_empty());
-
-        let mut contract_families = HashMap::new();
-        contract_families.insert(target_addr, vec![ProtocolFamily::ERC4626, ProtocolFamily::Lending]);
-
-        let cache_dynamic = CampaignTargetCache::new_with_preset(&abi_map, Vec::new(), &[], Some(&contract_families));
-        
-        assert_eq!(cache_dynamic.prime_targets.len(), 1);
-        assert_eq!(cache_dynamic.prime_targets[0].0, target_addr);
-        assert_eq!(cache_dynamic.prime_targets[0].1, custom_prime_sel);
-
-        assert_eq!(cache_dynamic.reflexive_targets.len(), 1);
-        assert_eq!(cache_dynamic.reflexive_targets[0].0, target_addr);
-        assert_eq!(cache_dynamic.reflexive_targets[0].1, custom_lending_sel);
-    }
 
     #[test]
     fn test_campaign_step_linkage_planning() {
