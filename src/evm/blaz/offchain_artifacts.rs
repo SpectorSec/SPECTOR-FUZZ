@@ -429,8 +429,9 @@ impl OffChainArtifact {
                 let file_name = parts[0];
                 let contract = contract.as_object().expect("get contract failed");
                 let bytecode = contract["bin"].as_str().expect("get bytecode failed");
-                // let bytecode = Bytes::from(hex::decode(bytecode).expect("decode bytecode
-                // failed"));
+                let runtime_bytecode = hex::decode(bytecode.trim_start_matches("0x"))
+                    .map(Bytes::from)
+                    .unwrap_or_default();
                 let abi = serde_json::to_string(&contract["abi"]).expect("get abi failed");
                 let source_map = contract["srcmap-runtime"]
                     .as_str()
@@ -440,7 +441,7 @@ impl OffChainArtifact {
                     (file_name.to_string(), contract_name.to_string()),
                     ContractArtifact {
                         deploy_bytecode_str: bytecode.to_string(),
-                        deploy_bytecode: Default::default(),
+                        deploy_bytecode: runtime_bytecode,
                         abi,
                         source_map,
                         link_references: Default::default(),
@@ -455,8 +456,13 @@ impl OffChainArtifact {
                     let bytecode = contract["evm"]["bytecode"]["object"]
                         .as_str()
                         .expect("get bytecode failed");
-                    // let bytecode = Bytes::from(hex::decode(bytecode).expect("decode bytecode
-                    // failed"));
+                    let deployed_bytecode_str = contract["evm"]["deployedBytecode"]["object"]
+                        .as_str()
+                        .unwrap_or("");
+                    let deployed_bytecode = hex::decode(deployed_bytecode_str.trim_start_matches("0x"))
+                        .map(Bytes::from)
+                        .unwrap_or_default();
+
                     let abi = serde_json::to_string(&contract["abi"]).expect("get abi failed");
                     let link_references = serde_json::from_value(contract["evm"]["bytecode"]["linkReferences"].clone())
                         .unwrap_or_default();
@@ -468,7 +474,7 @@ impl OffChainArtifact {
                         (file_name.clone(), contract_name.clone()),
                         ContractArtifact {
                             deploy_bytecode_str: bytecode.to_string(),
-                            deploy_bytecode: Bytes::default(),
+                            deploy_bytecode: deployed_bytecode,
                             abi,
                             source_map,
                             link_references,

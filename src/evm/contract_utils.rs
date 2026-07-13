@@ -708,15 +708,14 @@ impl ContractLoader {
         let mut all_candidates = vec![];
         for (idx, artifact) in offchain_artifacts.iter().enumerate() {
             for (loc, contract) in &artifact.contracts {
-                if contract.deploy_bytecode.is_empty() {
-                    let contract_deploy_bytecode = hex::decode(contract.deploy_bytecode_str.as_str()).unwrap();
-                    if is_bytecode_similar_lax(to_find.clone(), contract_deploy_bytecode) < 2 {
-                        candidates.push((idx, loc.clone()));
-                    }
+                let local_runtime_bytecode = if !contract.deploy_bytecode.is_empty() {
+                    contract.deploy_bytecode.to_vec()
                 } else {
-                    if is_bytecode_similar_lax(to_find.clone(), contract.deploy_bytecode.to_vec()) < 2 {
-                        candidates.push((idx, loc.clone()));
-                    }
+                    hex::decode(contract.deploy_bytecode_str.as_str()).unwrap_or_default()
+                };
+
+                if is_bytecode_similar_lax(to_find.clone(), local_runtime_bytecode) < 2 {
+                    candidates.push((idx, loc.clone()));
                 }
 
                 all_candidates.push((idx, loc.clone()));
@@ -730,7 +729,12 @@ impl ContractLoader {
             .iter()
             .map(|(idx, loc)| {
                 let artifact = &offchain_artifacts[*idx].contracts[loc];
-                is_bytecode_similar_strict_ranking(to_find.clone(), artifact.deploy_bytecode.to_vec())
+                let local_runtime_bytecode = if !artifact.deploy_bytecode.is_empty() {
+                    artifact.deploy_bytecode.to_vec()
+                } else {
+                    hex::decode(artifact.deploy_bytecode_str.as_str()).unwrap_or_default()
+                };
+                is_bytecode_similar_strict_ranking(to_find.clone(), local_runtime_bytecode)
             })
             .collect::<Vec<_>>();
 
