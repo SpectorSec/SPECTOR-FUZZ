@@ -253,6 +253,41 @@ impl<S> Default for PowerABIScheduler<S> {
     }
 }
 
+fn find_func_src_in_real_ast(ast: &serde_json::Value, tc_func_name: &str, tc_arg_len: usize) -> Option<String> {
+    if let Some(nodes) = ast.get("nodes").and_then(|v| v.as_array()) {
+        for node in nodes {
+            let node_type = node.get("nodeType").and_then(|v| v.as_str()).unwrap_or("");
+            if node_type == "ContractDefinition" {
+                if let Some(sub_nodes) = node.get("nodes").and_then(|v| v.as_array()) {
+                    for sub_node in sub_nodes {
+                        let sub_node_type = sub_node.get("nodeType").and_then(|v| v.as_str()).unwrap_or("");
+                        if sub_node_type == "FunctionDefinition" {
+                            let name = sub_node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if name == tc_func_name {
+                                let arg_len = sub_node.get("parameters")
+                                    .and_then(|p| p.get("parameters"))
+                                    .and_then(|pa| pa.as_array())
+                                    .map(|pa| pa.len())
+                                    .unwrap_or(0);
+                                if arg_len == tc_arg_len {
+                                    if let Some(src) = sub_node.get("src").and_then(|v| v.as_str()) {
+                                        return Some(src.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Some(src) = find_func_src_in_real_ast(node, tc_func_name, tc_arg_len) {
+                    return Some(src);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl<S> PowerABIScheduler<S> {
     pub fn new() -> Self {
         Self { phantom: PhantomData }
@@ -287,7 +322,42 @@ impl<S> PowerABIScheduler<S> {
             let name = tc_func_name.split('(').next().unwrap();
             format!("{}:{}", name, amount_args)
         };
-        for (_filename, ast) in artifact.asts.iter() {
+
+        let name_only = tc_func_name.split('(').next().unwrap_or("").trim();
+        let amount_args = tc_func_name.matches(',').count() + if tc_func_name.contains("()") { 0 } else { 1 };
+
+        for (filename, ast) in artifact.asts.iter() {
+            // Find in real AST
+            let mut src_loc = find_func_src_in_real_ast(ast, name_only, amount_args);
+            if src_loc.is_none() {
+                if let Some(ast_inner) = ast.get("ast") {
+                    src_loc = find_func_src_in_real_ast(ast_inner, name_only, amount_args);
+                }
+            }
+
+            if let Some(src) = src_loc {
+                let parts: Vec<&str> = src.split(':').collect();
+                if parts.len() >= 2 {
+                    if let (Ok(start), Ok(len)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                        let source_code = artifact.sources.iter()
+                            .find(|(name, _)| name == filename)
+                            .map(|(_, s)| s);
+                        if let Some(src_str) = source_code {
+                            let src_bytes = src_str.as_bytes();
+                            if start < src_bytes.len() && start + len <= src_bytes.len() {
+                                let func_source = &src_bytes[start..start + len];
+                                let num_lines = func_source.iter().filter(|&&b| b == b'\n').count() + 1;
+                                if num_lines > 1 {
+                                    testcase.add_metadata(PowerABITestcaseMetadata::new(num_lines));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: Check custom/fictional AST shape (legacy / compat)
             if let Some(contracts) = ast.get("contracts").and_then(|v| v.as_array()) {
                 for contract in contracts {
                     if let Some(funcs) = contract.get("functions").and_then(|v| v.as_array()) {
@@ -746,5 +816,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_real_ast_line_count_parsing() {
+        let ast_json = serde_json::json!({
+            "nodeType": "SourceUnit",
+            "nodes": [
+                {
+                    "nodeType": "ContractDefinition",
+                    "name": "Target",
+                    "nodes": [
+                        {
+                            "nodeType": "FunctionDefinition",
+                            "name": "deposit",
+                            "parameters": {
+                                "nodeType": "ParameterList",
+                                "parameters": [
+                                    {
+                                        "nodeType": "VariableDeclaration",
+                                        "name": "amount"
+                                    }
+                                ]
+                            },
+                            "src": "22:73:0"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let src_code = "contract Target {\n    function deposit(uint256 amount) public {\n        // some code here\n    }\n}";
+
+        let src_loc = super::find_func_src_in_real_ast(&ast_json, "deposit", 1).expect("should find source mapping");
+        assert_eq!(src_loc, "22:73:0");
+
+        let parts: Vec<&str> = src_loc.split(':').collect();
+        let start: usize = parts[0].parse().unwrap();
+        let len: usize = parts[1].parse().unwrap();
+
+        let src_bytes = src_code.as_bytes();
+        let func_source = &src_bytes[start..start + len];
+        let num_lines = func_source.iter().filter(|&&b| b == b'\n').count() + 1;
+        assert_eq!(num_lines, 3);
     }
 }
