@@ -18,7 +18,6 @@ default = [
     "full_trace",
     "force_cache",
     "real_balance",
-    "use_presets",
 ]
 evm = []
 cmp = []
