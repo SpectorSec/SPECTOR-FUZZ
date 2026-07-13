@@ -67,12 +67,6 @@ pub struct Config<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E> {
     /// Feature 011 (Part A): rank the extraction gradient by realized ETH value
     /// instead of raw token units. Off ⇒ original token-unit gradient (unchanged).
     pub impact_eth_gradient: bool,
-    /// When true, disable the entire topology auto-layer: no TopologyHints mutation
-    /// bias ("Gamma Ray") and no topology-driven oracle auto-activation. Lets you run
-    /// a truly bare/unbiased baseline to isolate detector and performance behaviour.
-    pub no_topology: bool,
-    /// Topology mutator-bias strength [0.0,1.0] (--topology-bias). See TopologyHints::bias.
-    pub topology_bias: f64,
     pub contract_loader: ContractLoader,
     pub oracle: Vec<Rc<RefCell<dyn Oracle<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E>>>>,
     pub producers: Vec<Rc<RefCell<dyn Producer<VS, Addr, Code, By, Loc, SlotTy, Out, I, S, CI, E>>>>,

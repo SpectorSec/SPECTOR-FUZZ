@@ -187,21 +187,6 @@ pub struct EvmArgs {
     #[arg(long, default_value = "false")]
     impact_eth_gradient: bool,
 
-    /// Disable the topology auto-layer: no TopologyHints mutation bias ("Gamma Ray")
-    /// and no topology-driven oracle auto-activation. For a truly bare/unbiased
-    /// baseline to isolate detector behaviour and per-component performance.
-    #[arg(long, default_value = "false")]
-    no_topology: bool,
-
-    /// Topology FORCING strength in [0.0, 1.0]. Topology is feedback (it reads the ABI and
-    /// gives the fuzzer the system's shape) and always INFORMS — oracle activation, campaign
-    /// shape, gap-filling stay on regardless. This knob only controls whether topology
-    /// confidence also FORCES the mutator: it scales the campaign spawn-rate and scheduler
-    /// power (multiplier = 1 + (conf/100) * bias). DEFAULT 0.0 = inform only, no forcing
-    /// (coherent: don't override coverage-gravity with our prior). 1.0 = legacy floodlight.
-    /// Distinct from --no-topology, which throws out the shape *feedback* too.
-    #[arg(long, default_value = "0.0")]
-    topology_bias: f64,
 
     /// Enable the economic outcome detection subsystem.
     ///
@@ -983,8 +968,6 @@ pub fn evm_main(mut args: EvmArgs) {
             }
         },
         impact_eth_gradient: args.impact_eth_gradient || args.reflexive_lever,
-        no_topology: args.no_topology,
-        topology_bias: args.topology_bias,
         oracle: oracles,
         producers,
         flashloan: args.flashloan || args.bounty,
@@ -1215,8 +1198,6 @@ fn test_evm_offchain_setup() {
             }
         },
         impact_eth_gradient: args.impact_eth_gradient || args.reflexive_lever,
-        no_topology: args.no_topology,
-        topology_bias: args.topology_bias,
         oracle: oracles,
         producers,
         flashloan: args.flashloan || args.bounty,
