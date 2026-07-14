@@ -14,8 +14,8 @@ The methodology: instead of labeling incidents by root cause (Reentrancy, Flash 
 | Attack Pattern (from incidents) | Fuzzer Architecture |
 |---|---|
 | Unprotected callbacks — attackers hijack `onERC721Received`, `executeOperation`, `uniswapV3SwapCallback` to inject payloads during protocol execution | Attacker bytecode injection on caller addresses + NestedAction system + host bridge that writes staged actions into EVM storage slots before executing the callback bytecode |
-| Arbitrary call / unverified input (74 incidents) — attackers supply target+calldata to drain via `transferFrom`, swaps, or vault withdrawals | NestedAction mutator draws oracle-flagged targets via `OracleTargetMetadata`; topology confidence steers mutation through a **configurable** `--topology-bias` multiplier (`1 + (conf/100)·bias`, default `0.0` = unbiased) |
-| Access control + flash loan + oracle manipulation combos — attackers sequence a borrow, a price move, and a privileged call | Campaign planner (`plan_campaign`) generates topology-ranked multi-step sequences; `TopologyReport` drives step ordering and same-contract prioritization |
+| Arbitrary call / unverified input (74 incidents) — attackers supply target+calldata to drain via `transferFrom`, swaps, or vault withdrawals | NestedAction mutator draws oracle-flagged targets via `OracleTargetMetadata`; the economic-energy scheduler (`PowerABIScheduler`) boosts promoted/high-value inputs via `promote_boost`/`magnitude_boost`, keyed off each oracle's `PromotionCandidate.kind` |
+| Access control + flash loan + oracle manipulation combos — attackers sequence a borrow, a price move, and a privileged call | Campaign planner (`plan_campaign`) generates multi-step sequences guided by **Compiled Semantic Guidance** (`--guidance-file`) — offline DFG-derived `after["Contract:fn"]` transitions steer step ordering and exploit-target selection |
 | Profit extraction via swaps — attackers convert drained tokens to ETH | LiquidationRouter (`route_to_base`) discovers exit routes; `liquidation_percent` on inputs triggers ERC20Oracle's post-execution `.sell()` calls |
 | Cross-contract identity spoofing (confused deputy) — attackers make `msg.sender` appear as a trusted router/vault to bypass `onlyRouter`, `onlyVault` modifiers | **Ghost Identities (Feature 004)** — `TrustedCallerMetadata` populated by `FunctionOracle` on successful privileged calls; mutator draws from trusted protocol addresses first, falls back to `WhaleAddressMetadata`. CLI: `--ghost-identities` |
 | Multi-block state priming — Tx 1 deposits/manipulates, Tx 2 exploits after internal accounting desyncs | **Temporal Pre-condition Skimming (Feature 005)** — `TemporalSkimOracle` snapshots balances, inserts `Warp(10)` between campaign steps, flags divergence >0.001 ETH. Global warp-aware `OracleCtx` passes `temporal_warps` to all oracles to suppress false positives. CLI: `--temporal-skimming` |
@@ -77,28 +77,38 @@ Oracles activate automatically from selector detection — no manual configurati
 | *17 keywords* | Permission boundary | `FunctionOracle` |
 
 ### 3. Oracle Suite (`-d all`)
-~18 oracle modules (`src/evm/oracles/*`) cover the seven Ghost property classes. The
-suite grew during the oracle-layer audit — `FeeOnTransferOracle`, `RebasingOracle`,
-`TemporalSkimOracle`, `SelfDestructOracle`, and `V2PairOracle` are audit-era additions
-that close false-positive and archetype gaps the original 12 missed:
+20 oracle modules (`src/evm/oracles/*`) bind to the **six `LeakClass` primitives**
+(`src/evm/leak_class.rs` — the single source of truth for the taxonomy; see
+*The Philosophy* above). `FeeOnTransferOracle`, `RebasingOracle`, `TemporalSkimOracle`,
+`SelfDestructOracle`, and `V2PairOracle` are audit-era additions that close
+false-positive and archetype gaps the original 12 missed:
 
-| Oracle | Detects | Ghost |
-|--------|---------|-------|
-| `ERC20Oracle` | Fund extraction | #1 |
-| `FreshnessOracle` | Stale Chainlink data accepted without revert | #3 |
-| `ERC4626Oracle` | Share price manipulation / vault inflation | #5 |
-| `FunctionOracle` | Unauthorized privileged function call | #4 |
-| `ReentrancyOracle` | Control flow hijack mid-state | #2 |
-| `InvariantOracle` / `StateCompOracle` | Echidna `invariant_*` / failed slot / state-comparison tripped | #7 |
-| `ArbitraryCallOracle` (`arb_call` / `arb_transfer`) | Unvalidated external call target / transfer | #6 |
-| `NFTOracle` | ERC-721/1155 ownership leak | #6 |
-| `ApprovalOracle` | Unlimited approval granted to attacker | #4 |
-| `FeeOnTransferOracle` *(audit)* | Fee-on-transfer token accounting error / false-positive guard | #1 |
-| `RebasingOracle` *(audit)* | Rebasing token balance desync | #5 |
-| `TemporalSkimOracle` *(audit, Feat. 005)* | Multi-block state-priming divergence >0.001 ETH | #7 |
-| `SelfDestructOracle` *(audit)* | Contract self-destruct / code removal | #6 |
-| `V2PairOracle` *(audit)* | Uniswap-V2 pair `k`-invariant / reserve manipulation | #7 |
-| `CrossChainOracle` | Cross-chain message trust boundary | #6 |
+| Oracle | Detects | LeakClass |
+|--------|---------|-----------|
+| `ERC20Oracle` | Fund extraction | Value |
+| `FeeOnTransferOracle` *(audit)* | Fee-on-transfer token accounting error / false-positive guard | Value |
+| `RebasingOracle` *(audit)* | Rebasing token balance desync | Value |
+| `ERC4626Oracle` | Share price manipulation / vault inflation | Value |
+| `V2PairOracle` *(audit)* | Uniswap-V2 pair `k`-invariant / reserve manipulation | Value |
+| `arb_transfer` (`MathCalculate`) | Arbitrary ERC-20 transfer to attacker | Value |
+| `FreshnessOracle` *(out-of-band, Feat. 036)* | Stale Chainlink data accepted without revert | Value |
+| `TemporalSkimOracle` *(audit, Feat. 005, out-of-band)* | Multi-block state-priming divergence >0.001 ETH | Value |
+| `ReentrancyOracle` | Control flow hijack mid-state | ControlFlow |
+| `arb_call` (`ArbitraryCallOracle`) | Unvalidated external call target | Message |
+| `CrossChainOracle` | Cross-chain bridge-receive message forgery | Message |
+| `FunctionOracle` | Unauthorized privileged function call | Permission |
+| `ApprovalOracle` | Unlimited approval granted to attacker | Permission |
+| `InvariantOracle` | Declared invariant broken | Invariant |
+| `StateCompOracle` | Failed slot / state-comparison tripped | Invariant |
+| `EchidnaOracle` | Echidna-style `invariant_*` tripped | Invariant |
+| `TypedBugOracle` | User-defined typed invariant assertion tripped | Invariant |
+| `SnapshotDelta` | Ownership/authority slot (e.g. `owner()`) relocated | Ownership |
+| `NFTOracle` | ERC-721/1155 ownership leak | Ownership |
+| `SelfDestructOracle` *(audit)* | Contract self-destruct / code removal | Ownership |
+
+`FreshnessOracle` and `TemporalSkimOracle` are bound to `Value` for taxonomy
+completeness but activate out-of-band (ABI fingerprint / `--temporal-skimming`),
+independent of `-d` selection — same precedent as ERC4626.
 
 ### 4. Cheatcode Extensions & Nested Pranking
 Supports `vm.computeCreateAddress`, `vm.computeCreate2Address` (both variants), and `vm.getNonce` for predicting CREATE2 exploit addresses.
@@ -191,14 +201,13 @@ These are deliberate current-state boundaries, not claimed capabilities:
     `*addr == step.contract`; a lever whose storage effect lands on a *downstream* contract is
     invisible to the pre-screen (though fail-open still probes it empirically).
 
-### 11. Topology Intelligence & Anti-Topology Pre-flight
-Every DeFi protocol exposes its shape through its ABI selector set. When two or more protocol families appear in the same target set, their intersection is almost always where the vulnerability lives. 
+### 11. Compiled Semantic Guidance (`--guidance-file`)
+Superseded the earlier ABI-topology engine (`src/evm/topology.rs`, ~765 LOC, since deleted). An offline DFG/taint-analysis pipeline compiles per-target static analysis into a `spectrefuzz.guidance` JSON file — auto-loaded from the working directory if `--guidance-file` isn't passed — and the fuzzer digests it at startup:
 
-SPECTOR-FUZZ implements static topology mapping at startup to analyze these shapes and guide both the oracle and mutation engines:
-*   **Protocol Family Mapping (ABI Fingerprinting)**: Classifies contract selectors into `ProtocolFamily` categories (e.g., ERC-20, ERC-721, ERC-4626, Chainlink, Lending, FlashLoan).
-*   **Co-occurrence & Exploit Classification**: Matches co-occurring families to rank exploit classes and auto-activate corresponding oracles (e.g., `ERC-4626` + `Chainlink` triggers `ERC4626Oracle` with 95% confidence for price-gated vault inflation).
-*   **Anti-Topology Pre-flight Warnings**: Scans for the **absence** of critical safety mechanisms (e.g., a Chainlink oracle without a freshness/staleness check, or callbacks without reentrancy guards) and logs pre-flight warnings at startup.
-*   **Topology Mutation Boost ("Gamma Ray")**: Generates `TopologyHints` that boost mutation energy in the scheduler for input sequences matching predicted exploit paths, focusing pressure where bugs are most likely to exist.
+*   **DFG-Guided Campaign Planning**: `scheduler.after["Contract:fn"]` records which functions a real data-flow edge follows a given call; `plan_campaign` prefers exploit-step candidates from that set over uniform sampling. Keys are contract-qualified (`Contract:fn`, not bare `fn`) to avoid collisions when multiple contracts in the same campaign share function names (e.g. two ERC-20s both exposing `transfer`).
+*   **High-Value Parameter Mutation**: `mutator.high_value_params` flags contract-scoped parameters that reach a sink or influence protocol state; `BoxedABI` mutation biases 80/20 toward those argument indices instead of mutating uniformly.
+*   **Guidance-Driven Auto-Activation**: declared invariants in the guidance file auto-activate `InvariantOracle`; `delegatecall`/`call` sinks auto-activate `ArbitraryCallOracle`; `selfdestruct` sinks auto-activate `SelfDestructOracle`; oracle/feed/price-named state variables auto-activate `ReentrancyOracle` + the `OracleStaleness` middleware; loading any guidance file force-enables the flashloan/economic-oracle layer.
+*   **Slot Novelty Scoring**: per-slot influence weights precomputed from `sv_flows` feed a `SlotNoveltyMap` — the scheduler scores newly-touched storage slots by novelty × influence instead of treating all SSTOREs as equally interesting.
 *   **Causal Oracle Gating**: Taint analysis runs before oracle feedback. If no injection chain is confirmed, oracles don't fire — eliminating phantom false positives where value moves coincidentally. Both `Sha3WrappedFeedback` and `OracleFeedback` are gated.
 
 ---
@@ -245,7 +254,7 @@ ityfuzz evm -t "build/*" -d all --run-forever -w ./findings
 | `--injection-detect` | Shallow taint: detect attacker-controlled CALL target/calldata |
 | `--injection-persist` | Persistent taint across executions (via tainted_storage) |
 | `--injection-provenance` | Arg→slot provenance mapping; enables LOCATE narrowing |
-| `--topology-bias <f>` | Topology→mutation steer strength `[0.0,1.0]`; default `0.0` (unbiased) |
+| `--guidance-file <path>` | Load Compiled Semantic Guidance JSON (DFG transitions, high-value params, invariants); auto-loads `spectrefuzz.guidance` from cwd if omitted |
 | `--temporal-skimming` | Multi-block state-priming: insert `Warp` between steps, flag divergence |
 | `--reflexive-lever` | Feature 015 reflexive-body amplification (yDAI-class valuation levers) |
 | `--oracle-detection` | Inline oracle-gated transfer detection (opcode proximity) |
